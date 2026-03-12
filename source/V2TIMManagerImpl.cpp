@@ -154,6 +154,10 @@ V2TIMManagerImpl::V2TIMManagerImpl()
 
 // Destructor (if not existing, add it)
 V2TIMManagerImpl::~V2TIMManagerImpl() {
+    // Stop background tasks first so no detach'd thread holds raw this
+    try {
+        StopBackgroundTasks();
+    } catch (...) {}
     // Be conservative at process teardown: stop and join the worker thread only.
     // Avoid calling into other singletons during global destruction to prevent
     // undefined order issues that can trigger std::terminate.
@@ -175,6 +179,18 @@ V2TIMManagerImpl::~V2TIMManagerImpl() {
         // Thread may have already exited or mutex is invalid - ignore
     } catch (...) {
         // Swallow any exception at process exit.
+    }
+}
+
+void V2TIMManagerImpl::StopBackgroundTasks() {
+    refresh_stop_requested_.store(true, std::memory_order_release);
+    rejoin_stop_requested_.store(true, std::memory_order_release);
+    if (refresh_task_.joinable()) {
+        refresh_task_.join();
+    }
+    refresh_task_running_.store(false, std::memory_order_release);
+    if (rejoin_task_.joinable()) {
+        rejoin_task_.join();
     }
 }
 
@@ -1414,6 +1430,8 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
 }
 
 void V2TIMManagerImpl::UnInitSDK() {
+    // Stop background tasks (refresh/rejoin threads) so they don't access this after shutdown
+    StopBackgroundTasks();
     // First, stop the event thread and wait for it to exit
     // This MUST happen before calling ToxManager::shutdown() to prevent race conditions
     running_ = false;
@@ -5462,48 +5480,35 @@ void V2TIMManagerImpl::HandleSelfConnectionStatus(TOX_CONNECTION connection_stat
                 GetToxManager()->setStatus(TOX_USER_STATUS_NONE);
                 listener->OnConnectSuccess();
                 
-                // OPTIMIZATION: Immediately refresh cache on connection, then schedule periodic refreshes
-                // This ensures friend list is available as soon as connection is established
-                // Use a static flag to prevent multiple refresh threads from being created
-                static std::atomic<bool> refresh_thread_created(false);
+                // OPTIMIZATION: Immediately refresh cache on connection, then schedule periodic refreshes.
+                // Use per-instance joinable jthread (no detach) so StopBackgroundTasks() can join before destroy.
+                refresh_stop_requested_.store(false, std::memory_order_release);
                 bool expected = false;
-                if (refresh_thread_created.compare_exchange_strong(expected, true)) {
+                if (refresh_task_running_.compare_exchange_strong(expected, true)) {
                     V2TIMConversationManagerImpl* cm = V2TIMConversationManagerImpl::GetInstance();
                     if (cm) {
-                        // Immediate refresh to get friend list right away
                         cm->RefreshCache();
-                        
-                        // Schedule additional refreshes to catch any delayed friend list updates
-                        // CRITICAL: Capture manager_impl pointer to check if SDK is still running
-                        V2TIMManagerImpl* manager_ptr = this;
-                        std::thread([manager_ptr]() {
-                            // Check if SDK is still running before each refresh
-                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                            if (manager_ptr && manager_ptr->IsRunning()) {
-                                V2TIMConversationManagerImpl* cm = V2TIMConversationManagerImpl::GetInstance();
-                                if (cm) cm->RefreshCache();
+                        refresh_task_ = std::thread([this]() {
+                            auto refresh_once = [this]() {
+                                if (!running_.load(std::memory_order_acquire)) return;
+                                V2TIMConversationManagerImpl* c = V2TIMConversationManagerImpl::GetInstance();
+                                if (c) c->RefreshCache();
+                            };
+                            const long delays_ms[] = { 500, 1000, 2000 };
+                            for (long delay_ms : delays_ms) {
+                                for (long elapsed = 0; elapsed < delay_ms && !refresh_stop_requested_.load(std::memory_order_acquire); elapsed += 10) {
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                                }
+                                if (refresh_stop_requested_.load(std::memory_order_acquire)) break;
+                                refresh_once();
                             }
-                            
-                            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-                            if (manager_ptr && manager_ptr->IsRunning()) {
-                                V2TIMConversationManagerImpl* cm = V2TIMConversationManagerImpl::GetInstance();
-                                if (cm) cm->RefreshCache();
-                            }
-                            
-                            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                            if (manager_ptr && manager_ptr->IsRunning()) {
-                                V2TIMConversationManagerImpl* cm = V2TIMConversationManagerImpl::GetInstance();
-                                if (cm) cm->RefreshCache();
-                            }
-                            
-                            // Reset flag after all refreshes complete
-                            refresh_thread_created.store(false);
-                        }).detach();
+                            refresh_task_running_.store(false, std::memory_order_release);
+                        });
                     } else {
-                        refresh_thread_created.store(false);
+                        refresh_task_running_.store(false, std::memory_order_release);
                     }
                 } else {
-                    V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: RefreshCache thread already created, skipping");
+                    V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: RefreshCache task already running, skipping");
                 }
                 break;
         }
@@ -5553,58 +5558,21 @@ void V2TIMManagerImpl::HandleSelfConnectionStatus(TOX_CONNECTION connection_stat
                 }
                 
                 V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: Connection established, triggering RejoinKnownGroups");
-                // Use a separate thread to avoid blocking the connection status callback
-                // CRITICAL: Capture this pointer and check validity before each access
-                // Use atomic flag to track if object is being destroyed
-                V2TIMManagerImpl* self_ptr = this;
-                V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: Creating RejoinKnownGroups thread, self_ptr={}", (void*)self_ptr);
-                std::thread([self_ptr]() {
-                    // Small delay to ensure connection is fully established
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    
-                    // Check if object is still valid before ANY access
-                    if (!self_ptr) {
-                        return;
+                rejoin_stop_requested_.store(false, std::memory_order_release);
+                rejoin_task_ = std::thread([this]() {
+                    for (int i = 0; i < 50 && !rejoin_stop_requested_.load(std::memory_order_acquire); ++i) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     }
-                    
-                    bool is_running = false;
-                    bool has_tox_manager = false;
-                    
+                    if (rejoin_stop_requested_.load(std::memory_order_acquire)) return;
                     try {
-                        is_running = self_ptr->IsRunning();
-                        has_tox_manager = (self_ptr->tox_manager_ != nullptr);
-                    } catch (const std::bad_alloc& e) {
-                        return;
-                    } catch (const std::exception& e) {
-                        return;
+                        if (!running_.load(std::memory_order_acquire) || !tox_manager_) return;
+                        RejoinKnownGroups();
+                    } catch (const std::bad_alloc&) {
+                    } catch (const std::exception&) {
                     } catch (...) {
-                        return;
                     }
-                    
-                    if (is_running && has_tox_manager) {
-                        if (!self_ptr) {
-                            return;
-                        }
-                        
-                        try {
-                            bool test_running = self_ptr->IsRunning();
-                            (void)test_running; // Suppress unused variable warning
-                        } catch (...) {
-                            return;
-                        }
-                        
-                        try {
-                            self_ptr->RejoinKnownGroups();
-                        } catch (const std::bad_alloc& e) {
-                            // Ignore memory errors
-                        } catch (const std::exception& e) {
-                            // Ignore exceptions
-                        } catch (...) {
-                            // Ignore unknown exceptions
-                        }
-                    }
-                }).detach();
-                V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: RejoinKnownGroups thread created and detached");
+                });
+                V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: RejoinKnownGroups task started (joinable)");
             } else {
                 V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: RejoinKnownGroups already triggered, skipping");
             }
@@ -6677,14 +6645,14 @@ void V2TIMManagerImpl::HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Gr
                     static_cast<int>(err_key));
         }
         
-        // Get peer name
-        uint8_t name_buffer[TOX_MAX_NAME_LENGTH];
+        // Get peer name (buffer may not be NUL-terminated; use strnlen to avoid OOB read)
+        uint8_t name_buffer[TOX_MAX_NAME_LENGTH + 1] = {};
         Tox_Err_Group_Peer_Query err_name;
         if (tox_group_peer_get_name(tox, group_number, peer_id, name_buffer, &err_name) &&
             err_name == TOX_ERR_GROUP_PEER_QUERY_OK) {
-            size_t name_len = strlen(reinterpret_cast<const char*>(name_buffer));
-            fprintf(stdout, "[HandleGroupPeerJoin] Peer name: %s (length=%zu)\n", 
-                    reinterpret_cast<const char*>(name_buffer), name_len);
+            size_t name_len = strnlen(reinterpret_cast<const char*>(name_buffer), TOX_MAX_NAME_LENGTH);
+            fprintf(stdout, "[HandleGroupPeerJoin] Peer name: %.*s (length=%zu)\n",
+                    static_cast<int>(name_len), reinterpret_cast<const char*>(name_buffer), name_len);
         }
         
         // Get peer role
@@ -6770,15 +6738,15 @@ void V2TIMManagerImpl::HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Gr
         group_peer_id_cache_[group_number][key_lower] = peer_id;
     }
     
-    // Get peer name
-    uint8_t name_buffer[TOX_MAX_NAME_LENGTH];
+    // Get peer name (buffer may not be NUL-terminated; use strnlen to avoid OOB read)
+    uint8_t name_buffer[TOX_MAX_NAME_LENGTH + 1] = {};
     std::string peer_name;
     Tox_Err_Group_Peer_Query err_name;
-    if (GetToxManager()->getGroupPeerName(group_number, peer_id, name_buffer, sizeof(name_buffer), &err_name) &&
+    if (GetToxManager()->getGroupPeerName(group_number, peer_id, name_buffer, TOX_MAX_NAME_LENGTH, &err_name) &&
         err_name == TOX_ERR_GROUP_PEER_QUERY_OK) {
-        size_t name_len = strlen(reinterpret_cast<const char*>(name_buffer));
+        size_t name_len = strnlen(reinterpret_cast<const char*>(name_buffer), TOX_MAX_NAME_LENGTH);
         peer_name = std::string(reinterpret_cast<const char*>(name_buffer), name_len);
-        fprintf(stdout, "[HandleGroupPeerJoin] Peer name=%s (length=%zu)\n", peer_name.c_str(), name_len);
+        fprintf(stdout, "[HandleGroupPeerJoin] Peer name=%.*s (length=%zu)\n", static_cast<int>(name_len), reinterpret_cast<const char*>(name_buffer), name_len);
         fflush(stdout);
     } else {
         fprintf(stdout, "[HandleGroupPeerJoin] Failed to get peer name, err=%d\n", static_cast<int>(err_name));

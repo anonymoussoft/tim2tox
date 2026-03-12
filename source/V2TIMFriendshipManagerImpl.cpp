@@ -45,8 +45,11 @@ V2TIMFriendshipManagerImpl::V2TIMFriendshipManagerImpl() {
 
 // Destructor
 V2TIMFriendshipManagerImpl::~V2TIMFriendshipManagerImpl() {
-    // Don't log in destructor to avoid mutex issues during static destruction
-    // V2TIM_LOG(kInfo, "V2TIMFriendshipManagerImpl destroyed.");
+    if (refresh_after_accept_thread_.joinable()) {
+        try {
+            refresh_after_accept_thread_.join();
+        } catch (...) {}
+    }
 }
 
 // 好友请求存储改由 NotifyFriendApplicationListAdded 统一处理
@@ -1107,10 +1110,11 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
         // OPTIMIZATION: Refresh conversation cache asynchronously without blocking
         // The debounce mechanism in RefreshConversationCache will prevent excessive refreshes
         // if multiple friend applications are accepted in quick succession
-        std::thread([]() {
-            // Small delay to ensure Tox has updated its friend list
+        if (refresh_after_accept_thread_.joinable()) {
+            refresh_after_accept_thread_.join();
+        }
+        refresh_after_accept_thread_ = std::thread([]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            // Use GetCurrentInstance() for multi-instance support
             extern V2TIMManagerImpl* GetCurrentInstance();
             V2TIMManagerImpl* manager_impl = GetCurrentInstance();
             if (!manager_impl) {
@@ -1119,14 +1123,13 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
             if (manager_impl) {
                 V2TIMConversationManager* cm = manager_impl->GetConversationManager();
                 if (cm) {
-                    // RefreshCache is a public method, but we need to cast to impl
                     V2TIMConversationManagerImpl* cm_impl = static_cast<V2TIMConversationManagerImpl*>(cm);
                     if (cm_impl) {
                         cm_impl->RefreshCache();
                     }
                 }
             }
-        }).detach();
+        });
     } else {
         V2TIM_LOG(kInfo, "[AcceptFriendApplication] Error case: err_add={}", err_add);
         if (err_add == TOX_ERR_FRIEND_ADD_ALREADY_SENT || err_add == TOX_ERR_FRIEND_ADD_SET_NEW_NOSPAM) {

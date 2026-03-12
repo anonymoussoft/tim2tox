@@ -1,6 +1,7 @@
 // tox_manager.h
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -292,7 +293,7 @@ private:
     std::unique_ptr<Tox, decltype(&toxDeleter)> tox_;
     mutable std::mutex mutex_;
     std::mutex iterate_mutex_;  // Serialize tox_iterate - toxcore requires single-threaded access per instance
-    bool is_shutting_down_;  // Flag to prevent double cleanup
+    std::atomic<bool> is_shutting_down_{false};  // Flag to prevent double cleanup; atomic for lock-free read in iterate()
 
     // 回调存储
     SelfConnectionStatusCallback self_connection_status_cb_;

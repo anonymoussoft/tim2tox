@@ -84,13 +84,11 @@ extern "C" {
                 std::string result_json = ConversationResultToJson(result);
                 std::string user_data_str = UserDataToString(user_data_);
                 int64_t instance_id = GetCurrentInstanceId();
-                std::thread([result_json, user_data_str, instance_id]() {
-                    std::ostringstream json_msg;
-                    json_msg << "{\"callback\":\"apiCallback\",\"instance_id\":" << instance_id << ",\"user_data\":\"" << EscapeJsonString(user_data_str) << "\",";
-                    json_msg << "\"code\":0,\"desc\":\"\",";
-                    json_msg << "\"json_param\":\"" << EscapeJsonString(result_json) << "\"}";
-                    SendCallbackToDart("apiCallback", json_msg.str(), nullptr);
-                }).detach();
+                std::ostringstream json_msg;
+                json_msg << "{\"callback\":\"apiCallback\",\"instance_id\":" << instance_id << ",\"user_data\":\"" << EscapeJsonString(user_data_str) << "\",";
+                json_msg << "\"code\":0,\"desc\":\"\",";
+                json_msg << "\"json_param\":\"" << EscapeJsonString(result_json) << "\"}";
+                SendCallbackToDart("apiCallback", json_msg.str(), nullptr);
             } catch (const std::exception& e) {
                 // Safely get exception message
                 const char* what_msg = e.what();

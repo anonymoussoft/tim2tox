@@ -201,8 +201,11 @@ void V2TIMSignalingManagerImpl::SetManagerImpl(V2TIMManagerImpl* manager_impl) {
 }
 
 V2TIMSignalingManagerImpl::~V2TIMSignalingManagerImpl() {
-    // Do not shutdown ToxManager here - it should only be shut down by V2TIMManagerImpl::UnInitSDK()
-    // Shutting down here would cause all subsequent operations to fail with 6013 error
+    if (invite_timeout_thread_.joinable()) {
+        try {
+            invite_timeout_thread_.join();
+        } catch (...) {}
+    }
 }
 
 void V2TIMSignalingManagerImpl::AddSignalingListener(V2TIMSignalingListener* listener) {
@@ -289,9 +292,12 @@ V2TIMString V2TIMSignalingManagerImpl::Invite(const V2TIMString& invitee, const 
             active_invites_[inviteID] = info;
         }
         if (callback) callback->OnSuccess();
-        // Schedule timeout: after timeout seconds, fire OnInvitationTimeout if invite still active
+        // Schedule timeout: use joinable thread so destructor can join (no detach/UAF).
         if (timeout > 0) {
-            std::thread([this, inviteID, timeout]() {
+            if (invite_timeout_thread_.joinable()) {
+                invite_timeout_thread_.join();
+            }
+            invite_timeout_thread_ = std::thread([this, inviteID, timeout]() {
                 std::this_thread::sleep_for(std::chrono::seconds(timeout));
                 V2TIMManagerImpl* current = nullptr;
                 { std::lock_guard<std::mutex> lock(manager_impl_mutex_); current = manager_impl_; }
@@ -307,7 +313,7 @@ V2TIMString V2TIMSignalingManagerImpl::Invite(const V2TIMString& invitee, const 
                     }
                     active_invites_.erase(it);
                 });
-            }).detach();
+            });
         }
         return V2TIMString(inviteID.c_str());
     });

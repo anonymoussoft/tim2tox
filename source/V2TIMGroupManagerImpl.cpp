@@ -1869,13 +1869,13 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
         // Convert public key to userID (hex string)
         std::string userID = ToxUtil::tox_bytes_to_hex(peer_pubkey, TOX_PUBLIC_KEY_SIZE);
         
-        // Get peer name (this is the nameCard in group context)
-        uint8_t name_buffer[TOX_MAX_NAME_LENGTH];
+        // Get peer name (buffer may not be NUL-terminated; use strnlen to avoid OOB read)
+        uint8_t name_buffer[TOX_MAX_NAME_LENGTH + 1] = {};
         std::string peer_name;
         Tox_Err_Group_Peer_Query err_name;
-        if (GetToxManagerFromImpl(target_manager_impl)->getGroupPeerName(group_number, peer_id, name_buffer, sizeof(name_buffer), &err_name) &&
+        if (GetToxManagerFromImpl(target_manager_impl)->getGroupPeerName(group_number, peer_id, name_buffer, TOX_MAX_NAME_LENGTH, &err_name) &&
             err_name == TOX_ERR_GROUP_PEER_QUERY_OK) {
-            size_t name_len = strlen(reinterpret_cast<const char*>(name_buffer));
+            size_t name_len = strnlen(reinterpret_cast<const char*>(name_buffer), TOX_MAX_NAME_LENGTH);
             peer_name = std::string(reinterpret_cast<const char*>(name_buffer), name_len);
         }
         
@@ -2293,13 +2293,13 @@ void V2TIMGroupManagerImpl::GetGroupMembersInfo(
                 if (peer_userID_upper == requested_userID_upper) {
                     V2TIM_LOG(kInfo, "[GetGroupMembersInfo] MATCH FOUND peer_id={} peer_userID={}", peer_id, peer_userID);
 
-                    // Get peer name
-                    uint8_t name_buffer[TOX_MAX_NAME_LENGTH];
+                    // Get peer name (buffer may not be NUL-terminated; use strnlen to avoid OOB read)
+                    uint8_t name_buffer[TOX_MAX_NAME_LENGTH + 1] = {};
                     std::string peer_name;
                     Tox_Err_Group_Peer_Query err_name;
-                    if (GetToxManagerFromImpl(manager_impl_)->getGroupPeerName(group_number, peer_id, name_buffer, sizeof(name_buffer), &err_name) &&
+                    if (GetToxManagerFromImpl(manager_impl_)->getGroupPeerName(group_number, peer_id, name_buffer, TOX_MAX_NAME_LENGTH, &err_name) &&
                         err_name == TOX_ERR_GROUP_PEER_QUERY_OK) {
-                        size_t name_len = strlen(reinterpret_cast<const char*>(name_buffer));
+                        size_t name_len = strnlen(reinterpret_cast<const char*>(name_buffer), TOX_MAX_NAME_LENGTH);
                         peer_name = std::string(reinterpret_cast<const char*>(name_buffer), name_len);
                     }
 

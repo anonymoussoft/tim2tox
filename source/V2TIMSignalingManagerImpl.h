@@ -3,6 +3,7 @@
 
 #include "tox.h"
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -81,6 +82,9 @@ private:
     
     // Per-instance counter for unique ID generation (replaces static counter for multi-instance support)
     int unique_id_counter_;
+
+    // Joinable thread for invite timeout (no detach to avoid UAF). At most one active; new invite waits for previous.
+    std::thread invite_timeout_thread_;
 };
 
 #endif  // __V2TIM_SIGNALING_MANAGER_IMPL_H__

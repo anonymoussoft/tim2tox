@@ -4,6 +4,7 @@
 #include "V2TIMFriendshipManager.h"
 #include "tox.h"
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include "V2TIMLog.h" // Optional for logging
@@ -104,6 +105,9 @@ private:
     // 申请列表本地缓存
     std::mutex application_mutex_;
     V2TIMFriendApplicationVector pending_applications_;
+
+    // Joinable thread for delayed RefreshCache after AcceptFriendApplication (no detach to avoid UAF).
+    std::thread refresh_after_accept_thread_;
 };
 
 #endif // __V2TIM_FRIENDSHIP_MANAGER_IMPL_H__

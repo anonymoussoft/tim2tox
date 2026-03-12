@@ -146,21 +146,24 @@ V2TIMMessage V2TIMMessageManagerImpl::CreateCustomMessage(const V2TIMBuffer& dat
 }
 
 V2TIMMessage V2TIMMessageManagerImpl::CreateImageMessage(const V2TIMString& imagePath) {
-    V2TIM_LOG(kError, "CreateImageMessage not implemented.");
-    // TODO: Read image, potentially upload, create V2TIMImageElem
-    return CreateBaseMessage(); // Return empty message
+    V2TIM_LOG(kError, "CreateImageMessage not implemented. path={}", imagePath.CString());
+    V2TIMMessage msg = CreateBaseMessage();
+    msg.status = V2TIM_MSG_STATUS_SEND_FAIL;
+    return msg;
 }
 
 V2TIMMessage V2TIMMessageManagerImpl::CreateSoundMessage(const V2TIMString& soundPath, uint32_t duration) {
-    V2TIM_LOG(kError, "CreateSoundMessage not implemented.");
-    // TODO: Read sound file, potentially upload, create V2TIMSoundElem
-    return CreateBaseMessage();
+    V2TIM_LOG(kError, "CreateSoundMessage not implemented. path={}", soundPath.CString());
+    V2TIMMessage msg = CreateBaseMessage();
+    msg.status = V2TIM_MSG_STATUS_SEND_FAIL;
+    return msg;
 }
 
 V2TIMMessage V2TIMMessageManagerImpl::CreateVideoMessage(const V2TIMString& videoFilePath, const V2TIMString& type, uint32_t duration, const V2TIMString& snapshotPath) {
-    V2TIM_LOG(kError, "CreateVideoMessage not implemented.");
-    // TODO: Read video/snapshot, potentially upload, create V2TIMVideoElem
-    return CreateBaseMessage();
+    V2TIM_LOG(kError, "CreateVideoMessage not implemented. path={}", videoFilePath.CString());
+    V2TIMMessage msg = CreateBaseMessage();
+    msg.status = V2TIM_MSG_STATUS_SEND_FAIL;
+    return msg;
 }
 
 V2TIMMessage V2TIMMessageManagerImpl::CreateFileMessage(const V2TIMString& filePath, const V2TIMString& fileName) {
@@ -450,10 +453,15 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
     // --- Extract Payload and Call Appropriate Send Method ---
     V2TIMString sentMsgID = ""; // Store the ID returned by the lower-level send
 
-    // Check if elemList has at least one element
     if (message.elemList.Size() == 0) {
         V2TIM_LOG(kError, "SendMessage failed: Message has no elements.");
         if (callback) callback->OnError(ERR_INVALID_PARAMETERS, "Message has no elements");
+        message.status = V2TIM_MSG_STATUS_SEND_FAIL;
+        return "";
+    }
+    if (message.elemList.Size() != 1) {
+        V2TIM_LOG(kError, "SendMessage failed: tim2tox supports exactly one message element, got {}", message.elemList.Size());
+        if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, "tim2tox currently supports exactly one message element");
         message.status = V2TIM_MSG_STATUS_SEND_FAIL;
         return "";
     }

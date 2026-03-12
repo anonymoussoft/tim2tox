@@ -169,6 +169,9 @@ public:
     // Should be called after Tox connection is established for best success rate
     void RejoinKnownGroups();
 
+    // Stop background tasks (refresh cache, rejoin groups). Called from UnInitSDK and destructor.
+    void StopBackgroundTasks();
+
 private:
     struct PendingInvite {
         uint32_t friend_number;
@@ -190,6 +193,13 @@ private:
     
     std::thread event_thread_;
     std::atomic<bool> running_{true};  // Use atomic to prevent compiler optimization issues
+    // Joinable background tasks (no detach) to avoid UAF when instance is destroyed.
+    // Use std::thread + atomic stop flag for compatibility (std::jthread is C++20 and not on all toolchains).
+    std::thread refresh_task_;
+    std::thread rejoin_task_;
+    std::atomic<bool> refresh_task_running_{false};
+    std::atomic<bool> refresh_stop_requested_{false};
+    std::atomic<bool> rejoin_stop_requested_{false};
     std::mutex task_mutex_;
     std::queue<std::function<void()>> task_queue_;
     std::condition_variable task_cv_;  // Signalled when a task is pushed so event thread can process

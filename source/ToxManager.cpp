@@ -27,7 +27,7 @@ ToxManager* ToxManager::getDefaultInstance() {
     return g_default_instance;
 }
 
-// 辅助函数：从 Tox* 获取 ToxManager*
+// 辅助函数：从 Tox* 获取 ToxManager*。找不到映射时返回 nullptr，不再 fallback 到默认实例，避免错误路由。
 static ToxManager* getManagerFromTox(Tox* tox) {
     if (!tox) {
         V2TIM_LOG(kWarning, "[getManagerFromTox] WARNING: tox is null");
@@ -39,13 +39,12 @@ static ToxManager* getManagerFromTox(Tox* tox) {
         V2TIM_LOG(kDebug, "[getManagerFromTox] Found manager={} for tox={}", (void*)it->second, (void*)tox);
         return it->second;
     }
-    V2TIM_LOG(kWarning, "[getManagerFromTox] WARNING: No manager found for tox={}, using default instance", (void*)tox);
-    V2TIM_LOG(kDebug, "[getManagerFromTox] Total mappings: {}", g_tox_to_manager.size());
-    return ToxManager::getDefaultInstance();
+    V2TIM_LOG(kError, "[getManagerFromTox] No manager found for tox={}, total mappings={}", (void*)tox, g_tox_to_manager.size());
+    return nullptr;
 }
 
 // 构造函数（现在是 public，支持多实例）
-ToxManager::ToxManager() : tox_(nullptr, &toxDeleter), is_shutting_down_(false) {}
+ToxManager::ToxManager() : tox_(nullptr, &toxDeleter) {}
 
 // 析构函数
 ToxManager::~ToxManager() {
@@ -107,8 +106,7 @@ void ToxManager::initialize(const Tox_Options* options,
     }
     
     // Reset shutdown flag when reinitializing
-    // This allows reinitialization after shutdown
-    is_shutting_down_ = false;
+    is_shutting_down_.store(false, std::memory_order_release);
 
     // Allocate options using tox API to avoid freeing invalid pointers in defaults.
     Tox_Err_Options_New opt_err;
@@ -210,11 +208,10 @@ void ToxManager::shutdown() {
     Tox* tox_to_remove = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (is_shutting_down_ || !tox_) {
-            // Already shutting down or already shut down - idempotent
+        if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
             return;
         }
-        is_shutting_down_ = true;
+        is_shutting_down_.store(true, std::memory_order_release);
         tox_to_remove = tox_.get();
     }
     
@@ -240,7 +237,7 @@ Tox* ToxManager::getTox() const {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
         // Check if shutting down to avoid accessing tox_ during destruction
-        if (is_shutting_down_ || !tox_) {
+        if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
             return nullptr;
         }
         return tox_.get();
@@ -257,8 +254,7 @@ Tox* ToxManager::getTox() const {
 // 检查是否正在关闭
 bool ToxManager::isShuttingDown() const {
     try {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return is_shutting_down_;
+        return is_shutting_down_.load(std::memory_order_acquire);
     } catch (...) {
         // Mutex may be invalid during static destruction
         // Return true to indicate shutdown to prevent further operations
@@ -276,9 +272,8 @@ void ToxManager::iterate(uint32_t timeout) {
         // This can happen when the application is terminating and static objects are being destroyed
         try {
             std::lock_guard<std::mutex> lock(mutex_);
-            // Check if shutting down after acquiring lock to avoid race conditions
-            if (is_shutting_down_ || !tox_) {
-                return; // Tox instance not initialized or already destroyed
+            if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
+                return;
             }
             tox_ptr = tox_.get();
             if (!tox_ptr) {
@@ -297,14 +292,10 @@ void ToxManager::iterate(uint32_t timeout) {
     // Call tox_iterate without holding the lock to prevent deadlock in callbacks
     // Note: tox_ptr and 'this' must remain valid during tox_iterate execution
     // Since ToxManager is a singleton, 'this' should always be valid
-    // IMPORTANT: Check is_shutting_down_ again before calling tox_iterate
-    // because tox_ptr may have been invalidated by another thread calling shutdown()
-    if (tox_ptr && !is_shutting_down_) {
-        // Double-check that tox_ptr is still valid by re-acquiring lock briefly
-        // This prevents race condition where shutdown() is called between lock release and tox_iterate
+    if (tox_ptr && !is_shutting_down_.load(std::memory_order_acquire)) {
         try {
             std::lock_guard<std::mutex> verify_lock(mutex_);
-            if (is_shutting_down_ || !tox_ || tox_.get() != tox_ptr) {
+            if (is_shutting_down_.load(std::memory_order_acquire) || !tox_ || tox_.get() != tox_ptr) {
                 // Tox instance was destroyed or replaced, don't call tox_iterate
                 return;
             }
