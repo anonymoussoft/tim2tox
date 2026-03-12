@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 #include "V2TIMLog.h" // Optional for logging
+#include "V2TIMFriendship.h"
 
 class V2TIMFriendshipManagerImpl : public V2TIMFriendshipManager {
 public:
@@ -67,6 +68,7 @@ public:
 
     // --- Internal methods for V2TIMManagerImpl to call ---
     void NotifyFriendApplicationListAdded(const V2TIMFriendApplicationVector& applicationList);
+    void NotifyFriendApplicationListDeleted(const V2TIMStringVector& userIDList);
     void NotifyFriendInfoChanged(const V2TIMFriendInfoResultVector& infoList); // Placeholder for info changes
     void NotifyFriendListAdded(const V2TIMFriendInfoVector& infoList);      // Placeholder for when friends are added
     void NotifyFriendListDeleted(const V2TIMStringVector& userIDList);     // Placeholder for when friends are deleted
@@ -93,14 +95,15 @@ private:
     std::vector<V2TIMFriendshipListener*> listeners_;
     
     // 本地存储结构
+    // UNUSED: friend_id_map_ is declared but never used in .cpp; remove or implement when needed.
     std::unordered_map<std::string, uint32_t> friend_id_map_; // Tox ID到friend_number的映射
     std::vector<std::string> blacklist_;
     std::unordered_map<std::string, std::vector<std::string>> friend_groups_; // 分组管理
     std::unordered_map<std::string, V2TIMFriendInfo> friend_info_db_;
 
-    // Tox回调处理
-    static void friendRequestCallback(Tox* tox, const uint8_t* public_key, const uint8_t* message, size_t length, void* user_data);
-    void handleFriendRequest(const uint8_t* public_key, const std::string& message);
+    // 申请列表本地缓存
+    std::mutex application_mutex_;
+    V2TIMFriendApplicationVector pending_applications_;
 };
 
 #endif // __V2TIM_FRIENDSHIP_MANAGER_IMPL_H__

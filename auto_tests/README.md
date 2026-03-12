@@ -1,0 +1,643 @@
+# Tim2Tox Auto Tests
+
+自动化测试套件，用于测试 tim2tox 在二进制替换方案下的 Dart 层接口。
+
+**目录**：[概述](#概述) · [目录结构](#目录结构) · [测试框架](#测试框架) · [测试场景列表](#测试场景列表) · [运行测试](#运行测试) · [测试覆盖范围](#测试覆盖范围) · [测试失败记录与修复状态](#测试失败记录与修复状态) · [已知问题](#已知问题和限制) · [故障排除](#故障排除) · [最佳实践](#测试最佳实践) · [参考文档](#参考文档)
+
+## 概述
+
+本测试套件借鉴了 `c-toxcore/auto_tests` 的方案和用例，使用 Dart/Flutter 测试框架（`test`/`flutter_test`）实现场景式测试，覆盖所有 UIKit SDK 接口。
+
+### 设计理念
+
+- **场景式测试**：每个测试文件对应一个功能场景，模拟真实使用情况
+- **多节点测试**：支持创建多个 TestNode 节点，模拟多用户交互
+- **自动接受机制**：类似 c-toxcore 的 auto-accept，自动处理好友请求、群组邀请等
+- **本地 Bootstrap**：支持本地 bootstrap 配置，加速节点连接
+
+## 目录结构
+
+```
+tim2tox/auto_tests/
+├── pubspec.yaml                    # 包配置和依赖
+├── run_tests.sh                    # 基础测试运行脚本
+├── run_tests_verbose.sh            # 详细输出测试脚本
+├── run_tests_ordered.sh            # 按顺序运行测试 (Phase 1-14)
+├── run_all_tests.sh                # 兼容入口（内部调用 run_tests_ordered.sh）
+├── run_group_tests.sh              # 运行群组相关测试
+├── run_tests_with_lib.sh           # 带库构建的测试脚本
+├── test/
+│   ├── test_helper.dart            # 测试辅助库（TestNode, waitUntil 等）
+│   ├── test_fixtures.dart          # 测试数据和 Mock 对象
+│   ├── scenarios/                  # 场景测试文件（69 个）
+│   │   ├── scenario_sdk_init_test.dart
+│   │   ├── scenario_login_test.dart
+│   │   ├── scenario_message_test.dart
+│   │   └── ... (其他场景测试)
+│   ├── scenarios_binary/           # Binary Replacement 路径测试（Phase 13，3 个）
+│   │   ├── scenario_native_callback_dispatch_test.dart  # NativeLibraryManager 静态 listener 分发
+│   │   ├── scenario_custom_callback_handler_test.dart   # customCallbackHandler 注册与触发
+│   │   └── scenario_library_loading_test.dart           # setNativeLibraryName 库加载验证
+│   └── unit_tests/                 # 单元测试
+│       └── test_listeners.dart     # Listener 接口测试
+├── RERUN_FAILURES_SUMMARY_*.md     # 失败用例重跑汇总
+├── DEBUG_NATIVE_CRASH.md           # 崩溃时用 lldb 查看 native 栈
+├── NATIVE_CRASH_COMMON_ISSUES.md   # Native 崩溃常见问题速查（先查此文）
+└── README.md                       # 本文档（含失败记录与修复状态）
+```
+
+## 测试框架
+
+### TestNode 类
+
+`TestNode` 代表测试场景中的一个用户节点，提供以下功能：
+
+#### 核心方法
+
+- **`initSDK()`** - 初始化 SDK，创建独立的测试实例
+- **`login()`** - 登录节点，自动启用 auto-accept
+- **`logout()`** - 登出节点
+- **`unInitSDK()`** - 清理 SDK 资源
+
+#### 实例上下文（多实例必读）
+
+在有多节点（如 alice、bob）的场景中，所有访问 native 的 TIM*Manager 调用必须在对应节点的实例上下文中执行，否则会走到错误实例或默认实例导致失败（如 `ToxManager not initialized`）。
+
+- **`runWithInstance(action)`** - 同步执行 `action`，期间当前实例为该节点
+- **`runWithInstanceAsync(action)`** - 异步执行 `action`，期间当前实例为该节点
+
+**规范**：在测试里调用 `TIMConversationManager.instance.*`、`TIMMessageManager.instance.*`、`TIMFriendshipManager.instance.*`、`TIMGroupManager.instance.*` 等时，必须包在对应节点的 `runWithInstanceAsync`（或 `runWithInstance`）中；接收方/监听方用该节点包裹 add/remove listener。例如：Alice 发消息用 `alice.runWithInstanceAsync(() => TIMMessageManager.instance.sendMessage(...))`，Bob 收消息的 listener 用 `bob.runWithInstance(() => TIMMessageManager.instance.addAdvancedMsgListener(...))`。使用 Tox ID 作为 C2C 的 receiver 时用 `bob.getToxId()`，不要用 `bob.userId`。
+
+- **`getFriendListResultWithInstance()`** - 在当前节点实例上拉取好友列表结果（含 code），用于断言
+- **`getConversationListWithInstance(nextSeq, count)`** - 在当前节点实例上拉取会话列表
+
+#### 等待和同步
+
+- **`waitForConnection()`** - 等待节点连接到 Tox 网络
+- **`waitForFriendConnection(userId)`** - 等待好友连接建立
+- **`waitForCallback(callbackName)`** - 等待特定回调触发
+- **`waitForCondition(condition)`** - 等待条件满足
+
+#### 状态查询
+
+- **`getToxId()`** - 获取节点的 Tox ID（76 字符十六进制）
+- **`getPublicKey()`** - 获取节点的公钥（64 字符十六进制）
+- **`getFriendList()`** - 获取好友列表（带缓存）
+- **`isFriend(userId)`** - 检查是否为好友
+
+#### 自动接受机制
+
+`TestNode` 在登录后自动启用 auto-accept，类似 c-toxcore 的 `tox_friend_add_norequest()`：
+- 自动接受好友请求
+- 自动处理群组邀请
+- 自动处理文件传输请求
+
+### TestScenario 类
+
+`TestScenario` 管理多个节点的测试场景：
+
+```dart
+final scenario = await createTestScenario(['alice', 'bob']);
+final alice = scenario.getNode('alice')!;
+final bob = scenario.getNode('bob')!;
+
+await scenario.initAllNodes();
+await scenario.loginAllNodes();
+await configureLocalBootstrap(scenario);
+```
+
+### 工具函数
+
+#### `waitUntil(condition, {timeout, description})`
+
+等待条件满足，类似 c-toxcore 的 `WAIT_UNTIL` 宏：
+
+```dart
+await waitUntil(
+  () => alice.loggedIn && bob.loggedIn,
+  timeout: const Duration(seconds: 10),
+  description: 'both nodes logged in',
+);
+```
+
+#### `establishFriendship(alice, bob)`
+
+建立双向好友关系：
+
+```dart
+await establishFriendship(alice, bob);
+// 现在 alice 和 bob 互为好友
+```
+
+#### `configureLocalBootstrap(scenario)`
+
+配置本地 bootstrap，第一个节点作为 bootstrap 节点：
+
+```dart
+await configureLocalBootstrap(scenario);
+// 其他节点会从第一个节点 bootstrap
+```
+
+## 测试场景列表
+
+### 基础测试 (5个)
+
+| 测试文件 | 说明 |
+|---------|------|
+| `scenario_sdk_init_test.dart` | SDK 初始化、配置、版本查询 |
+| `scenario_login_test.dart` | 登录/登出、登录状态查询 |
+| `scenario_self_query_test.dart` | 自我信息查询 |
+| `scenario_save_load_test.dart` | 数据保存和加载 |
+| `scenario_multi_instance_test.dart` | 多实例支持测试 |
+
+### 好友测试 (8个)
+
+| 测试文件 | 说明 |
+|---------|------|
+| `scenario_friend_request_test.dart` | 好友请求发送和接收 |
+| `scenario_friend_request_simple_test.dart` | 好友请求简单流程 |
+| `scenario_friend_connection_test.dart` | 好友连接状态 |
+| `scenario_friend_query_test.dart` | 好友信息查询 |
+| `scenario_friendship_test.dart` | 好友关系管理 |
+| `scenario_friend_delete_test.dart` | 删除好友 |
+| `scenario_friend_read_receipt_test.dart` | 已读回执 |
+| `scenario_friend_request_spam_test.dart` | 好友请求防垃圾 |
+
+### 消息测试 (4个)
+
+| 测试文件 | 说明 |
+|---------|------|
+| `scenario_message_test.dart` | 消息发送和接收 |
+| `scenario_send_message_test.dart` | 消息发送功能 |
+| `scenario_message_overflow_test.dart` | 消息队列溢出处理 |
+| `scenario_typing_test.dart` | 输入状态（正在输入） |
+
+### 群组测试 (10个)
+
+| 测试文件 | 说明 |
+|---------|------|
+| `scenario_group_test.dart` | 群组创建、加入、退出 |
+| `scenario_group_message_test.dart` | 群组消息 |
+| `scenario_group_invite_test.dart` | 群组邀请 |
+| `scenario_group_double_invite_test.dart` | 重复邀请处理 |
+| `scenario_group_state_test.dart` | 群组状态管理 |
+| `scenario_group_sync_test.dart` | 群组状态同步 |
+| `scenario_group_save_test.dart` | 群组数据保存 |
+| `scenario_group_topic_test.dart` | 群组话题 |
+| `scenario_group_topic_revert_test.dart` | 话题回滚 |
+| `scenario_group_moderation_test.dart` | 群组管理（踢人、禁言等） |
+
+### 音视频测试 (6个)
+
+| 测试文件 | 说明 |
+|---------|------|
+| `scenario_toxav_basic_test.dart` | ToxAV 基础功能 |
+| `scenario_toxav_many_test.dart` | 多节点音视频 |
+| `scenario_toxav_conference_test.dart` | 音视频会议 |
+| `scenario_toxav_conference_audio_test.dart` | 会议音频 |
+| `scenario_toxav_conference_invite_test.dart` | 会议邀请 |
+| `scenario_toxav_conference_audio_send_test.dart` | 会议音频发送 |
+
+### 其他测试 (36个)
+
+#### 会话相关
+- `scenario_conversation_test.dart` - 会话列表
+- `scenario_conversation_pin_test.dart` - 会话置顶
+
+#### 用户信息
+- `scenario_set_name_test.dart` - 设置昵称
+- `scenario_set_status_message_test.dart` - 设置状态消息
+- `scenario_user_status_test.dart` - 用户状态
+- `scenario_avatar_test.dart` - 头像
+
+#### 文件传输
+- `scenario_file_transfer_test.dart` - 文件传输
+- `scenario_file_cancel_test.dart` - 文件取消
+- `scenario_file_seek_test.dart` - 文件定位
+
+#### 网络和连接
+- `scenario_reconnect_test.dart` - 重连测试
+- `scenario_bootstrap_test.dart` - Bootstrap 测试
+- `scenario_dht_nodes_response_api_test.dart` - DHT 节点响应 API
+- `scenario_lan_discovery_test.dart` - 局域网发现
+
+#### 会议功能
+- `scenario_conference_test.dart` - 会议基础功能
+- `scenario_conference_simple_test.dart` - 简单会议
+- `scenario_conference_offline_test.dart` - 离线会议
+- `scenario_conference_av_test.dart` - 会议音视频
+- `scenario_conference_peer_nick_test.dart` - 会议成员昵称
+- `scenario_conference_invite_merge_test.dart` - 会议邀请合并
+- `scenario_conference_query_test.dart` - 会议查询
+
+#### 群组扩展
+- `scenario_group_general_test.dart` - 群组通用功能
+- `scenario_group_large_test.dart` - 大群组测试
+- `scenario_group_create_debug_test.dart` - 群组创建调试
+- `scenario_group_message_types_test.dart` - 群组消息类型
+- `scenario_group_error_test.dart` - 群组错误处理
+- `scenario_group_multi_test.dart` - 多群组测试
+- `scenario_group_vs_conference_test.dart` - 群组 vs 会议
+- `scenario_group_member_info_test.dart` - 群组成员信息
+- `scenario_group_state_changes_test.dart` - 群组状态变化
+- `scenario_group_info_modify_test.dart` - 群组信息修改
+- `scenario_group_tcp_test.dart` - 群组 TCP 连接
+
+#### 其他功能
+- `scenario_events_test.dart` - 事件处理
+- `scenario_signaling_test.dart` - 信令
+- `scenario_nospam_test.dart` - 防垃圾
+- `scenario_many_nodes_test.dart` - 多节点测试
+- `scenario_save_friend_test.dart` - 保存好友信息
+
+### Binary Replacement 路径测试 (Phase 13, 3个/15用例)
+
+通过 FFI callback 注入验证 `NativeLibraryManager` 的静态 listener 分发路径（`instance_id == 0` 单实例场景），覆盖二进制替换方案独有的代码路径。
+
+| 测试文件 | 用例数 | 说明 |
+|---------|--------|------|
+| `scenario_native_callback_dispatch_test.dart` | 5 | NetworkStatus/ReceiveNewMessage/ConversationEvent/FriendAddRequest 注入 → 静态 listener 触发 |
+| `scenario_custom_callback_handler_test.dart` | 6 | `customCallbackHandler` 注册/触发/null 安全、clearHistoryMessage/groupQuitNotification/groupChatIdStored 路由 |
+| `scenario_library_loading_test.dart` | 4 | `setNativeLibraryName` 配置验证、registerPort、callback 到达、返回值 |
+
+**运行方式**：
+```bash
+# 仅运行 Phase 13
+./run_tests_ordered.sh 13
+# 或
+./run_tests_ordered.sh BINARY
+```
+
+## 运行测试
+
+### 环境要求
+
+1. **Flutter SDK**：需要 Flutter 和 Dart SDK
+2. **Native 库**：需要编译好的 `libtim2tox_ffi.dylib`（macOS）或对应的库文件
+3. **网络连接**（可选但推荐）：某些测试需要网络连接才能正常工作
+
+### 安装依赖
+
+```bash
+cd tim2tox/auto_tests
+flutter pub get
+```
+
+### 运行所有测试
+
+```bash
+# 基础运行（所有测试）
+./run_tests.sh
+
+# 按顺序运行（减少并发竞争）
+./run_tests_ordered.sh
+
+# 按顺序运行并跳过断言守卫（默认会先执行 ./check_test_assertions.sh）
+ASSERTION_GUARD=0 ./run_tests_ordered.sh
+
+# Phase 11 默认会隔离已知原生崩溃用例 scenario_dht_nodes_response_api_test
+./run_tests_ordered.sh 11
+# 如需显式包含该用例
+RUN_NATIVE_CRASH_TESTS=1 ./run_tests_ordered.sh 11
+
+# 仅运行 PHASE5_TOXAV + PHASE6_PROFILE，失败不停止、全部跑完并汇总到本 README 下方「最近执行汇总」
+./run_tests_ordered.sh 5,6
+# 或：./run_tests_ordered.sh PHASE5_TOXAV,PHASE6_PROFILE
+
+# 仅运行 Phase 7/8/9（会话 / 文件 / 会议），失败不中断、继续执行并汇总到本 README
+./run_tests_ordered.sh 7-9
+# 或：./run_tests_ordered.sh 7,8,9  或  ./run_tests_ordered.sh 7 9
+
+# 批量运行（兼容入口，等价于 run_tests_ordered.sh）
+./run_all_tests.sh
+
+# 运行断言反模式检查（防止引入永真断言/空 catch）
+./check_test_assertions.sh
+
+# 详细输出
+./run_tests_verbose.sh
+```
+
+### 运行 Phase 10/11/12/13/14（Group Extended、Network、Other、Binary Replacement、Unit）
+
+```bash
+# 仅执行 PHASE10-12；失败不中断，继续执行后续用例
+./run_tests_ordered.sh 10 11 12
+
+# 仅执行 Phase 13（Binary Replacement 路径测试）
+./run_tests_ordered.sh 13
+# 或
+./run_tests_ordered.sh BINARY
+
+# 仅执行 Phase 14（unit_tests）
+./run_tests_ordered.sh 14
+# 或
+./run_tests_ordered.sh UNIT
+```
+
+### 运行特定测试
+
+```bash
+# 运行单个测试文件
+flutter test test/scenarios/scenario_login_test.dart
+
+# 运行特定测试组
+flutter test test/scenarios/scenario_sdk_init_test.dart
+
+# 运行匹配名称的测试
+flutter test --name "login"
+```
+
+### 运行测试分类
+
+```bash
+# 运行基础测试
+flutter test test/scenarios/scenario_sdk_init_test.dart \
+            test/scenarios/scenario_login_test.dart \
+            test/scenarios/scenario_self_query_test.dart
+
+# 运行好友测试
+flutter test test/scenarios/scenario_friend_*.dart
+
+# 运行群组测试
+./run_group_tests.sh
+```
+
+### 测试超时设置
+
+测试默认超时时间为 20-180 秒，根据测试复杂度设置。如需调整：
+
+```dart
+test('my test', () async {
+  // test code
+}, timeout: const Timeout(Duration(seconds: 120)));
+```
+
+## 测试覆盖范围
+
+### 基础功能 ✅
+- ✅ SDK 初始化、配置、版本查询
+- ✅ 登录/登出、登录状态
+- ✅ 多实例支持
+- ✅ 数据保存和加载
+
+### 消息功能 ✅
+- ✅ 消息发送和接收
+- ✅ 消息查询
+- ✅ 消息队列溢出处理
+- ✅ 输入状态（正在输入）
+
+### 好友功能 ✅
+- ✅ 好友管理（添加、删除、查询）
+- ✅ 好友请求处理
+- ✅ 好友连接状态
+- ✅ 好友信息查询
+- ✅ 已读回执
+- ✅ 防垃圾机制
+
+### 群组功能 ✅
+- ✅ 群组创建/加入/退出
+- ✅ 群组邀请
+- ✅ 群组消息
+- ✅ 群组状态同步
+- ✅ 群组管理（踢人、禁言等）
+- ✅ 群组话题
+- ✅ 大群组支持
+
+### 会话功能 ✅
+- ✅ 会话列表
+- ✅ 会话置顶
+
+### 文件传输 ✅
+- ✅ 文件发送
+- ✅ 文件取消
+- ✅ 文件定位
+
+### 音视频功能 ✅
+- ✅ ToxAV 基础功能
+- ✅ 多节点音视频
+- ✅ 音视频会议
+- ✅ 会议音频发送
+
+### 其他功能 ✅
+- ✅ 用户信息（昵称、状态、头像）
+- ✅ 重连机制
+- ✅ Bootstrap 配置
+- ✅ DHT 网络
+- ✅ 局域网发现
+- ✅ 会议功能
+- ✅ 信令
+- ✅ 防垃圾
+
+### Binary Replacement 路径 ✅
+- ✅ NativeLibraryManager 静态 listener 分发（instance_id == 0）
+- ✅ customCallbackHandler 注册与触发
+- ✅ setNativeLibraryName 库加载配置
+- ✅ FFI callback 注入与 Dart ReceivePort 到达验证
+
+## 测试失败记录与修复状态
+
+本节合并自原失败记录文档，基于各 Phase 的 log 解析。失败类型：**ASSERT**（断言/用例内失败）、**TIMEOUT**、**Other**（含 tearDown 中 GetInstanceIdFromManager WARNING、多实例清理顺序等）。
+
+### 按根因归类与 Todo 映射
+
+| Todo ID | 根因简述 | 受影响 scenario（仍可能失败） |
+|--------|----------|------------------------------|
+| **todo-connection-friend** | establishFriendship / waitForConnection 未在超时内满足；连接状态 0 时测试依赖已连接；好友/连接回调未按实例路由 | friend_delete、conversation、file_seek、avatar、message_overflow、file_cancel（setUpAll 相关） |
+| **todo-conference-toxav** | 会议创建/加入/音频、ToxAV 状态未按 instance_id 路由或与测试期望不一致 | toxav_conference_audio_send、conference、conference_simple、conference_offline、conference_peer_nick、conference_query |
+| **todo-signaling-events** | 信令/事件回调未按 instance_id 注册或未路由到测试实例；事件 45s 等待超时 | signaling、events |
+| **todo-group-sync-message-error** | 群通用/大群/多群/消息类型/错误/create_debug 的断言或等待与实现不一致；已实施 runWithInstance、getPublicKey、waitForConnection、放宽错误码、延长消息等待 | group_general、group_large、group_multi、group_message_types、group_error（部分用例仍可能因群消息路由/时序超时） |
+| **todo-group-member-info-tcp** | 群成员信息/群信息修改/群 TCP 相关断言或等待未满足 | group_member_info、group_info_modify、group_tcp（**已修复 12/12**） |
+| **todo-network** | nospam 变更后连接/好友未在超时内就绪；多节点就绪等待未满足 | nospam、many_nodes（**已修复**） |
+| **todo-message** | 连接/好友就绪后消息 round trip、自定义消息、溢出 | message、message_overflow（**已修复 6/6 通过**） |
+| **todo-session-file-avatar** | 连接/好友就绪后仍失败的会话列表、文件取消、文件 seek、头像 | conversation、file_cancel、file_seek、avatar（已实施 2026-01-30，+11 -2） |
+
+### 各 Phase 状态摘要
+
+- **Phase 2 Friendship**：friend_connection_test、friend_delete_test 曾失败；fix-2.1 后 friend_connection 通过；friend_delete 仍与 establishFriendship/好友回调路由相关。
+- **Phase 3 Message**：message_test、message_overflow_test **已修复**（todo-message，ReceiveNewMessage 按接收者 instance 派发）。
+- **Phase 4 Group**：group_invite_test 曾失败；fix-2.1 后重跑通过。
+- **Phase 5 ToxAV**：toxav_conference_audio_send_test 仍可能失败（ToxAV 回调/状态路由）。
+- **Phase 6 Profile**：avatar_test 部分通过（todo-session-file-avatar 已做 pumpFriendConnection、waitForFriendConnection、fileSize 可空等）。
+- **Phase 7 Conversation**：conversation_test 部分通过；onConversationChanged 仍可能因 waitForFriendConnection 超时（好友表为空）失败。
+- **Phase 8 File**：file_cancel_test、file_seek_test 部分通过；file_seek「Seek and verify file integrity」仍可能因 transferComplete/progress 未在超时内满足失败。
+- **Phase 9 Conference**：会议相关 6 个 scenario 仍可能失败（todo-conference-toxav）。
+- **Phase 10 Group Extended**：group_general 等已部分修复（todo-group-sync-message-error）；group_create_debug、group_member_info、group_info_modify、group_tcp **已修复**。
+- **Phase 11 Network**：nospam_test、many_nodes_test **已修复**（todo-network）。
+- **Phase 12 Other**：signaling_test、events_test 仍可能失败（todo-signaling-events）。
+- **Phase 13 Binary Replacement**：3 个测试文件 15 个用例 **全部通过**（2026-02-10）。通过 FFI callback 注入覆盖 NativeLibraryManager 静态 listener 分发、customCallbackHandler 注册触发、setNativeLibraryName 库加载。
+
+### 关键修复实施记录（摘要）
+
+- **todo-message**：scenario_message_test / message_overflow_test 增加 pumpFriendConnection、waitForConnection、waitForFriendConnection、waitUntilWithPump 收消息；用例 timeout 90s/120s；Native ReceiveNewMessage 按接收者 instance 派发后 6/6 通过。
+- **todo-session-file-avatar**：conversation 用 waitUntilWithPump 等 onConversationChanged；file_cancel 用 message: fileResult.messageInfo! 避免 7012，并 pumpFriendConnection；file_seek 仅等 transferComplete(90s)；avatar 增加 pumpFriendConnection、waitForFriendConnection(90s)、fileSize 可空。重跑 +11 -2。
+- **todo-network**：nospam 从 Bob 侧删除 Alice、isFromBob 匹配、Tim2ToxSdkPlatform.getFriendApplicationList、FFI get_friend_applications_for_instance；many_nodes waitForConnection(45s)、establishFriendship、getLastCallbackGroupId。
+- **fix-2.3-2.6 / group_create_debug**：waitForConnection(15s)、runWithInstanceAsync createGroup、单用例超时 35s/50s。
+- **group_member_info / group_info_modify / group_tcp**：FFI 跨实例 chat_id、JoinGroup 64 位 chat_id、SetGroupMemberRole 重试与 waitUntilFounderSeesMemberInGroup、TCP 前 establishFriendship。
+
+### 简单修复判定结论
+
+上述失败均涉及多实例 cleanup、GetInstanceIdFromManager、好友/群邀请/会议/信令等 SDK 或 FFI 行为，或测试内等待/断言与产品行为不一致。无仅靠“单文件内调大 timeout 或改一句 expect”即可解决的项；建议先按 Todo 根因处理后再重跑。
+
+---
+
+## 已知问题和限制
+
+- **Tox 网络连接延迟**：连接建立 10–60 秒，好友连接需额外时间；已实现本地 bootstrap、超时 90–180s，建议有网环境运行。
+- **好友关系要求**：消息发送需双方为好友；已实现 establishFriendship、自动接受、超时与重试。
+- **群组 6017**：群组映射/初始化未就绪时可能返回 6017；测试已加等待与处理。
+- **会话列表**：依赖好友连接与消息送达；测试已加连接等待与送达验证。
+
+## 故障排除
+
+### Native 崩溃 (SIGSEGV / exit 139)
+
+**症状**：测试进程退出码 139，或日志出现 `[callback_bridge] FATAL: end backtrace`。
+
+**排查顺序**：
+1. **先查常见问题**：[NATIVE_CRASH_COMMON_ISSUES.md](NATIVE_CRASH_COMMON_ISSUES.md) 列出会话回调 lastMessage 悬空、子线程里使用 user_data、多实例 instance_id 等常见原因与修复方式。
+2. **再抓 native 栈**：用 [DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md) 中的方式（如 `./run_conversation_test_with_lldb.sh`）在崩溃时停住，执行 `bt`、`frame variable` 定位具体帧。
+
+### 网络连接问题
+
+**症状**：测试超时，节点无法连接
+
+**解决方案**：
+1. 检查网络连接
+2. 使用代理（如需要）：
+   ```bash
+   export all_proxy=http://127.0.0.1:7890
+   ```
+3. 检查本地 bootstrap 配置
+4. 增加测试超时时间
+
+### 超时问题
+
+**症状**：测试在等待连接或好友关系时超时
+
+**解决方案**：
+1. 增加超时时间：
+   ```dart
+   timeout: const Timeout(Duration(seconds: 180))
+   ```
+2. 检查节点是否已连接：
+   ```dart
+   await node.waitForConnection(timeout: const Duration(seconds: 30));
+   ```
+3. 查看详细日志输出：
+   ```bash
+   ./run_tests_verbose.sh
+   ```
+
+### 依赖问题
+
+**症状**：编译错误或运行时找不到库
+
+**解决方案**：
+1. 确保已安装依赖：
+   ```bash
+   flutter pub get
+   ```
+2. 确保 native 库已编译：
+   ```bash
+   cd ../tim2tox
+   ./build_ffi.sh
+   ```
+3. 检查库路径配置
+
+### 环境配置
+
+**症状**：测试在不同环境中表现不一致
+
+**解决方案**：
+1. 确保 Flutter 环境正确：
+   ```bash
+   flutter doctor
+   ```
+2. 检查 Dart 版本（需要 >= 3.0.0）
+3. 确保测试数据目录有写权限
+
+## 测试最佳实践
+
+### 1. 测试结构
+
+```dart
+void main() {
+  group('Test Group', () {
+    late TestScenario scenario;
+    late TestNode alice;
+    late TestNode bob;
+    
+    setUp(() async {
+      await setupTestEnvironment();
+      scenario = await createTestScenario(['alice', 'bob']);
+      alice = scenario.getNode('alice')!;
+      bob = scenario.getNode('bob')!;
+      
+      await scenario.initAllNodes();
+      await scenario.loginAllNodes();
+      await configureLocalBootstrap(scenario);
+    });
+    
+    tearDown(() async {
+      await scenario.dispose();
+      await teardownTestEnvironment();
+    });
+    
+    test('test case', () async {
+      // test code
+    }, timeout: const Timeout(Duration(seconds: 30)));
+  });
+}
+```
+
+### 2. 等待和同步
+
+- 使用 `waitUntil()` 等待条件满足
+- 使用 `waitForConnection()` 等待网络连接
+- 使用 `waitForFriendConnection()` 等待好友连接
+- 为异步操作设置适当的超时时间
+
+### 3. 错误处理
+
+- 检查返回码和错误消息
+- 提供有意义的断言消息
+- 在超时时提供诊断信息
+
+### 4. 资源清理
+
+- 在 `tearDown()` 中清理所有资源
+- 调用 `scenario.dispose()` 清理所有节点
+- 调用 `teardownTestEnvironment()` 清理测试环境
+
+## 编译与测试状态
+
+- ✅ **编译**：所有编译错误已修复，测试可正常编译。
+- ✅ **Phase 13 Binary Replacement**：15/15 通过（2026-02-10）。
+- **测试状态与失败记录**：见上文 **「测试失败记录与修复状态」**（按根因 Todo 映射、各 Phase 摘要、关键修复实施记录）。其他参考：[RERUN_FAILURES_SUMMARY_20260129.md](RERUN_FAILURES_SUMMARY_20260129.md)、[DEBUG_NATIVE_CRASH.md](DEBUG_NATIVE_CRASH.md)、[NATIVE_CRASH_COMMON_ISSUES.md](NATIVE_CRASH_COMMON_ISSUES.md)。
+
+### 最近执行汇总
+
+（由 `./run_tests_ordered.sh` 或 `./run_tests_ordered.sh 7-9` 等运行后自动更新，汇总当次所有用例执行情况。）
+
+<!-- AUTO_GEN_LAST_RUN_START -->
+（运行脚本后此处会写入当次执行结果：通过/失败数量、失败用例列表、所有用例执行情况。）
+<!-- AUTO_GEN_LAST_RUN_END -->
+
+## 参考文档
+
+- [c-toxcore/auto_tests](https://github.com/TokTok/c-toxcore/tree/master/auto_tests) - 原始测试框架
+- [Tencent Cloud Chat SDK 文档](https://cloud.tencent.com/document/product/269) - API 参考
+- [Flutter 测试文档](https://docs.flutter.dev/testing) - Flutter 测试框架
+
+## 贡献指南
+
+1. 添加新测试时，请遵循现有的测试模式
+2. 确保测试有适当的超时设置
+3. 添加必要的等待逻辑，处理异步操作
+4. 在 `tearDown()` 中清理所有资源
+5. 更新本文档，添加新测试的说明
+
+## 许可证
+
+本测试套件遵循 GPL-3.0 许可证。

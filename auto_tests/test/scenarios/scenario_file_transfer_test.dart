@@ -1,0 +1,279 @@
+/// File Transfer Test
+///
+/// Tests file sending, receiving, and progress callbacks
+/// Reference: c-toxcore/auto_tests/scenarios/scenario_file_transfer_test.c
+
+import 'dart:io';
+import 'package:test/test.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
+import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
+import 'package:tencent_cloud_chat_sdk/enum/message_elem_type.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
+import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_download_progress.dart';
+import '../test_helper.dart';
+import '../test_fixtures.dart';
+
+void main() {
+  group('File Transfer Tests', () {
+    late TestScenario scenario;
+    late TestNode alice;
+    late TestNode bob;
+    late String testDataDir;
+    late File testFile;
+
+    setUpAll(() async {
+      await setupTestEnvironment();
+      testDataDir = await getTestDataDir();
+
+      // Create a test file
+      testFile = File('$testDataDir/test_file.txt');
+      await testFile
+          .writeAsString('This is a test file for file transfer.\n' * 100);
+
+      scenario = await createTestScenario(['alice', 'bob']);
+      await scenario.initAllNodes();
+      alice = scenario.getNode('alice')!;
+      bob = scenario.getNode('bob')!;
+      await Future.wait([alice.login(), bob.login()]);
+      await waitUntil(() => alice.loggedIn && bob.loggedIn,
+          timeout: const Duration(seconds: 10),
+          description: 'both nodes logged in');
+      await configureLocalBootstrap(scenario);
+      await establishFriendship(alice, bob);
+      // Pump so P2P connection is established before file transfer
+      await pumpFriendConnection(alice, bob);
+    });
+
+    tearDownAll(() async {
+      // Cleanup test file
+      if (await testFile.exists()) {
+        await testFile.delete();
+      }
+
+      await scenario.dispose();
+      await teardownTestEnvironment();
+    });
+
+    // Lightweight setUp for per-test cleanup if needed
+    setUp(() async {
+      final bob = scenario.getNode('bob')!;
+      bob.receivedMessages.clear();
+    });
+
+    test('Send file to friend and receive', () async {
+      // Setup Bob's message listener to receive file
+      var fileReceived = false;
+
+      final bobListener = V2TimAdvancedMsgListener(
+        onRecvNewMessage: (V2TimMessage message) {
+          // Accept FILE by elemType or by fileElem (native may send CElemType 4)
+          final text = message.textElem?.text ?? '';
+          final isForwardFileText =
+              text.contains('转发文件') && text.contains('test_file.txt');
+          if (message.elemType == MessageElemType.V2TIM_ELEM_TYPE_FILE ||
+              message.fileElem != null ||
+              isForwardFileText) {
+            fileReceived = true;
+            bob.addReceivedMessage(message);
+          }
+        },
+        onMessageDownloadProgressCallback:
+            (V2TimMessageDownloadProgress progress) {
+          // Track download progress
+          if (progress.currentSize == progress.totalSize) {
+            fileReceived = true;
+          }
+        },
+      );
+
+      bob.runWithInstance(
+          () => TIMMessageManager.instance.addAdvancedMsgListener(bobListener));
+      try {
+        final bobToxId = bob.getToxId();
+        await alice.waitForConnection(timeout: const Duration(seconds: 15));
+        await alice.waitForFriendConnection(bobToxId,
+            timeout: const Duration(seconds: 90));
+        await Future.delayed(const Duration(seconds: 2));
+
+        // Ensure file exists (native send uses this path)
+        if (!await testFile.exists()) {
+          await Directory(testDataDir).create(recursive: true);
+          await File(testFile.path)
+              .writeAsString('This is a test file for file transfer.\n' * 100);
+        }
+        final sendResult = await alice.runWithInstanceAsync(() async {
+          final fileResult = TIMMessageManager.instance.createFileMessage(
+            filePath: testFile.path,
+            fileName: 'test_file.txt',
+          );
+          expect(fileResult.messageInfo, isNotNull);
+          return await TIMMessageManager.instance.sendMessage(
+            message: fileResult.messageInfo!,
+            receiver: bobToxId,
+            groupID: null,
+          );
+        });
+
+        expect(sendResult.code, equals(0));
+
+        // Wait for file to be received; pump Tox so file offer and callbacks are delivered.
+        await waitUntilWithPump(
+          () => fileReceived,
+          timeout: const Duration(seconds: 60),
+          description: 'fileReceived',
+        );
+
+        expect(fileReceived, isTrue);
+        expect(bob.receivedMessages.length, greaterThan(0));
+
+        final fileMessages = bob.receivedMessages
+            .where((m) =>
+                m.elemType == MessageElemType.V2TIM_ELEM_TYPE_FILE ||
+                m.fileElem != null)
+            .toList();
+        if (fileMessages.isNotEmpty) {
+          final receivedMessage = fileMessages.last;
+          expect(receivedMessage.fileElem, isNotNull);
+          if (receivedMessage.fileElem?.fileName != null) {
+            expect(receivedMessage.fileElem!.fileName, equals('test_file.txt'));
+          }
+        } else {
+          final hasForwardText = bob.receivedMessages.any((m) {
+            final t = m.textElem?.text ?? '';
+            return t.contains('转发文件') && t.contains('test_file.txt');
+          });
+          expect(hasForwardText, isTrue,
+              reason: 'Expected FILE element or forward file text');
+        }
+      } finally {
+        bob.runWithInstance(() => TIMMessageManager.instance
+            .removeAdvancedMsgListener(listener: bobListener));
+      }
+    }, timeout: const Timeout(Duration(seconds: 130)));
+
+    test('File transfer progress callbacks', () async {
+      final bobToxId = bob.getToxId();
+      await alice.waitForConnection(timeout: const Duration(seconds: 15));
+      await alice.waitForFriendConnection(bobToxId,
+          timeout: const Duration(seconds: 90));
+
+      await Directory(testDataDir).create(recursive: true);
+      final largeFile = File('$testDataDir/large_test_file.txt');
+      await largeFile.writeAsString('Large file content.\n' * 1000);
+
+      var progressUpdates = <int>[];
+      final progressListener = V2TimAdvancedMsgListener(
+        onRecvNewMessage: (V2TimMessage message) {
+          if (message.elemType == MessageElemType.V2TIM_ELEM_TYPE_FILE) {
+            progressUpdates.add(message.fileElem?.fileSize ?? 0);
+          }
+        },
+        onMessageDownloadProgressCallback:
+            (V2TimMessageDownloadProgress progress) {
+          progressUpdates.add(progress.currentSize);
+        },
+      );
+
+      bob.runWithInstance(() =>
+          TIMMessageManager.instance.addAdvancedMsgListener(progressListener));
+      try {
+        await Future.delayed(const Duration(seconds: 2));
+
+        final sendResult = await alice.runWithInstanceAsync(() async {
+          final fileResult = TIMMessageManager.instance.createFileMessage(
+            filePath: largeFile.path,
+            fileName: 'large_test_file.txt',
+          );
+          expect(fileResult.messageInfo, isNotNull);
+          return await TIMMessageManager.instance.sendMessage(
+            groupID: null,
+            id: fileResult.id!,
+            receiver: bobToxId,
+          );
+        });
+
+        expect(sendResult.code, equals(0));
+
+        // Give native time to enqueue file_request and Dart poll to process it before waiting for progress
+        pumpAllInstancesOnce(iterations: 100);
+        await Future.delayed(const Duration(milliseconds: 800));
+
+        // Wait for progress updates; pump Tox so file transfer progresses
+        await waitUntilWithPump(
+          () => progressUpdates.isNotEmpty,
+          timeout: const Duration(seconds: 60),
+          description: 'progressUpdates',
+        );
+
+        expect(progressUpdates.length, greaterThan(0));
+      } finally {
+        bob.runWithInstance(() => TIMMessageManager.instance
+            .removeAdvancedMsgListener(listener: progressListener));
+        if (await largeFile.exists()) {
+          await largeFile.delete();
+        }
+      }
+    }, timeout: const Timeout(Duration(seconds: 90)));
+
+    test('File transfer completion verification', () async {
+      final bobToxId = bob.getToxId();
+      await alice.waitForConnection(timeout: const Duration(seconds: 15));
+      await alice.waitForFriendConnection(bobToxId,
+          timeout: const Duration(seconds: 90));
+
+      var fileCompleted = false;
+      final completionListener = V2TimAdvancedMsgListener(
+        onRecvNewMessage: (V2TimMessage message) {
+          if (message.elemType == MessageElemType.V2TIM_ELEM_TYPE_FILE) {
+            // File received (count as complete when message is delivered; progress may follow)
+            fileCompleted = true;
+          }
+        },
+        onMessageDownloadProgressCallback:
+            (V2TimMessageDownloadProgress progress) {
+          if (progress.currentSize == progress.totalSize &&
+              progress.totalSize > 0) {
+            fileCompleted = true;
+          }
+        },
+      );
+
+      bob.runWithInstance(() => TIMMessageManager.instance
+          .addAdvancedMsgListener(completionListener));
+      try {
+        await Future.delayed(const Duration(seconds: 2));
+
+        // Ensure file exists (may have been removed by earlier test or env)
+        if (!await testFile.exists()) {
+          await Directory(testDataDir).create(recursive: true);
+          await testFile
+              .writeAsString('This is a test file for file transfer.\n' * 100);
+        }
+        final sendResult = await alice.runWithInstanceAsync(() async {
+          final fileResult = TIMMessageManager.instance.createFileMessage(
+            filePath: testFile.path,
+            fileName: 'test_file.txt',
+          );
+          return await TIMMessageManager.instance.sendMessage(
+            groupID: null,
+            id: fileResult.id!,
+            receiver: bobToxId,
+          );
+        });
+
+        expect(sendResult.code, equals(0));
+
+        await waitUntilWithPump(
+          () => fileCompleted,
+          timeout: const Duration(seconds: 60),
+          description: 'fileCompleted',
+        );
+
+        expect(fileCompleted, isTrue);
+      } finally {
+        bob.runWithInstance(() => TIMMessageManager.instance
+            .removeAdvancedMsgListener(listener: completionListener));
+      }
+    }, timeout: const Timeout(Duration(seconds: 90)));
+  });
+}

@@ -6,8 +6,27 @@ set(BINARY_NAME "tim2tox")
 # Compiler warnings
 add_definitions(-Wfatal-errors)
 
-# Find dependencies
-find_package(Sodium REQUIRED)
+# Find dependencies (libsodium)
+find_package(Sodium QUIET)
+if (NOT Sodium_FOUND)
+    find_package(PkgConfig QUIET)
+    if (PKG_CONFIG_FOUND)
+        pkg_check_modules(SODIUM_PKG QUIET libsodium)
+        if (SODIUM_PKG_FOUND)
+            set(SODIUM_INCLUDE_DIR ${SODIUM_PKG_INCLUDE_DIRS})
+            # Prefer full library path if available; otherwise rely on linker flags
+            if (SODIUM_PKG_LIBRARIES)
+                list(GET SODIUM_PKG_LIBRARIES 0 SODIUM_LIBRARY)
+            endif()
+        endif()
+    endif()
+    if (NOT SODIUM_INCLUDE_DIR)
+        set(SODIUM_INCLUDE_DIR "/opt/homebrew/include")
+    endif()
+    if (NOT SODIUM_LIBRARY)
+        set(SODIUM_LIBRARY "/opt/homebrew/lib/libsodium.dylib")
+    endif()
+endif()
 
 # Include paths
 include_directories(
@@ -22,46 +41,83 @@ include_directories(
     ${SODIUM_INCLUDE_DIR}
 )
 
-# Source files
-file(GLOB TIM2TOX_SRCS
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
+# Build source list explicitly and respect BUILD_TOXAV
+set(TIM2TOX_CORE_SRCS
+    V2TIMManagerImpl.cpp
+    V2TIMMessageManagerImpl.cpp
+    V2TIMFriendshipManagerImpl.cpp
+    V2TIMGroupManagerImpl.cpp
+    V2TIMSignalingManagerImpl.cpp
+    V2TIMCommunityManagerImpl.cpp
+    V2TIMConversationManagerImpl.cpp
+    V2TIMLog.cpp
+    V2TIMString.cpp
+    V2TIMUtils.cpp
+    V2TIMDataShim.cpp
+    ToxManager.cpp
+    V2TIMBuffer.cpp
+    MessageReplyUtil.cpp
+    MergerMessageUtil.cpp
+    RevokeMessageUtil.cpp
+    # IrcClientManager.cpp removed - now in dynamic library
 )
-
-# Handle ToxAV files based on BUILD_TOXAV option
-if(NOT BUILD_TOXAV)
-    list(FILTER TIM2TOX_SRCS EXCLUDE REGEX ".*ToxAVManager\\.(cpp|h)$")
+set(TIM2TOX_SRCS ${TIM2TOX_CORE_SRCS})
+if(BUILD_TOXAV)
+    list(APPEND TIM2TOX_SRCS ToxAVManager.cpp)
 endif()
 
-# Create static library
-add_library(${BINARY_NAME} STATIC ${TIM2TOX_SRCS})
+add_library(tim2tox STATIC ${TIM2TOX_SRCS})
 
-# Add toxcore include directory
-target_include_directories(${BINARY_NAME}
-    PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/third_party/c-toxcore/toxcore
+if(BUILD_TOXAV)
+    target_compile_definitions(tim2tox PRIVATE BUILD_TOXAV=1)
+endif()
+
+# Set include directories for the library
+target_include_directories(tim2tox
+    PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/source
     ${CMAKE_SOURCE_DIR}/third_party/c-toxcore
-    ${CMAKE_BINARY_DIR}/third_party/c-toxcore
-    ${CMAKE_BINARY_DIR}/third_party/c-toxcore/toxcore
+    ${CMAKE_SOURCE_DIR}/third_party/c-toxcore/toxcore
 )
 
 # Link dependencies
-target_link_libraries(${BINARY_NAME}
-    PRIVATE
+target_link_libraries(tim2tox
+    PUBLIC
     toxcore_static
     ${SODIUM_LIBRARY}
 )
 
 if(BUILD_TOXAV)
-    target_link_libraries(${BINARY_NAME}
-        PRIVATE
-        toxav_static
-    )
+    # Note: toxav code is compiled into toxcore_static, so we don't need to link toxav_static
+    # But we need to link OPUS and VPX libraries that toxav depends on
+    if(TARGET Opus::opus AND TARGET libvpx::libvpx)
+        target_link_libraries(tim2tox
+            PUBLIC
+            Opus::opus
+            libvpx::libvpx
+        )
+    elseif(TARGET PkgConfig::OPUS AND TARGET PkgConfig::VPX)
+        target_link_libraries(tim2tox
+            PUBLIC
+            PkgConfig::OPUS
+            PkgConfig::VPX
+        )
+    else()
+        # Fallback: use pkg-config variables
+        if(OPUS_FOUND)
+            target_link_libraries(tim2tox PUBLIC ${OPUS_LIBRARIES})
+            target_include_directories(tim2tox PUBLIC ${OPUS_INCLUDE_DIRS})
+        endif()
+        if(VPX_FOUND)
+            target_link_libraries(tim2tox PUBLIC ${VPX_LIBRARIES})
+            target_include_directories(tim2tox PUBLIC ${VPX_INCLUDE_DIRS})
+        endif()
+    endif()
 endif()
 
 # Compiler options
-target_compile_options(${BINARY_NAME}
+target_compile_options(tim2tox
     PRIVATE
     -Wall
     -Wextra
@@ -71,27 +127,21 @@ target_compile_options(${BINARY_NAME}
 )
 
 if(APPLE)
-    target_compile_options(${BINARY_NAME}
+    target_compile_options(tim2tox
         PRIVATE
         -Wno-deprecated-declarations
     )
 endif()
 
-# Version information
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/version.h.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/version.h"
-)
-
 # Install rules
-install(TARGETS ${BINARY_NAME}
+install(TARGETS tim2tox
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 # Install headers
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/${BINARY_NAME}
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tim2tox
     FILES_MATCHING PATTERN "*.h"
     PATTERN "*.h.in" EXCLUDE)

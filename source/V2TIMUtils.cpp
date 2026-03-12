@@ -94,10 +94,16 @@ std::vector<uint8_t> SerializePacket(const SignalingPacket& packet) {
     return buffer;
 }
 
-// 反序列化方法：从字节流解析 SignalingPacket
+// 反序列化方法：从字节流解析 SignalingPacket（带边界检查，避免越界崩溃）
 SignalingPacket ParsePacket(const uint8_t* data, size_t length) {
     SignalingPacket packet;
     size_t offset = 0;
+
+    // 最小长度: type(1) + inviteIDLen(4) + dataLen(4) + timeout(4) = 13
+    if (!data || length < 13) {
+        packet.type = static_cast<SignalingType>(0xff);  // invalid, caller will ignore
+        return packet;
+    }
 
     // 解析 type
     packet.type = static_cast<SignalingType>(data[offset]);
@@ -107,17 +113,33 @@ SignalingPacket ParsePacket(const uint8_t* data, size_t length) {
     uint32_t inviteIDLength;
     memcpy(&inviteIDLength, data + offset, sizeof(uint32_t));
     offset += sizeof(uint32_t);
+    if (offset + inviteIDLength > length) {
+        packet.type = static_cast<SignalingType>(0xff);
+        return packet;
+    }
     packet.inviteID.assign(reinterpret_cast<const char*>(data + offset), inviteIDLength);
     offset += inviteIDLength;
 
     // 解析 data
+    if (offset + sizeof(uint32_t) > length) {
+        packet.type = static_cast<SignalingType>(0xff);
+        return packet;
+    }
     uint32_t dataLength;
     memcpy(&dataLength, data + offset, sizeof(uint32_t));
     offset += sizeof(uint32_t);
+    if (offset + dataLength > length) {
+        packet.type = static_cast<SignalingType>(0xff);
+        return packet;
+    }
     packet.data.assign(reinterpret_cast<const char*>(data + offset), dataLength);
     offset += dataLength;
 
     // 解析 timeout
+    if (offset + sizeof(uint32_t) > length) {
+        packet.type = static_cast<SignalingType>(0xff);
+        return packet;
+    }
     uint32_t timeoutBE;
     memcpy(&timeoutBE, data + offset, sizeof(uint32_t));
     packet.timeout = ntohl(timeoutBE); // 转为主机字节序

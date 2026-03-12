@@ -5,7 +5,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstring>
-#include "tox.h"
+#include "toxcore/tox.h"
 
 namespace ToxUtil {
 

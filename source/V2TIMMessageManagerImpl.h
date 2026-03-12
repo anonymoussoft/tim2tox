@@ -9,23 +9,20 @@
 #include "V2TIMMessageManager.h"
 #include "ToxManager.h"
 
-#include <SQLiteCpp/SQLiteCpp.h>
 #include <unordered_set>
+#include <unordered_map>
 #include <mutex>
 #include <vector>
 #include "V2TIMLog.h" // Optional for logging
 
 // Forward declarations if needed
 // class SQLiteDatabase; 
+class V2TIMManagerImpl;
 
 class V2TIMMessageManagerImpl : public V2TIMMessageManager {
 private:
     std::unordered_set<V2TIMAdvancedMsgListener*> listeners_;
     std::mutex listener_mutex_;
-    SQLite::Database db_;
-
-    void InsertMessageToDB(const V2TIMMessage& msg);
-    void UpdateMessageRevokeStatus(const V2TIMString& msgID, bool revoked);
     uint32_t GetFriendNumber(const V2TIMString& userID);
     uint32_t GetConferenceNumber(const V2TIMString& groupID);
 
@@ -35,6 +32,9 @@ public:
 
     // Destructor
     ~V2TIMMessageManagerImpl() override;
+    
+    // Internal notification methods
+    void NotifyMessageRevoked(const V2TIMString& msgID, const V2TIMString& revoker, const V2TIMString& reason);
 
     // Listener Management
     void AddAdvancedMsgListener(V2TIMAdvancedMsgListener* listener) override;
@@ -107,6 +107,9 @@ public:
     // Used by V2TIMManagerImpl::HandleFriendMessage / HandleGroupMessage
     void NotifyAdvancedListenersReceivedMessage(const V2TIMMessage& message);
 
+    // Multi-instance support: Set the associated V2TIMManagerImpl instance
+    void SetManagerImpl(V2TIMManagerImpl* manager_impl);
+
 private:
     // Private constructor for singleton
     V2TIMMessageManagerImpl();
@@ -119,6 +122,15 @@ private:
 
     // Helper to create a base V2TIMMessage object
     V2TIMMessage CreateBaseMessage();
+
+    // Local storage for receive message options
+    std::unordered_map<std::string, V2TIMReceiveMessageOpt> c2c_receive_opts_;
+    std::unordered_map<std::string, V2TIMReceiveMessageOpt> group_receive_opts_;
+    std::mutex receive_opt_mutex_;
+
+    // Reference to V2TIMManagerImpl for multi-instance support
+    V2TIMManagerImpl* manager_impl_;
+    std::mutex manager_impl_mutex_;
 
     // Callback with appropriate error for unimplemented features
     void ReportNotImplemented(V2TIMCallback* callback);

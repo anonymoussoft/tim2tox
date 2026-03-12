@@ -1,0 +1,221 @@
+/// TUICallKit Adapter
+///
+/// Adapts TUICallKit service calls to ToxAV implementation
+/// This allows chat-uikit-flutter to use ToxAV without modification
+///
+/// Usage:
+///   await TUICallKitAdapter.initialize(sdkPlatform, avService, callBridge);
+///   This will intercept TUICallKit calls and route them to ToxAV
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+import 'call_bridge_service.dart';
+
+/// TUICallKit service name (must match tuicore_define.dart / TUICallingService)
+const String TUICALLKIT_SERVICE_NAME = "TUICallingService";
+
+/// Method names
+const String METHOD_NAME_CALL = "call";
+
+/// Parameter names (must match tuicore_define.dart)
+const String PARAM_NAME_TYPE = "type";
+const String PARAM_NAME_USERIDS = "userIDs";
+const String PARAM_NAME_GROUPID = "groupId";
+
+/// Call types
+const String TYPE_AUDIO = "audio";
+const String TYPE_VIDEO = "video";
+
+/// Callback for outgoing call initiated events.
+/// [inviteID]: signaling invite ID, [userID]: remote user, [type]: "audio" or "video".
+typedef OutgoingCallCallback = void Function(
+    String inviteID, String userID, String type);
+typedef OutgoingCallPreflight = Future<bool> Function(
+    String userID, String type);
+
+/// TUICallKit Adapter Service
+///
+/// Registers itself as a TUICallKit service in TUICore
+/// and routes calls to ToxAV via CallBridgeService
+class TUICallKitAdapter {
+  static TUICallKitAdapter? _instance;
+  final TencentCloudChatSdkPlatform _sdkPlatform;
+  final CallAvBackend _avService;
+  final CallBridgeService _callBridge;
+
+  // Track active calls by user ID
+  final Map<String, String> _userToInviteId = {}; // userID -> inviteID
+
+  /// Fires when an outgoing call is successfully initiated so the UI can show the ringing overlay.
+  OutgoingCallCallback? onOutgoingCallInitiated;
+  OutgoingCallPreflight? onBeforeOutgoingCall;
+
+  TUICallKitAdapter._(this._sdkPlatform, this._avService, this._callBridge);
+
+  /// Initialize the adapter
+  static Future<TUICallKitAdapter> initialize(
+    TencentCloudChatSdkPlatform sdkPlatform,
+    CallAvBackend avService,
+    CallBridgeService callBridge,
+  ) async {
+    if (_instance != null) return _instance!;
+
+    _instance = TUICallKitAdapter._(sdkPlatform, avService, callBridge);
+    _globalAdapter = _instance;
+    await _instance!._registerService();
+    return _instance!;
+  }
+
+  /// Internal setup (TUICore registration happens via registerToxAVWithTUICore).
+  Future<void> _registerService() async {
+    print('[TUICallKitAdapter] Service initialized');
+  }
+
+  /// Intercept and handle TUICallKit calls
+  /// This should be called from TencentCloudChatTUICore.audioCall/videoCall
+  Future<bool> handleCall({
+    required String type,
+    required List<String> userids,
+    String? groupid,
+  }) async {
+    try {
+      await _handleCall({
+        PARAM_NAME_TYPE: type,
+        PARAM_NAME_USERIDS: userids,
+        PARAM_NAME_GROUPID: groupid ?? "",
+      });
+      return true;
+    } catch (e) {
+      print('[TUICallKitAdapter] Error handling call: $e');
+      return false;
+    }
+  }
+
+  /// Handle call method. Throws on failure so handleCall() can return false.
+  Future<void> _handleCall(Map<String, Object> params) async {
+    final type = params[PARAM_NAME_TYPE] as String?;
+    final userids = params[PARAM_NAME_USERIDS] as List<String>?;
+    final groupID = params[PARAM_NAME_GROUPID] as String?;
+
+    if (userids == null || userids.isEmpty) {
+      throw Exception('No userids provided');
+    }
+
+    // For now, only support 1-on-1 calls
+    if (userids.length > 1) {
+      throw Exception('Group calls not yet supported');
+    }
+
+    final userID = userids.first;
+    final isVideo = type == TYPE_VIDEO;
+
+    if (onBeforeOutgoingCall != null) {
+      final allowed = await onBeforeOutgoingCall!(
+        userID,
+        type ?? TYPE_AUDIO,
+      );
+      if (!allowed) {
+        throw Exception('Outgoing call preflight denied');
+      }
+    }
+
+    // Create call data JSON
+    final callData = jsonEncode({
+      'type': type,
+      'audio': true,
+      'video': isVideo,
+    });
+
+    // Invite user via signaling
+    final result = await _sdkPlatform.invite(
+      invitee: userID,
+      data: callData,
+      onlineUserOnly: false,
+      timeout: 30,
+    );
+
+    if (result.code != 0 || result.data == null) {
+      throw Exception('Signaling invite failed: code=${result.code}');
+    }
+
+    final inviteID = result.data!;
+    _userToInviteId[userID] = inviteID;
+    _callBridge.registerOutgoingCall(
+      inviteID: inviteID,
+      inviter: 'self',
+      invitee: userID,
+      data: callData,
+      friendNumber: null,
+      groupID: groupID,
+    );
+
+    // Notify listeners about the outgoing call so UI can show ringing overlay
+    print(
+        '[TUICallKitAdapter] _handleCall: about to fire onOutgoingCallInitiated, callback=${onOutgoingCallInitiated != null ? "SET" : "NULL"}, inviteID=$inviteID, userID=$userID, type=$type');
+    onOutgoingCallInitiated?.call(inviteID, userID, type ?? TYPE_AUDIO);
+    print('[TUICallKitAdapter] _handleCall: onOutgoingCallInitiated fired');
+
+    // Get friend number and start ToxAV call
+    final friendNumber = _avService.getFriendNumberByUserId(userID);
+    if (friendNumber == 0xFFFFFFFF) {
+      print(
+          '[TUICallKitAdapter] Friend not found for userID=$userID, signaling-only call');
+      return;
+    }
+
+    _callBridge.registerOutgoingCall(
+      inviteID: inviteID,
+      inviter: 'self',
+      invitee: userID,
+      data: callData,
+      friendNumber: friendNumber,
+      groupID: groupID,
+    );
+
+    final audioBitRate = 48;
+    final videoBitRate = isVideo ? 5000 : 0;
+
+    // Initialize ToxAV if needed
+    if (!_avService.isInitialized) {
+      await _avService.initialize();
+    }
+
+    // End any existing call to this friend before starting a new one
+    // (prevents FRIEND_ALREADY_IN_CALL error when user clicks call button multiple times)
+    try {
+      await _avService.endCall(friendNumber);
+    } catch (_) {
+      // Ignore — no active call to end
+    }
+
+    // Start the call
+    final callResult = await _avService.startCall(friendNumber,
+        audioBitRate: audioBitRate, videoBitRate: videoBitRate);
+    print(
+        '[TUICallKitAdapter] _handleCall: startCall result=$callResult, friendNumber=$friendNumber');
+  }
+
+  /// Dispose
+  void dispose() {
+    _userToInviteId.clear();
+  }
+}
+
+/// Global adapter instance
+TUICallKitAdapter? _globalAdapter;
+
+/// Initialize TUICallKit adapter
+/// This should be called during app initialization
+Future<TUICallKitAdapter> initializeTUICallKitAdapter(
+  TencentCloudChatSdkPlatform sdkPlatform,
+  CallAvBackend avService,
+  CallBridgeService callBridge,
+) async {
+  return await TUICallKitAdapter.initialize(sdkPlatform, avService, callBridge);
+}
+
+/// Get global adapter instance
+TUICallKitAdapter? getTUICallKitAdapter() {
+  return _globalAdapter;
+}

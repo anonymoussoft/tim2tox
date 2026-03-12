@@ -60,4 +60,19 @@ CTestTestfile.cmake
 # Windows specific
 Thumbs.db
 ehthumbs.db
-Desktop.ini 
+Desktop.ini
+
+# Dart and test runner state
+auto_tests/.dart_tool/
+auto_tests/.flutter-plugins-dependencies
+dart/.dart_tool/
+dart/.flutter-plugins-dependencies
+
+# Local test artifacts
+auto_tests/community_data_*.db
+auto_tests/lldb_pin_crash.log
+auto_tests/merged_results/
+auto_tests/test_results_*.log
+auto_tests/test_summary_*.txt
+build.log
+example/*_savedata.tox

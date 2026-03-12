@@ -2,14 +2,30 @@
 #include "toxcore/tox.h"
 #include <algorithm>
 #include "ToxManager.h"
+#include "V2TIMManager.h"
+#include "V2TIMManagerImpl.h"
+#include "V2TIMMessageManager.h"
 #include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <chrono>
+#include <thread>
+#include "V2TIMLog.h"
+#include "TIMResultDefine.h"
 
 // Conversation-specific error codes
 namespace {
     constexpr int ERR_SDK_CONVERSATION_NOT_FOUND = 6010;
 }
 
-V2TIMConversationManagerImpl::V2TIMConversationManagerImpl() {    
+// Singleton instance accessor
+V2TIMConversationManagerImpl* V2TIMConversationManagerImpl::GetInstance() {
+    static V2TIMConversationManagerImpl instance;
+    return &instance;
+}
+
+V2TIMConversationManagerImpl::V2TIMConversationManagerImpl() 
+    : last_friend_count_(0), last_refresh_time_(std::chrono::steady_clock::now()), manager_impl_(nullptr) {    
     // Refresh conversation cache
     RefreshConversationCache();
 }
@@ -29,24 +45,68 @@ void V2TIMConversationManagerImpl::RemoveConversationListener(V2TIMConversationL
     listeners_.erase(std::remove(listeners_.begin(), listeners_.end(), listener), listeners_.end());
 }
 
+// Forward declaration for multi-instance: use current instance's manager when available
+extern V2TIMManager* SafeGetV2TIMManager(void);
+
 // 核心会话列表获取实现
 void V2TIMConversationManagerImpl::GetConversationList(uint64_t nextSeq, uint32_t count,
                                                      V2TIMValueCallback<V2TIMConversationResult>* callback) {
-    RefreshConversationCache();
+    // Prefer current instance's manager (multi-instance safe); fallback to stored manager_impl_
+    V2TIMManagerImpl* manager_impl = dynamic_cast<V2TIMManagerImpl*>(SafeGetV2TIMManager());
+    if (!manager_impl) {
+        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+        manager_impl = manager_impl_;
+    }
+    if (!manager_impl) {
+        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "SDK not initialized");
+        return;
+    }
+    ToxManager* tox_manager = manager_impl->GetToxManager();
+    if (!tox_manager) {
+        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
+        return;
+    }
+    Tox* tox = tox_manager->getTox();
+    // Decide whether to refresh; must call RefreshConversationCache() WITHOUT holding cache_mutex_
+    // (RefreshConversationCache locks cache_mutex_ internally — calling it under lock would deadlock).
+    bool need_refresh = false;
+    if (tox) {
+        size_t current_friend_count = tox_self_get_friend_list_size(tox);
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            bool cache_empty = cached_conversations_.empty();
+            bool has_friends = current_friend_count > 0;
+            need_refresh = (current_friend_count != last_friend_count_) || (cache_empty && has_friends);
+        }
+        if (need_refresh) {
+            RefreshConversationCache();
+        }
+    } else {
+        RefreshConversationCache();
+    }
     
+    // Fill result from cache. Safe copy: clear lastMessage before PushBack to avoid dangling pointer.
+    // Re-check pinned_conversations_ for each conv so pin state is up-to-date (cache may be stale).
     V2TIMConversationResult result;
     result.nextSeq = 0;
     result.isFinished = true;
-    
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    const uint32_t total = cached_conversations_.size();
-    const uint32_t start = std::min((uint32_t)nextSeq, total);
-    const uint32_t end = std::min(start + count, total);
-    
-    for (uint32_t i = start; i < end; ++i) {
-        result.conversationList.PushBack(cached_conversations_[i]);
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        const size_t total = cached_conversations_.size();
+        const size_t start = std::min(static_cast<size_t>(nextSeq), total);
+        const size_t end = std::min(start + count, total);
+        for (size_t i = start; i < end; ++i) {
+            V2TIMConversation safe_conv = cached_conversations_[i];
+            safe_conv.lastMessage = nullptr;
+            {
+                std::string conv_id_str(safe_conv.conversationID.CString());
+                std::lock_guard<std::mutex> pin_lock(pinned_mutex_);
+                auto it = pinned_conversations_.find(conv_id_str);
+                safe_conv.isPinned = (it != pinned_conversations_.end() && it->second);
+            }
+            result.conversationList.PushBack(safe_conv);
+        }
     }
-    
     if (callback) {
         callback->OnSuccess(result);
     }
@@ -55,18 +115,75 @@ void V2TIMConversationManagerImpl::GetConversationList(uint64_t nextSeq, uint32_
 // 创建会话对象（好友）
 V2TIMConversation V2TIMConversationManagerImpl::CreateConversationFromFriend(uint32_t friend_number) {
     V2TIMConversation conv;
-    conv.conversationID = "c2c_" + std::to_string(friend_number);
+    std::string convID;
+    
+    // Initialize all string fields to empty strings first
+    conv.conversationID = V2TIMString("");
+    conv.userID = V2TIMString("");
+    conv.groupID = V2TIMString("");
+    conv.groupType = V2TIMString("");
+    conv.showName = V2TIMString("");
+    conv.faceUrl = V2TIMString("");
+    conv.draftText = V2TIMString("");
+    
+    // Initialize other fields
     conv.type = V2TIM_C2C;
+    conv.unreadCount = 0;
+    conv.isPinned = false;
+    conv.recvOpt = V2TIM_RECEIVE_MESSAGE; // Default: receive messages normally
+    conv.lastMessage = nullptr;
+    conv.draftTimestamp = 0;
+    conv.orderKey = 0;
+    conv.c2cReadTimestamp = 0;
+    conv.groupReadSequence = 0;
     
     uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
-    if (tox_friend_get_public_key(ToxManager::getInstance().getTox(), friend_number, pubkey, nullptr)) {
+    V2TIMManagerImpl* manager_impl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+        manager_impl = manager_impl_;
+    }
+    if (!manager_impl) {
+        convID = "c2c_" + std::to_string(friend_number);
+        conv.userID = V2TIMString("");
+        conv.conversationID = V2TIMString(convID.c_str());
+        return conv;
+    }
+    ToxManager* tox_manager = manager_impl->GetToxManager();
+    if (!tox_manager) {
+        convID = "c2c_" + std::to_string(friend_number);
+        conv.userID = V2TIMString("");
+        conv.conversationID = V2TIMString(convID.c_str());
+        return conv;
+    }
+    Tox* tox = tox_manager->getTox();
+    if (!tox) {
+        convID = "c2c_" + std::to_string(friend_number);
+        conv.userID = V2TIMString("");
+        conv.conversationID = V2TIMString(convID.c_str());
+        return conv;
+    }
+    if (tox_friend_get_public_key(tox, friend_number, pubkey, nullptr)) {
         // Convert binary pubkey to hex string
         char hex_pubkey[TOX_PUBLIC_KEY_SIZE * 2 + 1];
         for (size_t i = 0; i < TOX_PUBLIC_KEY_SIZE; i++) {
             sprintf(hex_pubkey + i * 2, "%02X", pubkey[i]);
         }
         hex_pubkey[TOX_PUBLIC_KEY_SIZE * 2] = '\0';
+        convID = std::string("c2c_") + hex_pubkey;
         conv.userID = V2TIMString(hex_pubkey);
+    } else {
+        convID = "c2c_" + std::to_string(friend_number);
+        conv.userID = V2TIMString("");
+    }
+    
+    conv.conversationID = V2TIMString(convID.c_str());
+    
+    // 检查置顶状态
+    {
+        std::lock_guard<std::mutex> lock(pinned_mutex_);
+        auto it = pinned_conversations_.find(convID);
+        conv.isPinned = (it != pinned_conversations_.end() && it->second);
     }
     
     // 其他字段根据tox状态填充...
@@ -75,31 +192,145 @@ V2TIMConversation V2TIMConversationManagerImpl::CreateConversationFromFriend(uin
 
 // 刷新本地缓存
 void V2TIMConversationManagerImpl::RefreshConversationCache() {
+    // OPTIMIZATION: Debounce mechanism to prevent excessive cache refreshes
+    // This reduces CPU usage and improves performance when multiple friend operations happen quickly
+    auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> debounce_lock(refresh_debounce_mutex_);
+        auto time_since_last_refresh = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_refresh_time_);
+        if (time_since_last_refresh < REFRESH_DEBOUNCE_MS) {
+            // Too soon since last refresh, skip this one
+            // The cache will be refreshed when the debounce period expires
+            return;
+        }
+        last_refresh_time_ = now;
+    }
+    
+    // Take a snapshot of deleted IDs BEFORE locking cache_mutex_ to avoid deadlock
+    // (DeleteConversation locks deleted_ids_mutex_ then cache_mutex_)
+    std::unordered_set<std::string> deleted_snapshot;
+    {
+        std::lock_guard<std::mutex> del_lock(deleted_ids_mutex_);
+        deleted_snapshot = deleted_conversation_ids_;
+    }
+
     std::lock_guard<std::mutex> lock(cache_mutex_);
     cached_conversations_.clear();
-    
-    // 添加好友会话
-    const size_t friend_count = tox_self_get_friend_list_size(ToxManager::getInstance().getTox());
+
+    V2TIMManagerImpl* manager_impl = dynamic_cast<V2TIMManagerImpl*>(SafeGetV2TIMManager());
+    if (!manager_impl) {
+        std::lock_guard<std::mutex> lock_mgr(manager_impl_mutex_);
+        manager_impl = manager_impl_;
+    }
+    if (!manager_impl) {
+        return;
+    }
+
+    if (!manager_impl->IsRunning()) {
+        return;
+    }
+
+    ToxManager* tox_manager = manager_impl->GetToxManager();
+    if (!tox_manager) {
+        return;
+    }
+
+    Tox* tox = nullptr;
+    try {
+        tox = tox_manager->getTox();
+    } catch (const std::exception& e) {
+        V2TIM_LOG(kError, "[V2TIMConversationManagerImpl] RefreshConversationCache: Exception in getTox(): {}", e.what());
+        return;
+    } catch (...) {
+        V2TIM_LOG(kError, "[V2TIMConversationManagerImpl] RefreshConversationCache: Unknown exception in getTox()");
+        return;
+    }
+
+    if (!tox) {
+        return;
+    }
+
+    const size_t friend_count = tox_self_get_friend_list_size(tox);
     std::vector<uint32_t> friends(friend_count);
-    tox_self_get_friend_list(ToxManager::getInstance().getTox(), friends.data());
+    if (friend_count > 0) {
+        tox_self_get_friend_list(tox, friends.data());
+    }
     
     for (uint32_t friend_number : friends) {
-        cached_conversations_.push_back(CreateConversationFromFriend(friend_number));
+        try {
+            V2TIMConversation conv = CreateConversationFromFriend(friend_number);
+            // Skip conversations that were explicitly deleted by the user
+            std::string conv_id_str(conv.conversationID.CString());
+            if (deleted_snapshot.count(conv_id_str) > 0) {
+                continue;
+            }
+            cached_conversations_.push_back(conv);
+        } catch (...) {
+            // Skip conversation on error
+        }
     }
+    
+    // Update last known friend count
+    last_friend_count_ = friend_count;
     
     // TODO: 添加群组会话（需要根据实际群组实现）
 }
 
 // 其他接口实现（部分示例）
 void V2TIMConversationManagerImpl::DeleteConversation(const V2TIMString& conversationID, V2TIMCallback* callback) {
-    // Check if conversation starts with "c2c_"
     std::string conv_id = conversationID.CString();
-    if (conv_id.substr(0, 4) == "c2c_") {
-        // Extract friend number after the "c2c_" prefix
-        uint32_t friend_number = std::stoul(conv_id.substr(4));
-        tox_friend_delete(ToxManager::getInstance().getTox(), friend_number, nullptr);
+
+    // Track this conversation as explicitly deleted so RefreshConversationCache won't re-add it
+    {
+        std::lock_guard<std::mutex> lock(deleted_ids_mutex_);
+        deleted_conversation_ids_.insert(conv_id);
+    }
+
+    // Check if conversation starts with "c2c_"
+    if (conv_id.length() >= 4 && conv_id.substr(0, 4) == "c2c_") {
+        // NOTE: DeleteConversation only removes the conversation from the UI cache.
+        // It must NOT call tox_friend_delete — deleting a conversation is not the same
+        // as deleting a friend.  Friend deletion is handled exclusively by
+        // V2TIMFriendshipManagerImpl::DeleteFromFriendList.
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            auto it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
+                                   [&](const V2TIMConversation& conv) { return conv.conversationID == conversationID; });
+            if (it != cached_conversations_.end()) {
+                cached_conversations_.erase(it);
+            }
+        }
+    } else if (conv_id.length() >= 6 && conv_id.substr(0, 6) == "group_") {
+        // For group conversations, remove from cached_conversations_
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        auto it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
+                               [&](const V2TIMConversation& conv) { return conv.conversationID == conversationID; });
+        if (it != cached_conversations_.end()) {
+            cached_conversations_.erase(it);
+        } else {
+        }
     }
     
+    // Notify listeners that conversation was deleted so Dart side removes it from UI list
+    {
+        V2TIMStringVector deletedIDs;
+        deletedIDs.PushBack(conversationID);
+        std::vector<V2TIMConversationListener*> listeners_copy;
+        {
+            std::lock_guard<std::mutex> lock(listeners_mutex_);
+            listeners_copy = listeners_;
+        }
+        for (auto* listener : listeners_copy) {
+            if (listener) {
+                try {
+                    listener->OnConversationDeleted(deletedIDs);
+                } catch (...) {
+                    // Ignore listener errors
+                }
+            }
+        }
+    }
+
     if (callback) {
         callback->OnSuccess();
     }
@@ -120,12 +351,87 @@ void V2TIMConversationManagerImpl::CreateConversationGroup(const V2TIMString &gr
 
 void V2TIMConversationManagerImpl::GetConversation(const V2TIMString& conversationID,
                                                    V2TIMValueCallback<V2TIMConversation>* callback) {
+    // Refresh cache first to ensure it's up to date
+    RefreshConversationCache();
+    
     std::lock_guard<std::mutex> lock(cache_mutex_);
+    std::string conv_id = conversationID.CString();
+    
+    // Try exact match first
     auto it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
                            [&](const V2TIMConversation& conv) { return conv.conversationID == conversationID; });
+    
+    // If not found and conv_id doesn't start with "c2c_", try with "c2c_" prefix
+    if (it == cached_conversations_.end() && conv_id.substr(0, 4) != "c2c_") {
+        std::string prefixed_id = "c2c_" + conv_id;
+        V2TIMString prefixed_conv_id(prefixed_id.c_str());
+        it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
+                          [&](const V2TIMConversation& conv) { return conv.conversationID == prefixed_conv_id; });
+    }
+    
+    // If still not found and conv_id starts with "c2c_", try without prefix
+    if (it == cached_conversations_.end() && conv_id.substr(0, 4) == "c2c_") {
+        std::string unprefixed_id = conv_id.substr(4);
+        V2TIMString unprefixed_conv_id(unprefixed_id.c_str());
+        it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
+                          [&](const V2TIMConversation& conv) { 
+                              std::string conv_user_id = conv.userID.CString();
+                              return conv_user_id == unprefixed_id;
+                          });
+    }
+    
     if (it != cached_conversations_.end()) {
-        if (callback) callback->OnSuccess(*it);
+        // Safe copy: clear lastMessage to avoid dangling pointer when callback serializes
+        V2TIMConversation safe_conv = *it;
+        safe_conv.lastMessage = nullptr;
+        if (callback) callback->OnSuccess(safe_conv);
     } else {
+        // If still not found, try to create conversation on-the-fly for friend
+        // This handles the case where conversation hasn't been cached yet
+        if (conv_id.length() == 64) { // Hex pubkey length
+            // Try to find friend by pubkey
+            uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
+            for (size_t i = 0; i < TOX_PUBLIC_KEY_SIZE && i * 2 < conv_id.length(); i++) {
+                char hex_byte[3] = {conv_id[i * 2], conv_id[i * 2 + 1], '\0'};
+                pubkey[i] = (uint8_t)strtoul(hex_byte, nullptr, 16);
+            }
+            
+            V2TIMManagerImpl* manager_impl = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+                manager_impl = manager_impl_;
+            }
+            if (!manager_impl) {
+                if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "SDK not initialized");
+                return;
+            }
+            ToxManager* tox_manager = manager_impl->GetToxManager();
+            if (!tox_manager) {
+                if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
+                return;
+            }
+            Tox* tox = tox_manager->getTox();
+            if (!tox) {
+                if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "Tox instance not available");
+                return;
+            }
+            const size_t friend_count = tox_self_get_friend_list_size(tox);
+            std::vector<uint32_t> friends(friend_count);
+            tox_self_get_friend_list(tox, friends.data());
+            
+            for (uint32_t friend_number : friends) {
+                uint8_t friend_pubkey[TOX_PUBLIC_KEY_SIZE];
+                if (tox_friend_get_public_key(tox, friend_number, friend_pubkey, nullptr)) {
+                    if (memcmp(pubkey, friend_pubkey, TOX_PUBLIC_KEY_SIZE) == 0) {
+                        // Found friend, create conversation
+                        V2TIMConversation conv = CreateConversationFromFriend(friend_number);
+                        if (callback) callback->OnSuccess(conv);
+                        return;
+                    }
+                }
+            }
+        }
+        
         if (callback) callback->OnError(ERR_SDK_CONVERSATION_NOT_FOUND, "Conversation not found");
     }
 }
@@ -134,11 +440,22 @@ void V2TIMConversationManagerImpl::GetConversationList(const V2TIMStringVector& 
                                                        V2TIMValueCallback<V2TIMConversationVector>* callback) {
     V2TIMConversationVector result;
     std::lock_guard<std::mutex> lock(cache_mutex_);
-    for (const auto& conversationID : conversationIDList) {
-        auto it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
-                               [&](const V2TIMConversation& conv) { return conv.conversationID == conversationID; });
-        if (it != cached_conversations_.end()) {
-            result.PushBack(*it);
+    
+    // Use index-based iteration instead of range-for to avoid accessing invalid objects
+    size_t list_size = conversationIDList.Size();
+    for (size_t i = 0; i < list_size; i++) {
+        try {
+            const V2TIMString& conversationID = conversationIDList[i];
+            auto it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
+                                   [&](const V2TIMConversation& conv) { return conv.conversationID == conversationID; });
+            if (it != cached_conversations_.end()) {
+                V2TIMConversation safe_conv = *it;
+                safe_conv.lastMessage = nullptr;
+                result.PushBack(safe_conv);
+            }
+        } catch (...) {
+            // Skip invalid conversation ID
+            continue;
         }
     }
     if (callback) callback->OnSuccess(result);
@@ -155,19 +472,150 @@ void V2TIMConversationManagerImpl::GetConversationListByFilter(const V2TIMConver
 void V2TIMConversationManagerImpl::DeleteConversationList(const V2TIMStringVector& conversationIDList, bool clearMessage,
                                                           V2TIMValueCallback<V2TIMConversationOperationResultVector>* callback) {
     V2TIMConversationOperationResultVector results;
-    for (const auto& conversationID : conversationIDList) {
-        DeleteConversation(conversationID, nullptr);
-        V2TIMConversationOperationResult result;
-        result.conversationID = conversationID;
-        result.resultCode = 0;
-        results.PushBack(result);
+    
+    // Use index-based iteration instead of range-for to avoid accessing invalid objects
+    size_t list_size = conversationIDList.Size();
+    for (size_t i = 0; i < list_size; i++) {
+        try {
+            // Safely access conversationID using index
+            const V2TIMString& conversationID = conversationIDList[i];
+            
+            // Safely extract conversation ID string
+            const char* conv_id_cstr = conversationID.CString();
+            if (!conv_id_cstr) {
+                // Skip invalid conversation ID
+                V2TIMConversationOperationResult result;
+                result.conversationID = conversationID;
+                result.resultCode = -1;
+                result.resultInfo = "Invalid conversation ID";
+                results.PushBack(result);
+                continue;
+            }
+            
+            std::string conv_id(conv_id_cstr);
+            
+            // If clearMessage is true, clear message history before deleting conversation
+            if (clearMessage) {
+                if (conv_id.length() >= 4 && conv_id.substr(0, 4) == "c2c_") {
+                    // C2C conversation: extract userID and clear C2C history
+                    std::string userID = conv_id.substr(4);
+                    if (!userID.empty()) {
+                        // Use manager_impl_ instead of V2TIMManager::GetInstance() for multi-instance support
+                        V2TIMManagerImpl* manager = nullptr;
+                        {
+                            std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+                            manager = manager_impl_;
+                        }
+                        if (manager) {
+                            manager->GetMessageManager()->ClearC2CHistoryMessage(
+                                V2TIMString(userID.c_str()),
+                                nullptr  // No callback needed for clearing history
+                            );
+                        }
+                    }
+                } else if (conv_id.length() >= 6 && conv_id.substr(0, 6) == "group_") {
+                    // Group conversation: extract groupID and clear group history
+                    std::string groupID = conv_id.substr(6);
+                    if (!groupID.empty()) {
+                        // Use manager_impl_ instead of V2TIMManager::GetInstance() for multi-instance support
+                        V2TIMManagerImpl* manager = nullptr;
+                        {
+                            std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+                            manager = manager_impl_;
+                        }
+                        if (manager) {
+                            manager->GetMessageManager()->ClearGroupHistoryMessage(
+                                V2TIMString(groupID.c_str()),
+                                nullptr  // No callback needed for clearing history
+                            );
+                        }
+                    }
+                }
+            }
+            
+            // Delete the conversation
+            DeleteConversation(conversationID, nullptr);
+            
+            V2TIMConversationOperationResult result;
+            result.conversationID = conversationID;
+            result.resultCode = 0;
+            results.PushBack(result);
+        } catch (const std::exception& e) {
+            // Handle exception for this conversation ID
+            V2TIMConversationOperationResult result;
+            result.conversationID = conversationIDList[i];
+            result.resultCode = -1;
+            result.resultInfo = V2TIMString(e.what());
+            results.PushBack(result);
+        } catch (...) {
+            // Handle unknown exception
+            V2TIMConversationOperationResult result;
+            result.conversationID = conversationIDList[i];
+            result.resultCode = -1;
+            result.resultInfo = "Unknown error";
+            results.PushBack(result);
+        }
     }
+    
     if (callback) callback->OnSuccess(results);
 }
 
 void V2TIMConversationManagerImpl::SetConversationDraft(const V2TIMString& conversationID,
                                                         const V2TIMString& draftText, V2TIMCallback* callback) {
-    // Implementation to set conversation draft
+    std::string conv_id(conversationID.CString());
+    // Update draft in cache
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        for (auto& conv : cached_conversations_) {
+            if (conv.conversationID == conversationID) {
+                conv.draftText = draftText;
+                break;
+            }
+        }
+    }
+
+    // Notify OnConversationChanged so Dart UI updates draft display
+    {
+        V2TIMConversationVector convVector;
+        V2TIMConversation conv;
+        conv.conversationID = conversationID;
+        conv.draftText = draftText;
+        conv.lastMessage = nullptr;
+        conv.isPinned = false;
+        conv.unreadCount = 0;
+        conv.recvOpt = V2TIM_RECEIVE_MESSAGE;
+        conv.draftTimestamp = 0;
+        conv.orderKey = 0;
+        conv.c2cReadTimestamp = 0;
+        conv.groupReadSequence = 0;
+        if (conv_id.length() >= 4 && conv_id.substr(0, 4) == "c2c_") {
+            conv.type = V2TIM_C2C;
+            conv.userID = V2TIMString(conv_id.substr(4).c_str());
+            conv.groupID = V2TIMString("");
+        } else if (conv_id.length() >= 6 && conv_id.substr(0, 6) == "group_") {
+            conv.type = V2TIM_GROUP;
+            conv.userID = V2TIMString("");
+            conv.groupID = V2TIMString(conv_id.substr(6).c_str());
+        }
+        conv.groupType = V2TIMString("");
+        conv.showName = V2TIMString("");
+        conv.faceUrl = V2TIMString("");
+        convVector.PushBack(conv);
+
+        std::vector<V2TIMConversationListener*> listeners_copy;
+        {
+            std::lock_guard<std::mutex> lock(listeners_mutex_);
+            listeners_copy = listeners_;
+        }
+        for (auto* listener : listeners_copy) {
+            if (listener) {
+                try {
+                    listener->OnConversationChanged(convVector);
+                } catch (...) {}
+            }
+        }
+    }
+
     if (callback) callback->OnSuccess();
 }
 
@@ -186,20 +634,135 @@ void V2TIMConversationManagerImpl::SetConversationCustomData(const V2TIMStringVe
 
 void V2TIMConversationManagerImpl::PinConversation(const V2TIMString& conversationID, bool isPinned,
                                                    V2TIMCallback* callback) {
-    // Implementation to pin conversation
+    std::string convID(conversationID.CString());
+    {
+        std::lock_guard<std::mutex> lock(pinned_mutex_);
+        // Store under given ID and under normalized C2C key (c2c_ + 64-char pubkey) so
+        // GetConversationList (which uses c2c_ + pubkey from BuildConversationFromFriendNumber) finds it
+        auto storePinned = [this, isPinned](const std::string& key) {
+            if (isPinned) {
+                pinned_conversations_[key] = true;
+            } else {
+                pinned_conversations_.erase(key);
+            }
+        };
+        storePinned(convID);
+        if (convID.length() >= 4 && convID.substr(0, 4) == "c2c_") {
+            std::string suffix = convID.substr(4);
+            if (suffix.length() >= TOX_PUBLIC_KEY_SIZE * 2) {
+                std::string normalized = "c2c_" + suffix.substr(0, TOX_PUBLIC_KEY_SIZE * 2);
+                storePinned(normalized);
+            }
+        }
+    }
+    // Notify listeners: always build a minimal conv from local strings only (convID already copied
+    // at top). Never pass cache-backed conv to listener to avoid dangling pointers in JSON serialization.
+    {
+        V2TIMConversationVector convVector;
+        V2TIMConversation conv;
+        std::string fallback_conv_id, fallback_user_id, fallback_group_id;
+        std::string fallback_group_type, fallback_show_name, fallback_face_url, fallback_draft_text;
+        
+        fallback_conv_id = convID;
+        conv.conversationID = V2TIMString(fallback_conv_id.c_str());
+        conv.isPinned = isPinned;
+        conv.unreadCount = 0;
+        conv.recvOpt = V2TIM_RECEIVE_MESSAGE;
+        conv.lastMessage = nullptr;
+        conv.draftTimestamp = 0;
+        conv.orderKey = 0;
+        conv.c2cReadTimestamp = 0;
+        conv.groupReadSequence = 0;
+        if (convID.length() >= 4 && convID.substr(0, 4) == "c2c_") {
+            conv.type = V2TIM_C2C;
+            fallback_user_id = convID.substr(4);
+            conv.userID = V2TIMString(fallback_user_id.c_str());
+            conv.groupID = V2TIMString(fallback_group_id.c_str());
+            conv.groupType = V2TIMString(fallback_group_type.c_str());
+            conv.showName = V2TIMString(fallback_show_name.c_str());
+            conv.faceUrl = V2TIMString(fallback_face_url.c_str());
+            conv.draftText = V2TIMString(fallback_draft_text.c_str());
+        } else if (convID.length() >= 6 && convID.substr(0, 6) == "group_") {
+            conv.type = V2TIM_GROUP;
+            fallback_group_id = convID.substr(6);
+            conv.userID = V2TIMString(fallback_user_id.c_str());
+            conv.groupID = V2TIMString(fallback_group_id.c_str());
+            conv.groupType = V2TIMString(fallback_group_type.c_str());
+            conv.showName = V2TIMString(fallback_show_name.c_str());
+            conv.faceUrl = V2TIMString(fallback_face_url.c_str());
+            conv.draftText = V2TIMString(fallback_draft_text.c_str());
+        } else {
+            conv.type = V2TIM_C2C;
+            fallback_user_id = convID;
+            conv.userID = V2TIMString(fallback_user_id.c_str());
+            conv.groupID = V2TIMString(fallback_group_id.c_str());
+            conv.groupType = V2TIMString(fallback_group_type.c_str());
+            conv.showName = V2TIMString(fallback_show_name.c_str());
+            conv.faceUrl = V2TIMString(fallback_face_url.c_str());
+            conv.draftText = V2TIMString(fallback_draft_text.c_str());
+        }
+        
+        convVector.PushBack(conv);
+        
+        {
+            std::lock_guard<std::mutex> lock(listeners_mutex_);
+            for (auto* listener : listeners_) {
+                if (listener) {
+                    listener->OnConversationChanged(convVector);
+                }
+            }
+        }
+    }
+    
     if (callback) callback->OnSuccess();
 }
 
 void V2TIMConversationManagerImpl::MarkConversation(const V2TIMStringVector &conversationIDList, uint64_t markType, bool enableMark,
                                                     V2TIMValueCallback<V2TIMConversationOperationResultVector>* callback) {
-    // Implementation to mark conversation
     V2TIMConversationOperationResultVector results;
-    for (const auto& conversationID : conversationIDList) {
+    V2TIMConversationVector changedConvs;
+
+    for (size_t i = 0; i < conversationIDList.Size(); i++) {
+        const V2TIMString& conversationID = conversationIDList[i];
         V2TIMConversationOperationResult result;
         result.conversationID = conversationID;
         result.resultCode = 0;
         results.PushBack(result);
+
+        // Update mark in cache
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            for (auto& conv : cached_conversations_) {
+                if (conv.conversationID == conversationID) {
+                    if (enableMark) {
+                        conv.markList.PushBack(markType);
+                    }
+                    // Build a safe copy for notification
+                    V2TIMConversation safe_conv = conv;
+                    safe_conv.lastMessage = nullptr;
+                    changedConvs.PushBack(safe_conv);
+                    break;
+                }
+            }
+        }
     }
+
+    // Notify OnConversationChanged
+    if (changedConvs.Size() > 0) {
+        std::vector<V2TIMConversationListener*> listeners_copy;
+        {
+            std::lock_guard<std::mutex> lock(listeners_mutex_);
+            listeners_copy = listeners_;
+        }
+        for (auto* listener : listeners_copy) {
+            if (listener) {
+                try {
+                    listener->OnConversationChanged(changedConvs);
+                } catch (...) {}
+            }
+        }
+    }
+
     if (callback) callback->OnSuccess(results);
 }
 
@@ -226,7 +789,98 @@ void V2TIMConversationManagerImpl::UnsubscribeUnreadMessageCountByFilter(const V
 
 void V2TIMConversationManagerImpl::CleanConversationUnreadMessageCount(const V2TIMString& conversationID, uint64_t cleanTimestamp, uint64_t cleanSequence,
                                                                        V2TIMCallback* callback) {
-    // Implementation to clean conversation unread message count
+    std::string conv_id(conversationID.CString());
+    // Update unread count in cache
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        for (auto& conv : cached_conversations_) {
+            if (conv.conversationID == conversationID) {
+                conv.unreadCount = 0;
+                break;
+            }
+        }
+    }
+
+    // Notify OnConversationChanged so Dart UI updates the unread badge.
+    // Use the full cached conversation (with unreadCount already set to 0) so that
+    // orderKey, showName, faceUrl and lastMessage are preserved — avoiding list order
+    // change and brief disappearance of avatar/text on the selected item.
+    {
+        V2TIMConversationVector convVector;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            auto it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
+                [&](const V2TIMConversation& c) { return c.conversationID == conversationID; });
+            if (it != cached_conversations_.end()) {
+                convVector.PushBack(*it);
+            } else {
+                // Fallback: minimal conv when not in cache (e.g. race) so UI still gets unread=0
+                V2TIMConversation conv;
+                conv.conversationID = conversationID;
+                conv.unreadCount = 0;
+                conv.lastMessage = nullptr;
+                conv.isPinned = false;
+                conv.recvOpt = V2TIM_RECEIVE_MESSAGE;
+                conv.draftTimestamp = 0;
+                conv.orderKey = 0;
+                conv.c2cReadTimestamp = 0;
+                conv.groupReadSequence = 0;
+                if (conv_id.length() >= 4 && conv_id.substr(0, 4) == "c2c_") {
+                    conv.type = V2TIM_C2C;
+                    conv.userID = V2TIMString(conv_id.substr(4).c_str());
+                    conv.groupID = V2TIMString("");
+                    conv.groupType = V2TIMString("");
+                } else if (conv_id.length() >= 6 && conv_id.substr(0, 6) == "group_") {
+                    conv.type = V2TIM_GROUP;
+                    conv.userID = V2TIMString("");
+                    conv.groupID = V2TIMString(conv_id.substr(6).c_str());
+                    conv.groupType = V2TIMString("");
+                }
+                conv.showName = V2TIMString("");
+                conv.faceUrl = V2TIMString("");
+                conv.draftText = V2TIMString("");
+                convVector.PushBack(conv);
+            }
+        }
+
+        std::vector<V2TIMConversationListener*> listeners_copy;
+        {
+            std::lock_guard<std::mutex> lock(listeners_mutex_);
+            listeners_copy = listeners_;
+        }
+        for (auto* listener : listeners_copy) {
+            if (listener) {
+                try {
+                    listener->OnConversationChanged(convVector);
+                } catch (...) {}
+            }
+        }
+    }
+
+    // Notify OnTotalUnreadMessageCountChanged
+    {
+        // Calculate total unread from cache
+        uint64_t totalUnread = 0;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            for (const auto& conv : cached_conversations_) {
+                totalUnread += conv.unreadCount;
+            }
+        }
+        std::vector<V2TIMConversationListener*> listeners_copy;
+        {
+            std::lock_guard<std::mutex> lock(listeners_mutex_);
+            listeners_copy = listeners_;
+        }
+        for (auto* listener : listeners_copy) {
+            if (listener) {
+                try {
+                    listener->OnTotalUnreadMessageCountChanged(totalUnread);
+                } catch (...) {}
+            }
+        }
+    }
+
     if (callback) callback->OnSuccess();
 }
 
@@ -259,4 +913,69 @@ void V2TIMConversationManagerImpl::DeleteConversationsFromGroup(const V2TIMStrin
     // Empty implementation
     V2TIMConversationOperationResultVector result;
     if (callback) callback->OnSuccess(result);
+}
+
+// Notify listeners about new conversations
+void V2TIMConversationManagerImpl::NotifyNewConversations() {
+    std::vector<V2TIMConversation> conversations_copy;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        conversations_copy = cached_conversations_;
+    }
+    
+    if (conversations_copy.empty()) {
+        return;
+    }
+    
+    // Convert to V2TIMConversationVector; safe copy each conv (lastMessage=nullptr) to avoid
+    // dangling pointer when listener serializes via ConversationVectorToJson
+    V2TIMConversationVector convVector;
+    for (const auto& conv : conversations_copy) {
+        try {
+            V2TIMConversation safe_conv = conv;
+            safe_conv.lastMessage = nullptr;
+            convVector.PushBack(safe_conv);
+        } catch (...) {
+            // Skip on error
+        }
+    }
+    
+    std::vector<V2TIMConversationListener*> listeners_copy;
+    {
+        std::lock_guard<std::mutex> lock(listeners_mutex_);
+        listeners_copy = listeners_;
+    }
+    
+    for (auto* listener : listeners_copy) {
+        if (listener) {
+            try {
+                listener->OnNewConversation(convVector);
+            } catch (...) {
+                // Ignore listener errors
+            }
+        }
+    }
+}
+
+// Multi-instance support: Set the associated V2TIMManagerImpl instance
+void V2TIMConversationManagerImpl::SetManagerImpl(V2TIMManagerImpl* manager_impl) {
+    V2TIMManagerImpl* old_impl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+        old_impl = manager_impl_;
+    }
+    if (manager_impl != old_impl) {
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cached_conversations_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(pinned_mutex_);
+            pinned_conversations_.clear();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+        manager_impl_ = manager_impl;
+    }
 }

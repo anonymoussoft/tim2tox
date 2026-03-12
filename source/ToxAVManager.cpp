@@ -1,53 +1,94 @@
 #include "ToxAVManager.h"
+#include "ToxManager.h"
+#include "V2TIMManagerImpl.h"
+#include "V2TIMLog.h"
+#include "toxav/toxav.h"
 #include <stdexcept>
 
-// 单例实例获取
+// 向后兼容：默认实例（单例模式）
+static ToxAVManager* g_default_toxav_instance = nullptr;
+static std::mutex g_default_toxav_instance_mutex;
+
 ToxAVManager& ToxAVManager::getInstance() {
-    static ToxAVManager instance;
-    return instance;
+    std::lock_guard<std::mutex> lock(g_default_toxav_instance_mutex);
+    if (!g_default_toxav_instance) {
+        g_default_toxav_instance = new ToxAVManager();
+    }
+    return *g_default_toxav_instance;
 }
 
-// 构造函数
-ToxAVManager::ToxAVManager() : toxav_(nullptr, &toxavDeleter) {}
+// 构造函数（现在是 public，支持多实例）
+ToxAVManager::ToxAVManager() : toxav_(nullptr, ToxAVDeleter{}) {}
 
 // 析构函数
 ToxAVManager::~ToxAVManager() {
     shutdown();
 }
 
+void ToxAVManager::Destroy(ToxAVManager* p) {
+    delete p;
+}
+
 // 自定义删除器实现
-void ToxAVManager::toxavDeleter(ToxAV* toxav) {
+void ToxAVManager::ToxAVDeleter::operator()(ToxAV* toxav) const {
     if (toxav) toxav_kill(toxav);
 }
 
-// 初始化实现
-void ToxAVManager::initialize() {
+// 初始化实现：使用调用方传入的 manager_impl，避免内部再次调用 GetCurrentInstance() 导致多实例竞态或段错误
+void ToxAVManager::initialize(V2TIMManagerImpl* manager_impl) {
     std::lock_guard<std::mutex> lock(mutex_);
+    V2TIMLog::getInstance().Info("[ToxAVManager] initialize() called");
     if (toxav_) {
+        V2TIMLog::getInstance().Error("[ToxAVManager] ToxAV instance already initialized");
         throw std::runtime_error("ToxAV instance already initialized");
     }
 
     TOXAV_ERR_NEW error;
-    toxav_.reset(toxav_new(ToxManager::getInstance().getTox(), &error));
+    if (!manager_impl) {
+        V2TIMLog::getInstance().Error("[ToxAVManager] V2TIMManagerImpl instance is null (caller must pass valid manager)");
+        throw std::runtime_error("V2TIMManagerImpl instance is null");
+    }
+    V2TIMLog::getInstance().Info("[ToxAVManager] Using V2TIMManagerImpl instance: {}", (void*)manager_impl);
+    ToxManager* tox_manager = manager_impl->GetToxManager();
+    if (!tox_manager) {
+        V2TIMLog::getInstance().Error("[ToxAVManager] ToxManager instance is null");
+        throw std::runtime_error("ToxManager instance is null");
+    }
+    Tox* tox = tox_manager->getTox();
+    if (!tox) {
+        V2TIMLog::getInstance().Error("[ToxAVManager] Tox instance is null");
+        throw std::runtime_error("Tox instance is null");
+    }
+    toxav_.reset(toxav_new(tox, &error));
     if (!toxav_ || error != TOXAV_ERR_NEW_OK) {
+        V2TIMLog::getInstance().Error("[ToxAVManager] ToxAV initialization failed with error: {}", (int)error);
         throw std::runtime_error("ToxAV initialization failed: " + std::to_string(error));
     }
+    V2TIMLog::getInstance().Info("[ToxAVManager] ToxAV initialized successfully");
 
     // 设置回调
     toxav_callback_call(toxav_.get(),
         [](ToxAV* av, uint32_t friend_number, bool audio_enabled,
            bool video_enabled, void* user_data) {
             auto self = static_cast<ToxAVManager*>(user_data);
+            V2TIMLog::getInstance().Info("[ToxAVManager] on_call callback: friend_number={}, audio={}, video={}", 
+                friend_number, audio_enabled, video_enabled);
             if (self && self->call_cb_) {
                 self->call_cb_(friend_number, audio_enabled, video_enabled);
+            } else {
+                V2TIMLog::getInstance().Warning("[ToxAVManager] on_call callback not set or self is null");
             }
         }, this);
 
     toxav_callback_call_state(toxav_.get(),
         [](ToxAV* av, uint32_t friend_number, uint32_t state, void* user_data) {
             auto self = static_cast<ToxAVManager*>(user_data);
+            V2TIMLog::getInstance().Info("[ToxAVManager] on_call_state callback: friend_number={}, state={}", 
+                friend_number, state);
             if (self && self->call_state_cb_) {
                 self->call_state_cb_(friend_number, state);
+            } else {
+                V2TIMLog::getInstance().Warning("[ToxAVManager] on_call_state callback not set or self is null");
             }
         }, this);
 
@@ -94,7 +135,9 @@ void ToxAVManager::initialize() {
 // 关闭实现
 void ToxAVManager::shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
+    V2TIMLog::getInstance().Info("[ToxAVManager] shutdown() called");
     toxav_.reset();
+    V2TIMLog::getInstance().Info("[ToxAVManager] shutdown() completed");
 }
 
 // 迭代实现
@@ -109,19 +152,71 @@ void ToxAVManager::iterate() {
 bool ToxAVManager::startCall(uint32_t friend_number, uint32_t audio_bit_rate,
                            uint32_t video_bit_rate) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!toxav_) return false;
+    V2TIMLog::getInstance().Info("[ToxAVManager] startCall() called: friend_number={}, audio_bit_rate={}, video_bit_rate={}", 
+        friend_number, audio_bit_rate, video_bit_rate);
+    if (!toxav_) {
+        V2TIMLog::getInstance().Error("[ToxAVManager] startCall() failed: ToxAV not initialized");
+        return false;
+    }
     TOXAV_ERR_CALL error;
-    return toxav_call(toxav_.get(), friend_number, audio_bit_rate,
-                     video_bit_rate, &error) && error == TOXAV_ERR_CALL_OK;
+    bool result = toxav_call(toxav_.get(), friend_number, audio_bit_rate,
+                     video_bit_rate, &error);
+    if (result && error == TOXAV_ERR_CALL_OK) {
+        V2TIMLog::getInstance().Info("[ToxAVManager] startCall() succeeded: friend_number={}", friend_number);
+    } else {
+        const char* errorStr = "UNKNOWN";
+        switch (error) {
+            case TOXAV_ERR_CALL_OK: errorStr = "OK"; break;
+            case TOXAV_ERR_CALL_MALLOC: errorStr = "MALLOC"; break;
+            case TOXAV_ERR_CALL_SYNC: errorStr = "SYNC"; break;
+            case TOXAV_ERR_CALL_FRIEND_NOT_FOUND: errorStr = "FRIEND_NOT_FOUND"; break;
+            case TOXAV_ERR_CALL_FRIEND_NOT_CONNECTED: errorStr = "FRIEND_NOT_CONNECTED"; break;
+            case TOXAV_ERR_CALL_FRIEND_ALREADY_IN_CALL: errorStr = "FRIEND_ALREADY_IN_CALL"; break;
+            case TOXAV_ERR_CALL_INVALID_BIT_RATE: errorStr = "INVALID_BIT_RATE"; break;
+            default: errorStr = "UNKNOWN"; break;
+        }
+        V2TIMLog::getInstance().Error("[ToxAVManager] startCall() failed: friend_number={}, error={} ({})", 
+            friend_number, (int)error, errorStr);
+    }
+    return result && error == TOXAV_ERR_CALL_OK;
 }
 
 bool ToxAVManager::endCall(uint32_t friend_number) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!toxav_) return false;
+    V2TIMLog::getInstance().Info("[ToxAVManager] endCall() called: friend_number={}", friend_number);
+    if (!toxav_) {
+        V2TIMLog::getInstance().Error("[ToxAVManager] endCall() failed: ToxAV not initialized");
+        return false;
+    }
     TOXAV_ERR_CALL_CONTROL error;
-    return toxav_call_control(toxav_.get(), friend_number,
-                            TOXAV_CALL_CONTROL_CANCEL, &error) &&
-           error == TOXAV_ERR_CALL_CONTROL_OK;
+    bool result = toxav_call_control(toxav_.get(), friend_number,
+                            TOXAV_CALL_CONTROL_CANCEL, &error);
+    if (result && error == TOXAV_ERR_CALL_CONTROL_OK) {
+        V2TIMLog::getInstance().Info("[ToxAVManager] endCall() succeeded: friend_number={}", friend_number);
+    } else {
+        V2TIMLog::getInstance().Error("[ToxAVManager] endCall() failed: friend_number={}, error={}", 
+            friend_number, (int)error);
+    }
+    return result && error == TOXAV_ERR_CALL_CONTROL_OK;
+}
+
+bool ToxAVManager::answerCall(uint32_t friend_number, uint32_t audio_bit_rate, uint32_t video_bit_rate) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    V2TIMLog::getInstance().Info("[ToxAVManager] answerCall() called: friend_number={}, audio_bit_rate={}, video_bit_rate={}", 
+        friend_number, audio_bit_rate, video_bit_rate);
+    if (!toxav_) {
+        V2TIMLog::getInstance().Error("[ToxAVManager] answerCall() failed: ToxAV not initialized");
+        return false;
+    }
+    TOXAV_ERR_ANSWER error;
+    bool result = toxav_answer(toxav_.get(), friend_number, audio_bit_rate, video_bit_rate, &error);
+    if (result && error == TOXAV_ERR_ANSWER_OK) {
+        V2TIMLog::getInstance().Info("[ToxAVManager] answerCall() succeeded: friend_number={}", friend_number);
+    } else {
+        V2TIMLog::getInstance().Error("[ToxAVManager] answerCall() failed: friend_number={}, error={}", 
+            friend_number, (int)error);
+    }
+    return result && error == TOXAV_ERR_ANSWER_OK;
 }
 
 bool ToxAVManager::muteAudio(uint32_t friend_number, bool mute) {
@@ -165,6 +260,22 @@ bool ToxAVManager::sendVideoFrame(uint32_t friend_number, uint16_t width,
                                 y, u, v, &error) && error == TOXAV_ERR_SEND_FRAME_OK;
 }
 
+bool ToxAVManager::setAudioBitRate(uint32_t friend_number, uint32_t audio_bit_rate) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!toxav_) return false;
+    TOXAV_ERR_BIT_RATE_SET error;
+    return toxav_audio_set_bit_rate(toxav_.get(), friend_number, audio_bit_rate, &error) &&
+           error == TOXAV_ERR_BIT_RATE_SET_OK;
+}
+
+bool ToxAVManager::setVideoBitRate(uint32_t friend_number, uint32_t video_bit_rate) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!toxav_) return false;
+    TOXAV_ERR_BIT_RATE_SET error;
+    return toxav_video_set_bit_rate(toxav_.get(), friend_number, video_bit_rate, &error) &&
+           error == TOXAV_ERR_BIT_RATE_SET_OK;
+}
+
 // 回调设置实现
 void ToxAVManager::setCallCallback(CallCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -194,4 +305,9 @@ void ToxAVManager::setAudioReceiveFrameCallback(AudioReceiveFrameCallback cb) {
 void ToxAVManager::setVideoReceiveFrameCallback(VideoReceiveFrameCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     video_receive_frame_cb_ = cb;
+}
+
+ToxAV* ToxAVManager::getToxAV() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return toxav_.get();
 } 

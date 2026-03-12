@@ -2,6 +2,11 @@
 #define __V2TIM_MANAGER_IMPL_H__
 
 #include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <functional>
+#include <future>
+#include <queue>
 #include "toxcore/tox_struct.h"
 #include "V2TIMManager.h"
 #include "V2TIMMessageManager.h"
@@ -11,6 +16,8 @@
 #include "V2TIMOfflinePushManager.h"
 #include "V2TIMSignalingManager.h"
 #include "V2TIMCommunityManager.h"
+
+class V2TIMSignalingManagerImpl;
 #include "ToxManager.h"
 #include <memory>
 #include <vector>
@@ -18,9 +25,22 @@
 #include <thread>
 #include "V2TIMStringHash.h"
 #include <unordered_map>
+#include <vector>
+#include <string>
+
+#ifdef BUILD_TOXAV
+#include "ToxAVManager.h"
+#endif
 
 class V2TIMManagerImpl : public V2TIMManager {
 public:
+    // Constructor (now public for multi-instance support)
+    V2TIMManagerImpl();
+    
+    // Destructor
+    ~V2TIMManagerImpl();
+    
+    // Backward compatibility: Get default instance
     static V2TIMManagerImpl* GetInstance();
 
     // SDK Listener Management
@@ -41,12 +61,18 @@ public:
     V2TIMString GetLoginUser() override;
     V2TIMLoginStatus GetLoginStatus() override;
 
+    /** Return true if this instance has group_id in its group mapping (used for join/peer sync). */
+    bool HasGroup(const V2TIMString& group_id) const;
+
     // Messaging
     void AddSimpleMsgListener(V2TIMSimpleMsgListener* listener) override;
     void RemoveSimpleMsgListener(V2TIMSimpleMsgListener* listener) override;
     V2TIMString SendC2CTextMessage(const V2TIMString& text, const V2TIMString& userID, V2TIMSendCallback* callback) override;
+    V2TIMString SendC2CTextMessage(const V2TIMString& text, const V2TIMString& userID, const V2TIMBuffer& cloudCustomData, V2TIMSendCallback* callback) override;
     V2TIMString SendC2CCustomMessage(const V2TIMBuffer& customData, const V2TIMString& userID, V2TIMSendCallback* callback) override;
     V2TIMString SendGroupTextMessage(const V2TIMString& text, const V2TIMString& groupID, V2TIMMessagePriority priority, V2TIMSendCallback* callback) override;
+    V2TIMString SendGroupTextMessage(const V2TIMString& text, const V2TIMString& groupID, V2TIMMessagePriority priority, const V2TIMBuffer& cloudCustomData, V2TIMSendCallback* callback) override;
+    V2TIMString SendGroupPrivateTextMessage(const V2TIMString& groupID, const V2TIMString& receiverPublicKey64, const V2TIMString& text, V2TIMSendCallback* callback);
     V2TIMString SendGroupCustomMessage(const V2TIMBuffer& customData, const V2TIMString& groupID, V2TIMMessagePriority priority, V2TIMSendCallback* callback) override;
 
     // Group Management
@@ -83,12 +109,90 @@ public:
     void CallExperimentalAPI(const V2TIMString& api, const void* param, V2TIMValueCallback<V2TIMBaseObject>* callback) override;
 
     // Helper methods for accessing private data
-    bool GetGroupNumberFromID(const V2TIMString& groupID, uint32_t& group_number);
+    bool GetGroupNumberFromID(const V2TIMString& groupID, Tox_Group_Number& group_number);
+    bool GetChatIdFromGroupID(const V2TIMString& groupID, uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE]);
+    bool GetGroupIDFromChatId(const uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE], V2TIMString& groupID);
+    bool IsRunning() const;  // Implementation in .cpp file to avoid inline optimization issues
+    
+    // Helper method to notify group listeners about member kicked
+    void NotifyGroupMemberKicked(const V2TIMString& groupID, const V2TIMGroupMemberInfoVector& memberList);
+    
+    // Helper method to get all group IDs from mapping (for GetJoinedGroupList)
+    // This ensures we use the correct group IDs instead of generating from group_number
+    std::vector<V2TIMString> GetAllGroupIDs();
+    
+#ifdef BUILD_TOXAV
+    // Helper to resolve group_number (e.g. conference_number) to groupID (for AV callbacks)
+    bool GetGroupIDFromGroupNumber(Tox_Group_Number group_number, V2TIMString& out_group_id);
+#endif
+    
+    // Helper method to get ToxManager instance (for internal use)
+    ToxManager* GetToxManager() { return tox_manager_.get(); }
+
+    // Save Tox profile to disk (call after friend list changes to persist state)
+    void SaveToxProfile();
+    
+    /** Run a function on the event thread (tox iterate loop). Use to avoid deadlock when calling tox API from another thread. */
+    template<typename R>
+    R RunOnEventThread(std::function<R()> f) {
+        auto promise = std::make_shared<std::promise<R>>();
+        auto future = promise->get_future();
+        std::function<void()> task = [f, promise]() {
+            try {
+                promise->set_value(f());
+            } catch (...) {
+                promise->set_exception(std::current_exception());
+            }
+        };
+        {
+            std::lock_guard<std::mutex> lock(task_mutex_);
+            task_queue_.push(task);
+        }
+        task_cv_.notify_one();
+        return future.get();
+    }
+
+    /** Post a void task to the event thread without waiting. Safe to call from within event thread (e.g. Tox callbacks). */
+    void PostToEventThread(std::function<void()> task) {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        task_queue_.push(std::move(task));
+        task_cv_.notify_one();
+    }
+    
+#ifdef BUILD_TOXAV
+    // Helper method to get ToxAVManager instance (for internal use)
+    ToxAVManager* GetToxAVManager();
+#endif
+    
+    // Rejoin all known groups using stored chat_id (c-toxcore recommended approach)
+    // This can be called from InitSDK or from Dart layer after init() completes
+    // Should be called after Tox connection is established for best success rate
+    void RejoinKnownGroups();
 
 private:
-    // Remove Tox instance and use ToxManager singleton
+    struct PendingInvite {
+        uint32_t friend_number;
+        std::vector<uint8_t> cookie;
+        Tox_Group_Number group_number;  // Store group_number after accepting invite
+        std::string inviter_userID;     // Store inviter's userID for onMemberInvited callback
+    };
+    // Tox profile path used in InitSDK; UnInitSDK and SaveToxProfile use this instead of recomputing
+    std::string save_path_;
+
+    // ToxManager instance (owned by this V2TIMManagerImpl instance)
+    std::unique_ptr<ToxManager> tox_manager_;
+    
+#ifdef BUILD_TOXAV
+    // ToxAVManager instance (owned by this V2TIMManagerImpl instance).
+    // Custom deleter required because ToxAVManager has a private destructor.
+    std::unique_ptr<ToxAVManager, void(*)(ToxAVManager*)> toxav_manager_;
+#endif
+    
     std::thread event_thread_;
-    bool running_ = true;
+    std::atomic<bool> running_{true};  // Use atomic to prevent compiler optimization issues
+    std::mutex task_mutex_;
+    std::queue<std::function<void()>> task_queue_;
+    std::condition_variable task_cv_;  // Signalled when a task is pushed so event thread can process
     V2TIMString logged_in_user_;
     std::mutex mutex_;
 
@@ -98,10 +202,30 @@ private:
     std::unordered_set<V2TIMGroupListener*> group_listeners_;
 
     // --- Mappings ---
-    // Map V2TIM GroupID string to Tox conference_number
-    std::unordered_map<V2TIMString, uint32_t> group_id_to_conference_number_;
-    // Map Tox conference_number back to V2TIM GroupID string (for receiving messages)
-    std::unordered_map<uint32_t, V2TIMString> conference_number_to_group_id_;
+    // Map V2TIM GroupID string to Tox group_number
+    std::unordered_map<V2TIMString, Tox_Group_Number> group_id_to_group_number_;
+    // Map Tox group_number back to V2TIM GroupID string (for receiving messages)
+    std::unordered_map<Tox_Group_Number, V2TIMString> group_number_to_group_id_;
+    // Map V2TIM GroupID string to Tox chat_id (stable identifier, 32 bytes)
+    std::unordered_map<V2TIMString, std::vector<uint8_t>> group_id_to_chat_id_;
+    // Map Tox chat_id (as hex string) back to V2TIM GroupID string
+    std::unordered_map<std::string, V2TIMString> chat_id_to_group_id_;
+    // Map V2TIM GroupID string to group type ("group" or "conference")
+    std::unordered_map<V2TIMString, std::string> group_id_to_type_;
+    // Pending group invites awaiting JoinGroup
+    std::unordered_map<V2TIMString, PendingInvite> pending_group_invites_;
+    // Flag to track if RejoinKnownGroups has been triggered after connection establishment
+    std::atomic<bool> rejoin_triggered_{false};
+    // Pending login callback to be called when connection is established
+    V2TIMCallback* pending_login_callback_;
+    // Member list snapshots for each group (for detecting join/leave)
+    std::unordered_map<Tox_Group_Number, std::unordered_set<std::string>> group_peer_snapshots_;
+    // (group_number, peer_public_key_hex_lower) -> peer_id, populated from HandleGroupPeerJoin for group private send
+    std::unordered_map<Tox_Group_Number, std::unordered_map<std::string, Tox_Group_Peer_Number>> group_peer_id_cache_;
+    // Global counter for generating unique group IDs (to avoid reusing IDs from deleted groups)
+    uint64_t next_group_id_counter_;
+    // Per-instance signaling manager (multi-instance support)
+    std::unique_ptr<V2TIMSignalingManagerImpl> signaling_manager_;
     
     // TODO: Consider mapping for friend numbers to UserIDs if needed frequently
     // std::unordered_map<uint32_t, V2TIMString> friend_number_to_user_id_;
@@ -115,20 +239,37 @@ private:
     void HandleFriendName(uint32_t friend_number, const uint8_t* name, size_t length);
     void HandleFriendStatusMessage(uint32_t friend_number, const uint8_t* message, size_t length);
     void HandleFriendStatus(uint32_t friend_number, TOX_USER_STATUS status);
+    void HandleFriendConnectionStatus(uint32_t friend_number, TOX_CONNECTION connection_status);
     void HandleGroupTitle(uint32_t conference_number, uint32_t peer_number, const uint8_t* title, size_t length);
     void HandleGroupPeerName(uint32_t conference_number, uint32_t peer_number, const uint8_t* name, size_t length);
     void HandleGroupPeerListChanged(uint32_t conference_number);
+    void HandleGroupConnected(uint32_t conference_number);
+    
+    // Tox group handlers
+    void HandleGroupMessageGroup(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t length, Tox_Group_Message_Id message_id);
+    void HandleGroupPrivateMessage(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t length, Tox_Group_Message_Id message_id);
+    void HandleGroupTopic(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* topic, size_t length);
+    void HandleGroupPeerNameGroup(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* name, size_t length);
+    void HandleGroupPeerJoin(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id);
+    void HandleGroupPeerExit(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, Tox_Group_Exit_Type exit_type, const uint8_t* name, size_t name_length);
+    void HandleGroupModeration(Tox_Group_Number group_number, Tox_Group_Peer_Number source_peer_id, Tox_Group_Peer_Number target_peer_id, Tox_Group_Mod_Event mod_type);
+    void HandleGroupSelfJoin(Tox_Group_Number group_number);
+    void HandleGroupJoinFail(Tox_Group_Number group_number, Tox_Group_Join_Fail fail_type);
+    void HandleGroupPrivacyState(Tox_Group_Number group_number, Tox_Group_Privacy_State privacy_state);
+    void HandleGroupVoiceState(Tox_Group_Number group_number, Tox_Group_Voice_State voice_state);
+    void HandleGroupPeerStatus(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_USER_STATUS status);
     // TODO: Add handlers for other Tox callbacks (read receipts, file transfer, etc.)
 
-    // Private constructor/destructor if using singleton pattern correctly
-    V2TIMManagerImpl(); 
-    ~V2TIMManagerImpl();
+    // Constructor and destructor are now public (declared above)
 
     // Delete copy constructor and assignment operator
     V2TIMManagerImpl(const V2TIMManagerImpl&) = delete;
     V2TIMManagerImpl& operator=(const V2TIMManagerImpl&) = delete;
 
     friend class V2TIMManager; // Allow V2TIMManager::GetInstance() potentially
+    friend class V2TIMGroupManagerImpl; // Allow V2TIMGroupManagerImpl to access private members
+    // Allow tim2tox_ffi functions to access private members for chat ID lookup
+    friend int tim2tox_ffi_get_group_chat_id(int64_t instance_id, const char* group_id, char* out_chat_id, int out_len);
 };
 
 #endif // __V2TIM_MANAGER_IMPL_H__

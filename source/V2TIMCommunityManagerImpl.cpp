@@ -7,6 +7,8 @@
 #include "V2TIMDefine.h"
 #include "toxcore/tox.h"
 #include <mutex>
+#include <cstring>
+#include "V2TIMManagerImpl.h"
 
 // Helper macro for logging with format strings
 // These allow us to use string formatting in logs like Python's f-strings
@@ -23,6 +25,23 @@ namespace community {
     constexpr int ERR_COMM_INVALID_PARAMS = -102;
     constexpr int ERR_COMM_NOT_FOUND = -103;
     constexpr int ERR_COMM_SUCCESS = 0;
+    
+    // Helper function to get ToxManager from current V2TIMManagerImpl instance
+    ToxManager* GetToxManager(V2TIMCommunityManagerImpl* self) {
+        if (!self) return nullptr;
+        // Use manager_impl_ instead of V2TIMManagerImpl::GetInstance() for multi-instance support
+        V2TIMManagerImpl* manager_impl = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(self->manager_impl_mutex_);
+            manager_impl = self->manager_impl_;
+        }
+        if (!manager_impl) {
+            // Fallback to default instance for backward compatibility
+            manager_impl = V2TIMManagerImpl::GetInstance();
+        }
+        if (!manager_impl) return nullptr;
+        return manager_impl->GetToxManager();
+    }
 
     // Helper function for hex string conversion
     bool hex_string_to_bin(const char* hex_string, uint8_t* bytes, size_t size) {
@@ -69,7 +88,17 @@ void V2TIMCommunityManagerImpl::CreateCommunity(const V2TIMGroupInfo& info,
                                                 const V2TIMCreateGroupMemberInfoVector& memberList,
                                                 V2TIMValueCallback<V2TIMString>* callback) {
     TOX_ERR_CONFERENCE_NEW err;
-    uint32_t conference_number = tox_conference_new(ToxManager::getInstance().getTox(), &err);
+    ToxManager* tox_manager = community::GetToxManager(this);
+    if (!tox_manager) {
+        if (callback) callback->OnError(ERR_SDK_INTERNAL_ERROR, "ToxManager not initialized");
+        return;
+    }
+    Tox* tox = tox_manager->getTox();
+    if (!tox) {
+        if (callback) callback->OnError(ERR_SDK_INTERNAL_ERROR, "Tox instance not available");
+        return;
+    }
+    uint32_t conference_number = tox_conference_new(tox, &err);
     if (err != TOX_ERR_CONFERENCE_NEW_OK) {
         if (callback) callback->OnError(ERR_SDK_INTERNAL_ERROR, "Create failed");
         return;
@@ -247,12 +276,66 @@ void V2TIMCommunityManagerImpl::GetTopicPermissionInPermissionGroup(const V2TIMS
 }
 
 // 初始化数据库
-V2TIMCommunityManagerImpl::V2TIMCommunityManagerImpl() {    
-    sqlite3_open("community_data.db", &db_);
-    sqlite3_exec(db_, 
-        "CREATE TABLE IF NOT EXISTS communities ("
-        "id TEXT PRIMARY KEY, name TEXT, topic_count INTEGER)", 
-        nullptr, nullptr, nullptr);
+V2TIMCommunityManagerImpl::V2TIMCommunityManagerImpl() : db_(nullptr), manager_impl_(nullptr) {
+    // Database will be opened in SetManagerImpl() when instance_id is available
+    // This ensures each instance uses its own database file
+}
+
+// Multi-instance support: Set the associated V2TIMManagerImpl instance
+void V2TIMCommunityManagerImpl::SetManagerImpl(V2TIMManagerImpl* manager_impl) {
+    V2TIMManagerImpl* old_impl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+        old_impl = manager_impl_;
+    }
+    // When instance changes, clear in-memory caches so they are not reused for another instance
+    if (manager_impl != old_impl) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            friend_numbers_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(community_mutex_);
+            communities_.clear();
+            community_info_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(topic_mutex_);
+            topics_.clear();
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+
+    // Close old database if exists
+    if (db_) {
+        sqlite3_close(db_);
+        db_ = nullptr;
+    }
+
+    manager_impl_ = manager_impl;
+
+    // Get instance_id and open per-instance database
+    int64_t instance_id = 0;
+    if (manager_impl) {
+        extern int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
+        instance_id = GetInstanceIdFromManager(manager_impl);
+    }
+
+    std::string db_path;
+    if (instance_id == 0) {
+        db_path = "community_data.db"; // Default instance
+    } else {
+        db_path = "community_data_" + std::to_string(instance_id) + ".db";
+    }
+
+    sqlite3_open(db_path.c_str(), &db_);
+    if (db_) {
+        sqlite3_exec(db_,
+            "CREATE TABLE IF NOT EXISTS communities ("
+            "id TEXT PRIMARY KEY, name TEXT, topic_count INTEGER)",
+            nullptr, nullptr, nullptr);
+    }
 }
 
 // 邀请成员到社群（使用 Tox 会议邀请）
@@ -278,7 +361,13 @@ V2TIMCallback* V2TIMCommunityManagerImpl::InviteMemberToCommunity(const std::str
     }
     
     // Send conference invite
-    auto* tox = ToxManager::getInstance().getTox();
+    ToxManager* tox_manager = community::GetToxManager(this);
+    if (!tox_manager) {
+        callback->code = community::ERR_COMM_NOT_INITIALIZED;
+        callback->desc = "ToxManager not initialized";
+        return callback;
+    }
+    auto* tox = tox_manager->getTox();
     if (!tox) {
         V2TIM_LOG_ERROR("Failed to get Tox instance");
         callback->code = community::ERR_COMM_NOT_INITIALIZED;
@@ -287,7 +376,7 @@ V2TIMCallback* V2TIMCommunityManagerImpl::InviteMemberToCommunity(const std::str
     }
     
     TOX_ERR_CONFERENCE_INVITE error;
-    tox_conference_invite(tox, friend_number, it->second, &error);
+    tox_manager->inviteToConference(friend_number, it->second, &error);
     if (error != TOX_ERR_CONFERENCE_INVITE_OK) {
         V2TIM_LOG_ERROR("Failed to invite {} to conference {}, error: {}", userID, communityID, error);
         callback->code = community::ERR_COMM_API_CALL_FAILED;
@@ -304,14 +393,31 @@ V2TIMCallback* V2TIMCommunityManagerImpl::InviteMemberToCommunity(const std::str
 uint32_t V2TIMCommunityManagerImpl::GetFriendNumber(const std::string& userID) {
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // Check if we already have the friend number cached
+    // Check if we already have the friend number cached; validate before use (cache invalidation on friend delete)
     auto it = friend_numbers_.find(userID);
     if (it != friend_numbers_.end()) {
-        return it->second;
+        ToxManager* tox_manager = community::GetToxManager(this);
+        if (tox_manager) {
+            Tox* tox = tox_manager->getTox();
+            if (tox) {
+                uint8_t pk[TOX_PUBLIC_KEY_SIZE];
+                TOX_ERR_FRIEND_GET_PUBLIC_KEY err;
+                if (tox_friend_get_public_key(tox, it->second, pk, &err) && err == TOX_ERR_FRIEND_GET_PUBLIC_KEY_OK) {
+                    uint8_t expected[TOX_PUBLIC_KEY_SIZE];
+                    if (community::hex_string_to_bin(userID.c_str(), expected, sizeof(expected)) && memcmp(expected, pk, TOX_PUBLIC_KEY_SIZE) == 0) {
+                        return it->second;
+                    }
+                }
+            }
+        }
+        // Cache invalid (friend removed or instance changed): remove entry and fall through to re-query
+        friend_numbers_.erase(it);
     }
     
     // Try to find friend by public key
-    auto tox = ToxManager::getInstance().getTox();
+    ToxManager* tox_manager = community::GetToxManager(this);
+    if (!tox_manager) return UINT32_MAX;
+    auto tox = tox_manager->getTox();
     if (!tox) {
         V2TIM_LOG_ERROR("Failed to get Tox instance");
         return UINT32_MAX;

@@ -154,6 +154,8 @@ public:
      */
     virtual V2TIMString SendC2CTextMessage(const V2TIMString &text, const V2TIMString &userID,
                                            V2TIMSendCallback *callback) = 0;
+    virtual V2TIMString SendC2CTextMessage(const V2TIMString &text, const V2TIMString &userID,
+                                           const V2TIMBuffer &cloudCustomData, V2TIMSendCallback *callback) = 0;
 
     /**
      * 3.4 发送单聊自定义（信令）消息（最大支持 12KB）
@@ -181,6 +183,8 @@ public:
      */
     virtual V2TIMString SendGroupTextMessage(const V2TIMString &text, const V2TIMString &groupID,
                                              V2TIMMessagePriority priority, V2TIMSendCallback *callback) = 0;
+    virtual V2TIMString SendGroupTextMessage(const V2TIMString &text, const V2TIMString &groupID,
+                                             V2TIMMessagePriority priority, const V2TIMBuffer &cloudCustomData, V2TIMSendCallback *callback) = 0;
 
     /**
      * 3.6 发送群聊自定义（信令）消息（最大支持 12KB）

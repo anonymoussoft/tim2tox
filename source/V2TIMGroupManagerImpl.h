@@ -6,7 +6,6 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
-#include <sqlite3.h>
 #include <unordered_set>
 #include "V2TIMString.h"
 
@@ -17,6 +16,8 @@ class V2TIMGroupManagerImpl : public V2TIMGroupManager {
 public:
     static V2TIMGroupManagerImpl* GetInstance();
     V2TIMGroupManagerImpl(V2TIMManagerImpl* manager_impl = nullptr);
+    
+    void SetManagerImpl(V2TIMManagerImpl* manager_impl);
 
     ////////////////////////////// 群组管理接口 //////////////////////////////
     void CreateGroup(const V2TIMGroupInfo& info,
@@ -32,6 +33,10 @@ public:
     void SearchCloudGroups(const V2TIMGroupSearchParam& searchParam,
                            V2TIMValueCallback<V2TIMGroupSearchResult>* callback) override;
     void SetGroupInfo(const V2TIMGroupInfo& info, V2TIMCallback* callback) override;
+    /// Called when group topic is received from Tox (e.g. name broadcast); updates local cache and GetGroupsInfo.
+    void UpdateGroupInfoFromTopic(const V2TIMString& groupID, const std::string& topic_value);
+    /// Ensure group_info_ has an entry for groupID (e.g. when joining so GetGroupsInfo finds it before topic arrives).
+    void EnsureGroupInfoExists(const V2TIMString& groupID);
     void InitGroupAttributes(const V2TIMString& groupID,
                             const V2TIMGroupAttributeMap& attributes,
                             V2TIMCallback* callback) override;
@@ -101,19 +106,31 @@ public:
     void GetTopicInfoList(const V2TIMString& groupID, const V2TIMStringVector& topicIDList,
                          V2TIMValueCallback<V2TIMTopicInfoResultVector>* callback) override;
 
+    // Internal methods for V2TIMManagerImpl to call
+    void QuitGroup(const V2TIMString& groupID, V2TIMCallback* callback);
+    void DismissGroup(const V2TIMString& groupID, V2TIMCallback* callback);
+    
+    // Helper method to get all group IDs (for CreateGroup to avoid ID conflicts)
+    std::vector<std::string> GetAllGroupIDsSync();
+
 private:
     std::mutex group_mutex_, member_mutex_, mute_mutex_;
-    std::unordered_map<std::string, uint32_t> groups_;          // groupID -> conference_number
+    std::unordered_map<std::string, Tox_Group_Number> groups_;          // groupID -> group_number
     std::unordered_map<std::string, V2TIMGroupInfo> group_info_; // 本地存储群资料
     std::unordered_map<std::string, V2TIMGroupMemberInfoVector> group_members_; // 群成员列表
     std::unordered_map<std::string, std::unordered_set<std::string>> muted_members_; // 禁言列表
-    V2TIMManagerImpl* manager_impl_; // 添加manager_impl指针
-
+    // nameCard overrides for other users (Tox only allows setting self name; we store others locally)
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> member_name_card_overrides_;
+    V2TIMManagerImpl* manager_impl_; // Reference to V2TIMManagerImpl to access group mappings
     // Tox工具函数
     uint32_t GetFriendNumber(const std::string& userID);
-
-    // 初始化数据库
-    sqlite3* db_;
+    // Helper functions for role mapping
+    Tox_Group_Role v2timRoleToToxRole(uint32_t v2tim_role);
+    uint32_t toxRoleToV2timRole(Tox_Group_Role tox_role);
+    // Helper function to convert chat_id to hex string
+    std::string chatIdToHexString(const uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE]);
+    // Helper function to convert hex string to chat_id
+    bool hexStringToChatId(const std::string& hex_str, uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE]);
 };
 
 #endif // __V2TIM_GROUP_MANAGER_IMPL_H__

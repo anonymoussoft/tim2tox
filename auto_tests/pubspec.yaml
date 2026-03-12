@@ -1,0 +1,30 @@
+name: tim2tox_auto_tests
+description: "Automated tests for tim2tox Dart layer interfaces in binary replacement mode"
+version: 0.1.0
+publish_to: "none"
+license: GPL-3.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  test: ^1.24.0
+  tencent_cloud_chat_sdk:
+    path: ../../tencent_cloud_chat_sdk-8.7.7201
+  tim2tox_dart:
+    path: ../dart
+  path_provider: ^2.1.3
+  path: ^1.8.3
+  shared_preferences: ^2.2.2
+  crypto: ^3.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.2
+
+dependency_overrides:
+  tencent_cloud_chat_sdk:
+    path: ../../tencent_cloud_chat_sdk-8.7.7201

@@ -33,6 +33,9 @@ public:
 
     void SetGroupInfo(const V2TIMGroupInfo& info, V2TIMCallback* callback) override;
 
+    /// Called when group topic is received from Tox (e.g. name broadcast); updates local cache and GetGroupsInfo.
+    void UpdateGroupInfoFromTopic(const V2TIMString& groupID, const std::string& topic_value);
+
     void GetGroupMemberList(const V2TIMString& groupID, uint32_t filter, uint64_t nextSeq,
                            V2TIMValueCallback<V2TIMGroupMemberInfoResult>* callback) override;
 

@@ -10,6 +10,16 @@
 #include <sqlite3.h>
 #include <string>
 
+// Forward declaration
+class V2TIMManagerImpl;
+class ToxManager;
+class V2TIMCommunityManagerImpl;
+
+// Forward declaration for namespace function
+namespace community {
+    ToxManager* GetToxManager(V2TIMCommunityManagerImpl* self);
+}
+
 // Error codes
 static constexpr int ERR_COMM_API_CALL_FAILED = -100;
 static constexpr int ERR_SDK_COMMUNITY_NOT_FOUND = -103;
@@ -17,6 +27,12 @@ static constexpr int ERR_SDK_COMMUNITY_NOT_FOUND = -103;
 class V2TIMCommunityManagerImpl : public V2TIMCommunityManager {
 public:
     static V2TIMCommunityManagerImpl& getInstance();
+    
+    // Multi-instance support: Set the associated V2TIMManagerImpl instance
+    void SetManagerImpl(V2TIMManagerImpl* manager_impl);
+    
+    // Friend function to access private members
+    friend ToxManager* community::GetToxManager(V2TIMCommunityManagerImpl* self);
     
     // Community listener management
     void AddCommunityListener(V2TIMCommunityListener* listener) override;
@@ -114,6 +130,10 @@ private:
     
     sqlite3* db_;
     uint32_t topic_counter_ = 0;
+    
+    // Reference to V2TIMManagerImpl for multi-instance support
+    V2TIMManagerImpl* manager_impl_;
+    std::mutex manager_impl_mutex_;
 };
 
 #endif // __V2TIM_COMMUNITY_MANAGER_IMPL_H__

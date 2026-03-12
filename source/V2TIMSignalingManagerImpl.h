@@ -12,6 +12,8 @@
 
 // Forward declarations
 struct SignalingPacket;
+class V2TIMManagerImpl;
+class ToxManager;
 
 struct SignalingInviteInfo {
     V2TIMString inviteID;
@@ -27,6 +29,9 @@ class V2TIMSignalingManagerImpl : public V2TIMSignalingManager {
 public:
     V2TIMSignalingManagerImpl();
     ~V2TIMSignalingManagerImpl() override;
+
+    // Multi-instance support: Set the associated V2TIMManagerImpl instance
+    void SetManagerImpl(V2TIMManagerImpl* manager_impl);
 
     void AddSignalingListener(V2TIMSignalingListener* listener) override;
     void RemoveSignalingListener(V2TIMSignalingListener* listener) override;
@@ -58,12 +63,24 @@ private:
     void SendToxPacket(uint32_t friend_number, const SignalingPacket& packet);
     uint32_t GetOrCreateConference(const V2TIMString& groupID);
     void SendConferenceMessage(uint32_t conference_number, const V2TIMString& data);
+    
+    // Helper function to get ToxManager from current V2TIMManagerImpl instance
+    ToxManager* GetToxManager();
 
     // 监听器列表
     std::vector<V2TIMSignalingListener*> listeners_;
-    // 邀请信息表 (inviteID -> 信息)
+    // 邀请信息表 (inviteID -> 信息) — 发送方维护
     std::unordered_map<std::string, SignalingInviteInfo> active_invites_;
+    // 接收到的邀请 (inviteID -> inviter_friend_number) — 接收方维护，用于 Accept/Reject
+    std::unordered_map<std::string, uint32_t> received_invites_;
     std::mutex mutex_;
+    
+    // Reference to V2TIMManagerImpl for multi-instance support
+    V2TIMManagerImpl* manager_impl_;
+    std::mutex manager_impl_mutex_;
+    
+    // Per-instance counter for unique ID generation (replaces static counter for multi-instance support)
+    int unique_id_counter_;
 };
 
 #endif  // __V2TIM_SIGNALING_MANAGER_IMPL_H__

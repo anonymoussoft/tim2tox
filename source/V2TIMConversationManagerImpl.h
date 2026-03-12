@@ -6,10 +6,17 @@
 #include <vector>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <chrono>
+#include <string>
 #include "V2TIMString.h"
+
+// Forward declaration
+class V2TIMManagerImpl;
 
 class V2TIMConversationManagerImpl : public V2TIMConversationManager {
 public:
+    static V2TIMConversationManagerImpl* GetInstance();
     V2TIMConversationManagerImpl();
     ~V2TIMConversationManagerImpl() override;
 
@@ -64,6 +71,22 @@ public:
     void DeleteConversationsFromGroup(const V2TIMString &groupName, const V2TIMStringVector &conversationIDList,
                                       V2TIMValueCallback<V2TIMConversationOperationResultVector>* callback) override;
 
+    // Public method to refresh cache and notify listeners (for use when new conversations appear)
+    void RefreshCache() {
+        RefreshConversationCache();
+        // Notify listeners about new conversations after refresh
+        NotifyNewConversations();
+    }
+
+    // Refresh cache only without notifying OnNewConversation listeners.
+    // Use this after deletions — OnNewConversation would re-add deleted conversations in Dart.
+    void RefreshConversationCacheOnly() {
+        RefreshConversationCache();
+    }
+
+    // Multi-instance support: Set the associated V2TIMManagerImpl instance
+    void SetManagerImpl(V2TIMManagerImpl* manager_impl);
+
 private:
     std::vector<V2TIMConversationListener*> listeners_;
     std::mutex listeners_mutex_;
@@ -71,9 +94,31 @@ private:
     // 本地会话缓存（好友列表+群组列表）
     std::vector<V2TIMConversation> cached_conversations_;
     std::mutex cache_mutex_;
+    
+    // Track last known friend count to detect changes
+    size_t last_friend_count_;
+    
+    // Debounce mechanism for RefreshConversationCache
+    // Prevents excessive cache refreshes (e.g., when multiple friend operations happen quickly)
+    std::chrono::steady_clock::time_point last_refresh_time_;
+    std::mutex refresh_debounce_mutex_;
+    static constexpr std::chrono::milliseconds REFRESH_DEBOUNCE_MS{200}; // 200ms debounce
+    
+    // 置顶状态存储
+    std::unordered_map<std::string, bool> pinned_conversations_;
+    std::mutex pinned_mutex_;
+
+    // Track explicitly deleted conversation IDs so RefreshConversationCache won't re-add them
+    std::unordered_set<std::string> deleted_conversation_ids_;
+    std::mutex deleted_ids_mutex_;
+
+    // Reference to V2TIMManagerImpl for multi-instance support
+    V2TIMManagerImpl* manager_impl_;
+    std::mutex manager_impl_mutex_;
 
     void RefreshConversationCache();
     V2TIMConversation CreateConversationFromFriend(uint32_t friend_number);
+    void NotifyNewConversations();
 };
 
 #endif // V2TIM_CONVERSATION_MANAGER_IMPL_H

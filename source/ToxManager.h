@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include "toxcore/tox.h"
 #include <functional>
 #include <stdexcept>
@@ -14,8 +15,15 @@ public:
     ToxManager(const ToxManager&) = delete;
     ToxManager& operator=(const ToxManager&) = delete;
 
-    // 获取单例实例
-    static ToxManager& getInstance();
+    // 构造函数（现在是 public，支持多实例）
+    ToxManager();
+    
+    // 析构函数
+    ~ToxManager();
+
+    // 向后兼容：获取默认实例（用于现有代码）
+    // 注意：在生产环境中，建议使用实例化对象而不是默认实例
+    static ToxManager* getDefaultInstance();
 
     // 初始化/关闭方法
     void initialize(const Tox_Options* options = nullptr,
@@ -26,6 +34,7 @@ public:
     // 核心功能接口
     Tox* getTox() const;
     void iterate(uint32_t timeout = 0);
+    bool isShuttingDown() const;
 
     // 数据保存和加载
     std::vector<uint8_t> getSaveData() const;
@@ -65,20 +74,72 @@ public:
     bool fileSeek(uint32_t friend_number, uint32_t file_number,
                  uint64_t position, TOX_ERR_FILE_SEEK* error = nullptr);
 
-    // 群组相关
-    uint32_t createGroup(TOX_ERR_CONFERENCE_NEW* error = nullptr);
-    bool deleteGroup(uint32_t group_number, TOX_ERR_CONFERENCE_DELETE* error = nullptr);
-    uint32_t joinGroup(uint32_t friend_number, const uint8_t* cookie, size_t length,
-                      TOX_ERR_CONFERENCE_JOIN* error = nullptr);
-    bool groupSendMessage(uint32_t group_number, TOX_MESSAGE_TYPE type,
+    // 群组相关 (tox group API)
+    Tox_Group_Number createGroup(Tox_Group_Privacy_State privacy_state,
+                                 const uint8_t* group_name, size_t group_name_length,
+                                 const uint8_t* name, size_t name_length,
+                                 Tox_Err_Group_New* error = nullptr);
+    bool deleteGroup(Tox_Group_Number group_number, Tox_Err_Group_Leave* error = nullptr);
+    Tox_Group_Number joinGroup(const uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE],
+                               const uint8_t* name, size_t name_length,
+                               const uint8_t* password, size_t password_length,
+                               Tox_Err_Group_Join* error = nullptr);
+    bool groupSendMessage(Tox_Group_Number group_number, TOX_MESSAGE_TYPE type,
                          const uint8_t* message, size_t length,
-                         TOX_ERR_CONFERENCE_SEND_MESSAGE* error = nullptr);
-    bool setGroupTitle(uint32_t group_number, const uint8_t* title,
-                      size_t length, TOX_ERR_CONFERENCE_TITLE* error = nullptr);
-    size_t getGroupTitle(uint32_t group_number, uint8_t* title) const;
-    size_t getGroupPeerName(uint32_t group_number, uint32_t peer_number,
-                           uint8_t* name) const;
-    uint32_t getGroupPeerCount(uint32_t group_number) const;
+                         Tox_Group_Message_Id* message_id = nullptr,
+                         Tox_Err_Group_Send_Message* error = nullptr);
+    bool setGroupTopic(Tox_Group_Number group_number, const uint8_t* topic, size_t length,
+                      Tox_Err_Group_Topic_Set* error = nullptr);
+    bool getGroupTopic(Tox_Group_Number group_number, uint8_t* topic, size_t max_length,
+                      Tox_Err_Group_State_Query* error = nullptr);
+    bool getGroupName(Tox_Group_Number group_number, uint8_t* name, size_t max_length,
+                     Tox_Err_Group_State_Query* error = nullptr);
+    bool getGroupPeerName(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
+                         uint8_t* name, size_t max_length,
+                         Tox_Err_Group_Peer_Query* error = nullptr);
+    uint32_t getGroupPeerCount(Tox_Group_Number group_number, Tox_Err_Group_Peer_Query* error = nullptr);
+    bool isGroupConnected(Tox_Group_Number group_number, Tox_Err_Group_Is_Connected* error = nullptr);
+    bool getGroupChatId(Tox_Group_Number group_number, uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE],
+                       Tox_Err_Group_State_Query* error = nullptr);
+    // Note: There's no direct tox_group_by_chat_id API, need to iterate groups and compare chat_id
+    Tox_Group_Number getGroupByChatId(const uint8_t chat_id[TOX_GROUP_CHAT_ID_SIZE]);
+    bool inviteToGroup(Tox_Group_Number group_number, Tox_Friend_Number friend_number,
+                      Tox_Err_Group_Invite_Friend* error = nullptr);
+    bool kickGroupMember(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
+                        Tox_Err_Group_Kick_Peer* error = nullptr);
+    bool setGroupMemberRole(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
+                           Tox_Group_Role role, Tox_Err_Group_Set_Role* error = nullptr);
+    Tox_Group_Role getGroupMemberRole(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
+                                     Tox_Err_Group_Peer_Query* error = nullptr);
+    Tox_Group_Role getSelfRole(Tox_Group_Number group_number, Tox_Err_Group_Self_Query* error = nullptr);
+    bool getGroupPeerPublicKey(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
+                              uint8_t public_key[TOX_PUBLIC_KEY_SIZE],
+                              Tox_Err_Group_Peer_Query* error = nullptr);
+    bool isGroupPeerOurs(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id,
+                        Tox_Err_Group_Peer_Query* error = nullptr);
+    size_t getGroupListSize() const;
+    void getGroupList(Tox_Group_Number* group_list, size_t list_size) const;
+    
+    // 群聊ID相关
+    bool getConferenceId(uint32_t conference_number, uint8_t id[TOX_CONFERENCE_ID_SIZE]);
+    uint32_t getConferenceById(const uint8_t id[TOX_CONFERENCE_ID_SIZE], TOX_ERR_CONFERENCE_BY_ID* error);
+    Tox_Conference_Type getConferenceType(uint32_t conference_number, TOX_ERR_CONFERENCE_GET_TYPE* error);
+    
+    // 封装直接调用的API
+    bool inviteToConference(uint32_t friend_number, uint32_t conference_number, TOX_ERR_CONFERENCE_INVITE* error = nullptr);
+    size_t getConferenceListSize() const;
+    void getConferenceList(uint32_t* chatlist, size_t list_size) const;
+    bool getConferencePeerPublicKey(uint32_t conference_number, uint32_t peer_number, uint8_t public_key[TOX_PUBLIC_KEY_SIZE], TOX_ERR_CONFERENCE_PEER_QUERY* error) const;
+    bool isConferencePeerOurs(uint32_t conference_number, uint32_t peer_number, TOX_ERR_CONFERENCE_PEER_QUERY* error) const;
+    bool getConferenceTitle(uint32_t conference_number, uint8_t* title, size_t max_length, TOX_ERR_CONFERENCE_TITLE* error) const;
+    
+    // 离线成员相关
+    uint32_t getConferenceOfflinePeerCount(uint32_t conference_number, TOX_ERR_CONFERENCE_PEER_QUERY* error) const;
+    size_t getConferenceOfflinePeerNameSize(uint32_t conference_number, uint32_t offline_peer_number, TOX_ERR_CONFERENCE_PEER_QUERY* error) const;
+    bool getConferenceOfflinePeerName(uint32_t conference_number, uint32_t offline_peer_number, uint8_t* name, size_t max_length, TOX_ERR_CONFERENCE_PEER_QUERY* error) const;
+    bool getConferenceOfflinePeerPublicKey(uint32_t conference_number, uint32_t offline_peer_number, uint8_t public_key[TOX_PUBLIC_KEY_SIZE], TOX_ERR_CONFERENCE_PEER_QUERY* error) const;
+    uint64_t getConferenceOfflinePeerLastActive(uint32_t conference_number, uint32_t offline_peer_number, TOX_ERR_CONFERENCE_PEER_QUERY* error) const;
+    bool setConferenceMaxOffline(uint32_t conference_number, uint32_t max_offline, TOX_ERR_CONFERENCE_SET_MAX_OFFLINE* error);
 
     // 回调类型定义
     using SelfConnectionStatusCallback = std::function<void(TOX_CONNECTION)>;
@@ -94,11 +155,28 @@ public:
     using FileControlCallback = std::function<void(uint32_t friend_number, uint32_t file_number, TOX_FILE_CONTROL control)>;
     using FileChunkRequestCallback = std::function<void(uint32_t, uint32_t, uint64_t, size_t)>;
     using FileRecvChunkCallback = std::function<void(uint32_t, uint32_t, uint64_t, const uint8_t*, size_t)>;
+    // Conference callbacks (deprecated, kept for compatibility)
     using GroupInviteCallback = std::function<void(uint32_t, TOX_CONFERENCE_TYPE, const uint8_t*, size_t)>;
     using GroupMessageCallback = std::function<void(uint32_t, uint32_t, TOX_MESSAGE_TYPE, const uint8_t*, size_t)>;
     using GroupTitleCallback = std::function<void(uint32_t, uint32_t, const uint8_t*, size_t)>;
     using GroupPeerNameCallback = std::function<void(uint32_t, uint32_t, const uint8_t*, size_t)>;
     using GroupPeerListChangedCallback = std::function<void(uint32_t)>;
+    using GroupConnectedCallback = std::function<void(uint32_t)>;
+    
+    // Tox group callbacks
+    using GroupInviteGroupCallback = std::function<void(Tox_Friend_Number, const uint8_t*, size_t)>;
+    using GroupMessageGroupCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, TOX_MESSAGE_TYPE, const uint8_t*, size_t, Tox_Group_Message_Id)>;
+    using GroupPrivateMessageGroupCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, TOX_MESSAGE_TYPE, const uint8_t*, size_t, Tox_Group_Message_Id)>;
+    using GroupTopicCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, const uint8_t*, size_t)>;
+    using GroupPeerNameGroupCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, const uint8_t*, size_t)>;
+    using GroupPeerJoinCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number)>;
+    using GroupPeerExitCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, Tox_Group_Exit_Type, const uint8_t*, size_t)>;
+    using GroupModerationCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, Tox_Group_Peer_Number, Tox_Group_Mod_Event)>;
+    using GroupSelfJoinCallback = std::function<void(Tox_Group_Number)>;
+    using GroupJoinFailCallback = std::function<void(Tox_Group_Number, Tox_Group_Join_Fail)>;
+    using GroupPrivacyStateCallback = std::function<void(Tox_Group_Number, Tox_Group_Privacy_State)>;
+    using GroupVoiceStateCallback = std::function<void(Tox_Group_Number, Tox_Group_Voice_State)>;
+    using GroupPeerStatusCallback = std::function<void(Tox_Group_Number, Tox_Group_Peer_Number, TOX_USER_STATUS)>;
     using FriendLossyPacketCallback = std::function<void(uint32_t, const uint8_t*, size_t)>;
     using FriendLosslessPacketCallback = std::function<void(uint32_t, const uint8_t*, size_t)>;
     using AudioReceiveCallback = std::function<void(uint32_t, const int16_t*, size_t, uint8_t, uint32_t)>;
@@ -123,6 +201,22 @@ public:
     void setGroupTitleCallback(GroupTitleCallback cb);
     void setGroupPeerNameCallback(GroupPeerNameCallback cb);
     void setGroupPeerListChangedCallback(GroupPeerListChangedCallback cb);
+    void setGroupConnectedCallback(GroupConnectedCallback cb);
+    
+    // Tox group callback setters
+    void setGroupInviteGroupCallback(GroupInviteGroupCallback cb);
+    void setGroupMessageGroupCallback(GroupMessageGroupCallback cb);
+    void setGroupPrivateMessageGroupCallback(GroupPrivateMessageGroupCallback cb);
+    void setGroupTopicCallback(GroupTopicCallback cb);
+    void setGroupPeerNameGroupCallback(GroupPeerNameGroupCallback cb);
+    void setGroupPeerJoinCallback(GroupPeerJoinCallback cb);
+    void setGroupPeerExitCallback(GroupPeerExitCallback cb);
+    void setGroupModerationCallback(GroupModerationCallback cb);
+    void setGroupSelfJoinCallback(GroupSelfJoinCallback cb);
+    void setGroupJoinFailCallback(GroupJoinFailCallback cb);
+    void setGroupPrivacyStateCallback(GroupPrivacyStateCallback cb);
+    void setGroupVoiceStateCallback(GroupVoiceStateCallback cb);
+    void setGroupPeerStatusCallback(GroupPeerStatusCallback cb);
     void setFriendLossyPacketCallback(FriendLossyPacketCallback cb);
     void setFriendLosslessPacketCallback(FriendLosslessPacketCallback cb);
     void setAudioReceiveCallback(AudioReceiveCallback cb);
@@ -146,6 +240,22 @@ public:
     static void onGroupTitle(Tox* tox, uint32_t conference_number, uint32_t peer_number, const uint8_t* title, size_t length, void* user_data);
     static void onGroupPeerName(Tox* tox, uint32_t conference_number, uint32_t peer_number, const uint8_t* name, size_t length, void* user_data);
     static void onGroupPeerListChanged(Tox* tox, uint32_t conference_number, void* user_data);
+    static void onGroupConnected(Tox* tox, uint32_t conference_number, void* user_data);
+    
+    // Tox group static callbacks
+    static void onGroupInviteGroup(Tox* tox, Tox_Friend_Number friend_number, const uint8_t* invite_data, size_t invite_data_length, const uint8_t* group_name, size_t group_name_length, void* user_data);
+    static void onGroupMessageGroup(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t length, Tox_Group_Message_Id message_id, void* user_data);
+    static void onGroupPrivateMessage(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message, size_t message_length, Tox_Group_Message_Id message_id, void* user_data);
+    static void onGroupTopic(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* topic, size_t length, void* user_data);
+    static void onGroupPeerNameGroup(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, const uint8_t* name, size_t length, void* user_data);
+    static void onGroupPeerJoin(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, void* user_data);
+    static void onGroupPeerExit(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, Tox_Group_Exit_Type exit_type, const uint8_t* name, size_t name_length, const uint8_t* part_message, size_t part_message_length, void* user_data);
+    static void onGroupModeration(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number source_peer_id, Tox_Group_Peer_Number target_peer_id, Tox_Group_Mod_Event mod_type, void* user_data);
+    static void onGroupSelfJoin(Tox* tox, Tox_Group_Number group_number, void* user_data);
+    static void onGroupJoinFail(Tox* tox, Tox_Group_Number group_number, Tox_Group_Join_Fail fail_type, void* user_data);
+    static void onGroupPrivacyState(Tox* tox, Tox_Group_Number group_number, Tox_Group_Privacy_State privacy_state, void* user_data);
+    static void onGroupVoiceState(Tox* tox, Tox_Group_Number group_number, Tox_Group_Voice_State voice_state, void* user_data);
+    static void onGroupPeerStatus(Tox* tox, Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_USER_STATUS status, void* user_data);
     static void onFriendLossyPacket(Tox* tox, uint32_t friend_number, const uint8_t* data, size_t length, void* user_data);
     static void onFriendLosslessPacket(Tox* tox, uint32_t friend_number, const uint8_t* data, size_t length, void* user_data);
 
@@ -168,12 +278,12 @@ private:
     friend void onGroupTitle(Tox* tox, uint32_t conference_number, uint32_t peer_number, const uint8_t* title, size_t length, void* user_data);
     friend void onGroupPeerName(Tox* tox, uint32_t conference_number, uint32_t peer_number, const uint8_t* name, size_t length, void* user_data);
     friend void onGroupPeerListChanged(Tox* tox, uint32_t conference_number, void* user_data);
+    friend void onGroupConnected(Tox* tox, uint32_t conference_number, void* user_data);
     friend void onFriendLossyPacket(Tox* tox, uint32_t friend_number, const uint8_t* data, size_t length, void* user_data);
     friend void onFriendLosslessPacket(Tox* tox, uint32_t friend_number, const uint8_t* data, size_t length, void* user_data);
 
-    // 私有构造函数/析构函数
-    ToxManager();
-    ~ToxManager() = default;
+    // 构造函数和析构函数现在是 public（支持多实例）
+    // 已在上面声明
 
     // 自定义删除器
     static void toxDeleter(Tox* tox);
@@ -181,6 +291,8 @@ private:
     // 成员变量
     std::unique_ptr<Tox, decltype(&toxDeleter)> tox_;
     mutable std::mutex mutex_;
+    std::mutex iterate_mutex_;  // Serialize tox_iterate - toxcore requires single-threaded access per instance
+    bool is_shutting_down_;  // Flag to prevent double cleanup
 
     // 回调存储
     SelfConnectionStatusCallback self_connection_status_cb_;
@@ -201,6 +313,22 @@ private:
     GroupTitleCallback group_title_cb_;
     GroupPeerNameCallback group_peer_name_cb_;
     GroupPeerListChangedCallback group_peer_list_changed_cb_;
+    GroupConnectedCallback group_connected_cb_;
+    
+    // Tox group callbacks
+    GroupInviteGroupCallback group_invite_group_cb_;
+    GroupMessageGroupCallback group_message_group_cb_;
+    GroupPrivateMessageGroupCallback group_private_message_group_cb_;
+    GroupTopicCallback group_topic_cb_;
+    GroupPeerNameGroupCallback group_peer_name_group_cb_;
+    GroupPeerJoinCallback group_peer_join_cb_;
+    GroupPeerExitCallback group_peer_exit_cb_;
+    GroupModerationCallback group_moderation_cb_;
+    GroupSelfJoinCallback group_self_join_cb_;
+    GroupJoinFailCallback group_join_fail_cb_;
+    GroupPrivacyStateCallback group_privacy_state_cb_;
+    GroupVoiceStateCallback group_voice_state_cb_;
+    GroupPeerStatusCallback group_peer_status_cb_;
     FriendLossyPacketCallback friend_lossy_packet_cb_;
     FriendLosslessPacketCallback friend_lossless_packet_cb_;
     AudioReceiveCallback audio_receive_cb_;

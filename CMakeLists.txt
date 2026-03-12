@@ -75,19 +75,72 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/c-toxcore
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/c-toxcore/toxcore
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    /opt/homebrew/include
 )
 
-# Add library directories
-link_directories(
-    /opt/homebrew/lib
-)
+# Platform-specific include and library directories
+if(APPLE)
+    # macOS - check for both Intel and Apple Silicon homebrew paths
+    if(EXISTS "/opt/homebrew/include")
+        include_directories(/opt/homebrew/include)
+        link_directories(/opt/homebrew/lib)
+    elseif(EXISTS "/usr/local/include")
+        include_directories(/usr/local/include)
+        link_directories(/usr/local/lib)
+    endif()
+elseif(UNIX AND NOT APPLE)
+    # Linux - use pkg-config for dependency management
+    find_package(PkgConfig REQUIRED)
+elseif(WIN32)
+    # Windows - support vcpkg
+    if(DEFINED ENV{VCPKG_ROOT})
+        include_directories($ENV{VCPKG_ROOT}/installed/x64-windows/include)
+        link_directories($ENV{VCPKG_ROOT}/installed/x64-windows/lib)
+    endif()
+    # Also check standard Windows paths
+    if(EXISTS "C:/vcpkg/installed/x64-windows/include")
+        include_directories(C:/vcpkg/installed/x64-windows/include)
+        link_directories(C:/vcpkg/installed/x64-windows/lib)
+    endif()
+endif()
 
-# Find dependencies
-find_package(Sodium REQUIRED)
+# Find dependencies - platform-specific
+if(APPLE OR WIN32)
+    # macOS and Windows - try to find Sodium package
+    find_package(Sodium QUIET)
+    if(NOT Sodium_FOUND)
+        # Fallback: try to find libsodium manually
+        find_library(SODIUM_LIB
+            NAMES sodium libsodium
+            PATHS
+                /opt/homebrew/lib
+                /usr/local/lib
+                /usr/lib
+                C:/vcpkg/installed/x64-windows/lib
+        )
+        if(NOT SODIUM_LIB)
+            message(WARNING "libsodium not found, some features may not work")
+        endif()
+    endif()
+elseif(UNIX AND NOT APPLE)
+    # Linux - use pkg-config
+    pkg_check_modules(SODIUM libsodium)
+    if(NOT SODIUM_FOUND)
+        # Fallback: try find_package
+        find_package(Sodium QUIET)
+        if(NOT Sodium_FOUND)
+            message(WARNING "libsodium not found via pkg-config or find_package, some features may not work")
+        endif()
+    endif()
+endif()
 
 # Add source directory
 add_subdirectory(source)
+
+# Add FFI directory for Flutter/Dart bindings
+option(BUILD_FFI "Build FFI shared library for Flutter/Dart" ON)
+if(BUILD_FFI)
+  add_subdirectory(ffi)
+endif()
 
 # Add test directory if testing is enabled
 option(BUILD_TESTS "Build tests" ON)

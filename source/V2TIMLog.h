@@ -6,7 +6,9 @@
 #include <mutex>
 #include <sstream>
 #include <memory>
-#include <cstdio> // For potential future use or compatibility if needed
+#include <cstdio>
+#include <atomic>
+#include <cstdint>
 
 // Define log levels
 enum class LogLevel {
@@ -64,13 +66,12 @@ public:
     // Make log method public so it can be called via the macro
     template<typename... Args>
     void log(LogLevel level, const char* format, Args... args) {
+        if (destroyed_.load()) return;
         if (level < min_level_) return;
 
         std::stringstream ss;
-        ss << "[" << getLevelString(level) << "] ";
-        // Use the recursive template function for formatting
         formatMessage(ss, format, args...);
-        writeLog(ss.str());
+        writeLog(level, ss.str());
     }
 
 private:
@@ -84,8 +85,8 @@ private:
     V2TIMLog(V2TIMLog&&) = delete;
     V2TIMLog& operator=(V2TIMLog&&) = delete;
 
-    // Helper methods
-    void writeLog(const std::string& message);
+    // Helper methods: writeLog produces unified format PID/TID/SeqNo/Time/Level/body
+    void writeLog(LogLevel level, const std::string& body);
     const char* getLevelString(LogLevel level);
 
     // Recursive template function for formatting messages
@@ -113,6 +114,8 @@ private:
     LogLevel min_level_;
     bool console_output_;
     std::mutex mutex_;
+    std::atomic<bool> destroyed_;
+    std::atomic<uint64_t> sequence_;  // SeqNo for unified format (no zero-padding)
 };
 
 // Macros for easy logging
