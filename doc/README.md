@@ -27,5 +27,5 @@
 ## 客户端联动
 
 - [主 README](../README.md)
-- [Flutter Echo Client 文档索引](../../flutter_echo_client/doc/README.md)
-- [Flutter Echo Client 账号与会话](../../flutter_echo_client/doc/ACCOUNT_AND_SESSION.md)
+- [toxee 文档索引](../../toxee/doc/README.md)
+- [toxee 账号与会话](../../toxee/doc/ACCOUNT_AND_SESSION.md)

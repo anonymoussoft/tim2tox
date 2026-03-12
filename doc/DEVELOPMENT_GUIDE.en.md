@@ -351,7 +351,7 @@ Tim2Tox supports the creation of multiple independent Tox instances, each instan
 - Test isolation: use independent persistence paths for each instance
 
 **Production environment**:
-- Production environment applications (such as `flutter_echo_client`) use the default instance
+- Production environment applications (such as `toxee`) use the default instance
 - No need to call test instance management functions
 - Use `TIMManager.instance` or `V2TIMManagerImpl::GetInstance()` directly
 

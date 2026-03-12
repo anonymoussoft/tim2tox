@@ -187,7 +187,7 @@ Tim2Tox supports three access forms:
 - **Platform interface scheme**: only routed through `Tim2ToxSdkPlatform`
 - **Hybrid Architecture**: Preserves both binary replacement and Platform paths
 
-Among them, **Flutter Echo Client currently uses a hybrid architecture**.
+Among them, **toxee currently uses a hybrid architecture**.
 
 ### Solution 1: Pure binary replacement solution
 
@@ -255,7 +255,7 @@ c-toxcore (P2P communication)
 - `tim2tox/dart/lib/service/ffi_chat_service.dart` - Advanced service layer
 - `tim2tox/dart/lib/ffi/tim2tox_ffi.dart` - FFI binding
 
-### Solution 3: Hybrid architecture (currently used by Flutter Echo Client)**Features**:
+### Solution 3: Hybrid architecture (currently used by toxee)**Features**:
 - `main()` executes `setNativeLibraryName('tim2tox_ffi')` first
 - The client registers `Tim2ToxSdkPlatform` in HomePage
 - NativeLibraryManager continues to be responsible for most binary replacement calls

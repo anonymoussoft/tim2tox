@@ -51,6 +51,10 @@ class TUICallKitAdapter {
   OutgoingCallCallback? onOutgoingCallInitiated;
   OutgoingCallPreflight? onBeforeOutgoingCall;
 
+  /// When set, we only call endCall() before startCall() if this returns false (i.e. there is an active call).
+  /// Avoids blocking the UI when native endCall() is invoked with no call in progress (e.g. second call after hangup).
+  bool Function()? isCallIdle;
+
   TUICallKitAdapter._(this._sdkPlatform, this._avService, this._callBridge);
 
   /// Initialize the adapter
@@ -182,11 +186,15 @@ class TUICallKitAdapter {
     }
 
     // End any existing call to this friend before starting a new one
-    // (prevents FRIEND_ALREADY_IN_CALL error when user clicks call button multiple times)
-    try {
-      await _avService.endCall(friendNumber);
-    } catch (_) {
-      // Ignore — no active call to end
+    // (prevents FRIEND_ALREADY_IN_CALL when user double-taps). Skip when app is idle to avoid
+    // blocking the UI: native endCall() with no call in progress can block or take long (error 3).
+    final skipEndCall = isCallIdle != null && isCallIdle!();
+    if (!skipEndCall) {
+      try {
+        await _avService.endCall(friendNumber);
+      } catch (_) {
+        // Ignore — no active call to end
+      }
     }
 
     // Start the call

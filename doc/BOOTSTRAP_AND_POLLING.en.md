@@ -2,13 +2,13 @@
 > Language: [Chinese](BOOTSTRAP_AND_POLLING.md) | [English](BOOTSTRAP_AND_POLLING.en.md)
 
 
-This document describes Tim2Tox’s current Bootstrap node loading, connection establishment, and polling mechanisms, and supplements the Flutter Echo Client’s access methods in startup, settings pages, and LAN Bootstrap scenarios.
+This document describes Tim2Tox’s current Bootstrap node loading, connection establishment, and polling mechanisms, and supplements the toxee’s access methods in startup, settings pages, and LAN Bootstrap scenarios.
 
 ## 1. Scope
 
 This link spans two layers:
 
-- `flutter_echo_client`: Responsible for selecting and saving the current Bootstrap node, determining the startup sequence, and providing the LAN Bootstrap UI.
+- `toxee`: Responsible for selecting and saving the current Bootstrap node, determining the startup sequence, and providing the LAN Bootstrap UI.
 - `tim2tox/dart`: Responsible for applying the saved `host/port/publicKey` to the Tox instance, and driving connection status, messages, files and AV events through `startPolling()`.
 
 It should be noted that there is no separate "LAN Bootstrap mode" branch within Tim2Tox. What the framework really consumes is always just a triple of the current Bootstrap node.
@@ -21,7 +21,7 @@ Three sources currently exist:
 2. Automatically pull from `https://nodes.tox.chat/json`
 3. Local Bootstrap service within LAN
 
-Flutter Echo Client side related code:
+toxee side related code:
 
 - `lib/util/bootstrap_nodes.dart`: Pull nodes from the public node list, and fall back to the hardcoded fallback list on failure.
 - `lib/ui/settings/bootstrap_settings_section.dart`: Manage three modes of `auto` / `manual` / `lan`.
@@ -37,7 +37,7 @@ Related code on Tim2Tox side:
 
 ### Automatic mode
 
-Flutter Echo Client will first check Bootstrap mode in `_StartupGate._decide()`:
+toxee will first check Bootstrap mode in `_StartupGate._decide()`:
 
 - If `lan` is detected on a non-desktop platform, it will be forced to fall back to `auto`.
 - In `auto` mode, if the node has not been saved yet, the public node list will be pulled first and the first online node will be written to `Prefs.setCurrentBootstrapNode(...)`
@@ -50,7 +50,7 @@ After manually entering the node on the settings page, `Prefs.setCurrentBootstra
 
 ### LAN Bootstrap mode
 
-The LAN Bootstrap mode is the configuration layer concept of Flutter Echo Client, not the internal protocol branch of Tim2Tox. In the current implementation:
+The LAN Bootstrap mode is the configuration layer concept of toxee, not the internal protocol branch of Tim2Tox. In the current implementation:
 
 - The desktop can start a local Tox instance as a Bootstrap service through `LanBootstrapServiceManager.startLocalBootstrapService(port)`
 - This service will generate an independent profile, log in as `BootstrapService`, take out `udpPort` and `dhtId`, and then start its own `startPolling()`
@@ -82,7 +82,7 @@ This means that in pages with `service` instances, the "test node" is not a pure
 
 It does not guarantee that networking has been completed at this time. Real connection changes rely on the `conn:success` / `conn:failed` events in the polling queue.
 
-The order when Flutter Echo Client is started is:
+The order when toxee is started is:
 
 1. `_StartupGate` ensures that there are currently available Bootstrap nodes
 2. Initialize `FfiChatService`
@@ -136,7 +136,7 @@ Among them:
 
 This is why the poll interval is pressed to `50ms` during file transfer and a single round of batch drain queue is allowed.
 
-## 8. Maintenance points on the Flutter Echo Client side
+## 8. Maintenance points on the toxee side
 
 ### Switch nodes
 
@@ -167,10 +167,10 @@ It does not replace the `currentBootstrapNode` configuration model.
 
 If you are changing Bootstrap, networking or polling issues, it is recommended to read the code in this order:
 
-1.`flutter_echo_client/lib/main.dart`
-2. `flutter_echo_client/lib/ui/settings/bootstrap_settings_section.dart`
-3. `flutter_echo_client/lib/util/bootstrap_nodes.dart`
-4. `flutter_echo_client/lib/util/lan_bootstrap_service.dart`
+1.`toxee/lib/main.dart`
+2. `toxee/lib/ui/settings/bootstrap_settings_section.dart`
+3. `toxee/lib/util/bootstrap_nodes.dart`
+4. `toxee/lib/util/lan_bootstrap_service.dart`
 5. `tim2tox/dart/lib/interfaces/bootstrap_service.dart`
 6. `tim2tox/dart/lib/service/ffi_chat_service.dart`
 
@@ -178,5 +178,5 @@ If you are changing Bootstrap, networking or polling issues, it is recommended t
 
 - [ARCHITECTURE.md](ARCHITECTURE.en.md)
 - [API_REFERENCE.md](API_REFERENCE.en.md)
-- [../../flutter_echo_client/doc/ACCOUNT_AND_SESSION.md](../../flutter_echo_client/doc/ACCOUNT_AND_SESSION.en.md)
-- [../../flutter_echo_client/doc/IMPLEMENTATION_DETAILS.md](../../flutter_echo_client/doc/IMPLEMENTATION_DETAILS.en.md)
+- [../../toxee/doc/ACCOUNT_AND_SESSION.md](../../toxee/doc/ACCOUNT_AND_SESSION.en.md)
+- [../../toxee/doc/IMPLEMENTATION_DETAILS.md](../../toxee/doc/IMPLEMENTATION_DETAILS.en.md)

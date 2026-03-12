@@ -277,4 +277,4 @@ RejoinKnownGroups: Matched conference_number=<number> to groupID=<group_id>
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) - Tim2Tox 架构（包含群聊实现说明）
 - [API_REFERENCE.md](./API_REFERENCE.md) - API 参考文档
-- [Flutter Echo Client 群聊功能](../../flutter_echo_client/doc/GROUP_CHAT_GUIDE.md) - 客户端群聊功能说明
+- [toxee 群聊功能](../../toxee/doc/GROUP_CHAT_GUIDE.md) - 客户端群聊功能说明

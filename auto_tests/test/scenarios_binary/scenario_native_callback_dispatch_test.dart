@@ -3,7 +3,7 @@
 /// Tests the NativeLibraryManager static listener dispatch path:
 ///   C++ callback → ReceivePort → _handleNativeMessage → _handleGlobalCallback → static listeners
 ///
-/// This covers the binary replacement path that flutter_echo_client uses,
+/// This covers the binary replacement path that toxee uses,
 /// where instance_id is 0 or null (single-instance, no Tim2ToxSdkPlatform routing).
 
 import 'dart:async';

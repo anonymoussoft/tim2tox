@@ -277,4 +277,4 @@ RejoinKnownGroups: Matched conference_number=<number> to groupID=<group_id>
 
 - [ARCHITECTURE.md](./ARCHITECTURE.en.md) - Tim2Tox architecture (including group chat implementation instructions)
 - [API_REFERENCE.md](./API_REFERENCE.en.md) - API reference documentation
-- [Flutter Echo Client group chat function](../../flutter_echo_client/doc/GROUP_CHAT_GUIDE.en.md) - Client group chat function description
+- [toxee group chat function](../../toxee/doc/GROUP_CHAT_GUIDE.en.md) - Client group chat function description

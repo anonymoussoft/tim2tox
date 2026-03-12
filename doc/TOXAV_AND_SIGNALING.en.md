@@ -97,7 +97,7 @@ The last hop from native callback to Dart is completed by trampoline; it reads `
 
 ## 5. Relationship with clients
 
-In Flutter Echo Client:
+In toxee:
 
 - `FakeUIKit.startWithFfi()` Created by `CallServiceManager`
 - `HomePage.initState()` calls `callServiceManager.initialize()` after the Platform setup is complete
@@ -116,4 +116,4 @@ Therefore, the signaling path will be incomplete if the client does not set `Tim
 - [ARCHITECTURE.md](ARCHITECTURE.en.md)
 - [API_REFERENCE.md](API_REFERENCE.en.md)
 - [MULTI_INSTANCE_SUPPORT.md](MULTI_INSTANCE_SUPPORT.en.md)
-- [../../flutter_echo_client/doc/CALLING_AND_EXTENSIONS.md](../../flutter_echo_client/doc/CALLING_AND_EXTENSIONS.en.md)
+- [../../toxee/doc/CALLING_AND_EXTENSIONS.md](../../toxee/doc/CALLING_AND_EXTENSIONS.en.md)

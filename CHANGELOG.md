@@ -18,7 +18,7 @@
 #### Tim2Tox 侧适配
 
 - ✅ **`Tim2ToxSdkPlatform`**: 构造函数注册 `customCallbackHandler`，接管 3 个自定义 callback
-- ✅ **`flutter_echo_client`**: `main()` 中调用 `setNativeLibraryName('tim2tox_ffi')`
+- ✅ **`toxee`**: `main()` 中调用 `setNativeLibraryName('tim2tox_ffi')`
 - ✅ **`auto_tests`**: `setupTestEnvironment()` 自动配置库名
 
 #### Binary Replacement 路径测试覆盖 (Phase 13)
@@ -40,7 +40,7 @@
 | `tim_manager.dart` / `tim_friendship_manager.dart` / `tim_group_manager.dart` / `tim_message_manager.dart` | 修改 | `isTim2ToxPlatform` → `isCustomPlatform` |
 | `v2_tim_message.dart` / `v2_tim_text_elem.dart` | 修改 | 删除调试 print |
 | `tim2tox_sdk_platform.dart` | 修改 | 注册 `customCallbackHandler` |
-| `flutter_echo_client/main.dart` | 修改 | 添加 `setNativeLibraryName('tim2tox_ffi')` |
+| `toxee/main.dart` | 修改 | 添加 `setNativeLibraryName('tim2tox_ffi')` |
 | `test_fixtures.dart` | 修改 | 添加 `setupNativeLibraryForTim2Tox()` |
 | `tim2tox_ffi.cpp` / `tim2tox_ffi.h` | 修改 | 新增 `tim2tox_ffi_inject_callback` |
 | `tim2tox_ffi.dart` | 修改 | 新增 `injectCallback` Dart 绑定 |

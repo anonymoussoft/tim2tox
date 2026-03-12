@@ -8,7 +8,7 @@
 
 二进制替换方案（BINARY REPLACEMENT MODE）是一种通过替换动态库文件来实现后端切换的方案，使得 Dart 层代码完全不需要修改，就能从腾讯云 IM SDK 切换到 Tox P2P 协议。
 
-**当前使用状态**: ✅ **Flutter Echo Client 使用混合模式（Binary Replacement + Platform 接口）**
+**当前使用状态**: ✅ **toxee 使用混合模式（Binary Replacement + Platform 接口）**
 
 **配置方式**:
 - 在 `main()` 最早期调用 `setNativeLibraryName('tim2tox_ffi')` 配置库名
@@ -293,9 +293,9 @@ int DartXXX(const char* json_param, void* user_data) {
 | **自定义 callback** | 通过 `customCallbackHandler` | 直接在 Platform 实现 | `customCallbackHandler` 注册到 Platform |
 | **适用场景** | 快速集成 | 需要高级功能 | 生产环境 |
 
-### 混合模式（Flutter Echo Client 当前使用）
+### 混合模式（toxee 当前使用）
 
-Flutter Echo Client 同时使用二进制替换和 Platform 接口：
+toxee 同时使用二进制替换和 Platform 接口：
 
 1. `setNativeLibraryName('tim2tox_ffi')` — 加载 `libtim2tox_ffi.dylib`
 2. `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(...)` — 启用高级功能
@@ -414,13 +414,13 @@ make tim2tox_ffi
 **macOS**:
 ```bash
 cp tim2tox/build/ffi/libtim2tox_ffi.dylib \
-   flutter_echo_client/build/macos/Build/Products/Debug/flutter_echo_client.app/Contents/MacOS/
+   toxee/build/macos/Build/Products/Debug/toxee.app/Contents/MacOS/
 ```
 
 **Linux**:
 ```bash
 cp tim2tox/build/ffi/libtim2tox_ffi.so \
-   flutter_echo_client/build/linux/x64/debug/bundle/lib/
+   toxee/build/linux/x64/debug/bundle/lib/
 ```
 
 ### 3. 依赖库处理

@@ -26,7 +26,7 @@ Tim2Tox now supports the creation of multiple independent Tox instances, each wi
 
 ### Production environment (default instance)
 
-For production environment applications (such as `flutter_echo_client`), just use the default instance:
+For production environment applications (such as `toxee`), just use the default instance:
 
 ```dart
 // Production environment: use the default instance directly
@@ -321,7 +321,7 @@ flutter test test/scenarios/scenario_multi_instance_test.dart
 
 ### Production environment application
 
-**No modifications required**: Production environment applications (such as `flutter_echo_client`) continue to use the default instance without any code modifications.
+**No modifications required**: Production environment applications (such as `toxee`) continue to use the default instance without any code modifications.
 
 **Call path**:
 ```

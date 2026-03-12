@@ -675,7 +675,7 @@ class Tim2ToxFfi {
     } catch (e) {
       // If that fails, try common Android library paths
       final possiblePaths = [
-        '/data/data/com.example.flutter_echo_client/lib/$libName',
+        '/data/data/com.example.toxee/lib/$libName',
         '/system/lib/$libName',
         '/vendor/lib/$libName',
       ];

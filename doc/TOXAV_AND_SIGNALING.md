@@ -96,7 +96,7 @@ native callback 到 Dart 的最后一跳由 trampoline 完成；它从 `userData
 
 ## 5. 与客户端的关系
 
-Flutter Echo Client 中：
+toxee 中：
 
 - `FakeUIKit.startWithFfi()` 创建 `CallServiceManager`
 - `HomePage.initState()` 在 Platform 设置完成后调用 `callServiceManager.initialize()`
@@ -115,4 +115,4 @@ Flutter Echo Client 中：
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [API_REFERENCE.md](API_REFERENCE.md)
 - [MULTI_INSTANCE_SUPPORT.md](MULTI_INSTANCE_SUPPORT.md)
-- [../../flutter_echo_client/doc/CALLING_AND_EXTENSIONS.md](../../flutter_echo_client/doc/CALLING_AND_EXTENSIONS.md)
+- [../../toxee/doc/CALLING_AND_EXTENSIONS.md](../../toxee/doc/CALLING_AND_EXTENSIONS.md)

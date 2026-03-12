@@ -27,5 +27,5 @@
 ## Client linkage
 
 - [Main README](../README.md)
-- [Flutter Echo Client Documentation Index](../../flutter_echo_client/doc/README.en.md)
-- [Flutter Echo Client Account and Session](../../flutter_echo_client/doc/ACCOUNT_AND_SESSION.en.md)
+- [toxee Documentation Index](../../toxee/doc/README.en.md)
+- [toxee Account and Session](../../toxee/doc/ACCOUNT_AND_SESSION.en.md)

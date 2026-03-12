@@ -8,7 +8,7 @@ This document details how to use the underlying Tox binary implementation to rep
 
 The binary replacement scheme (BINARY REPLACEMENT MODE) is a scheme that realizes backend switching by replacing dynamic library files, so that the Dart layer code can be switched from Tencent Cloud IM SDK to the Tox P2P protocol without any modification at all.
 
-**Current usage status**: ✅ **Flutter Echo Client uses hybrid mode (Binary Replacement + Platform interface)**
+**Current usage status**: ✅ **toxee uses hybrid mode (Binary Replacement + Platform interface)**
 
 **Configuration method**:
 - Call the `setNativeLibraryName('tim2tox_ffi')` configuration library name at the earliest stage of `main()`
@@ -293,9 +293,9 @@ int DartXXX(const char* json_param, void* user_data) {
 | **Custom callback** | By `customCallbackHandler` | Implemented directly on Platform | `customCallbackHandler` registered to Platform |
 | **Applicable scenarios** | Rapid integration | Advanced features required | Production environment |
 
-### Mixed mode (currently used by Flutter Echo Client)
+### Mixed mode (currently used by toxee)
 
-Flutter Echo Client uses both binary replacement and the Platform interface:
+toxee uses both binary replacement and the Platform interface:
 
 1. `setNativeLibraryName('tim2tox_ffi')` — Load `libtim2tox_ffi.dylib`
 2. `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(...)` — Enable advanced features
@@ -412,13 +412,13 @@ make tim2tox_ffi
 **macOS**:
 ```bash
 cp tim2tox/build/ffi/libtim2tox_ffi.dylib \
-   flutter_echo_client/build/macos/Build/Products/Debug/flutter_echo_client.app/Contents/MacOS/
+   toxee/build/macos/Build/Products/Debug/toxee.app/Contents/MacOS/
 ```
 
 **Linux**:
 ```bash
 cp tim2tox/build/ffi/libtim2tox_ffi.so \
-   flutter_echo_client/build/linux/x64/debug/bundle/lib/
+   toxee/build/linux/x64/debug/bundle/lib/
 ```
 
 ### 3. Dependency library processing

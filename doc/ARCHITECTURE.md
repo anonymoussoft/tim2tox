@@ -187,7 +187,7 @@ Tim2Tox 能力上支持三种接入形态：
 - **Platform 接口方案**：只通过 `Tim2ToxSdkPlatform` 路由
 - **混合架构**：同时保留二进制替换和 Platform 路径
 
-其中，**Flutter Echo Client 当前使用的是混合架构**。
+其中，**toxee 当前使用的是混合架构**。
 
 ### 方案一：纯二进制替换方案
 
@@ -255,7 +255,7 @@ c-toxcore (P2P 通信)
 - `tim2tox/dart/lib/service/ffi_chat_service.dart` - 高级服务层
 - `tim2tox/dart/lib/ffi/tim2tox_ffi.dart` - FFI 绑定
 
-### 方案三：混合架构（Flutter Echo Client 当前使用）
+### 方案三：混合架构（toxee 当前使用）
 
 **特点**：
 - `main()` 中先执行 `setNativeLibraryName('tim2tox_ffi')`
