@@ -13,34 +13,13 @@
 #include "ToxUtils.h" // 添加工具函数头文件
 #include "ToxUtil.h"
 
-// Helper function to get ToxManager from current V2TIMManagerImpl instance
-// For multi-instance support, use GetCurrentInstance() if available
-static ToxManager* GetToxManager() {
-    // Try to use GetCurrentInstance() for multi-instance support
-    // This is defined in tim2tox_ffi.cpp and made available via extern
-    extern V2TIMManagerImpl* GetCurrentInstance();
-    V2TIMManagerImpl* manager_impl = GetCurrentInstance();
-    if (!manager_impl) {
-        // Fallback to default instance
-        manager_impl = V2TIMManagerImpl::GetInstance();
-        if (!manager_impl) {
-            return nullptr;
-        }
-    }
-    return manager_impl->GetToxManager();
-}
-
-// (removed unused static helper - tox_address_string_to_bytes is defined in V2TIMUtils.cpp)
-
-// Singleton instance
-V2TIMFriendshipManagerImpl* V2TIMFriendshipManagerImpl::GetInstance() {
-    static V2TIMFriendshipManagerImpl instance;
-    return &instance;
-}
-
-// Constructor
-V2TIMFriendshipManagerImpl::V2TIMFriendshipManagerImpl() {
+// Constructor (R-06: owned by V2TIMManagerImpl, no singleton)
+V2TIMFriendshipManagerImpl::V2TIMFriendshipManagerImpl(V2TIMManagerImpl* owner) : manager_impl_(owner) {
     V2TIM_LOG(kInfo, "V2TIMFriendshipManagerImpl initialized.");
+}
+
+ToxManager* V2TIMFriendshipManagerImpl::GetToxManager() {
+    return manager_impl_ ? manager_impl_->GetToxManager() : nullptr;
 }
 
 // Destructor
@@ -761,17 +740,15 @@ void V2TIMFriendshipManagerImpl::AddFriend(const V2TIMFriendAddApplication& appl
         NotifyFriendListAdded(addedFriends);
 
         // Save Tox profile to disk so the new friend persists
-        extern V2TIMManagerImpl* GetCurrentInstance();
-        V2TIMManagerImpl* manager_impl = GetCurrentInstance();
-        if (!manager_impl) {
-            manager_impl = V2TIMManagerImpl::GetInstance();
-        }
-        if (manager_impl) {
-            manager_impl->SaveToxProfile();
+        if (manager_impl_) {
+            manager_impl_->SaveToxProfile();
         }
 
         // Refresh conversation cache so the new friend's conversation appears
-        V2TIMConversationManagerImpl::GetInstance()->RefreshCache();
+        if (manager_impl_) {
+            V2TIMConversationManager* cm = manager_impl_->GetConversationManager();
+            if (cm) static_cast<V2TIMConversationManagerImpl*>(cm)->RefreshCache();
+        }
     } else {
         // Map Tox error to V2TIM error code/info
         result.resultCode = ERR_SDK_FRIEND_ADD_FAILED; // General error
@@ -917,20 +894,18 @@ void V2TIMFriendshipManagerImpl::DeleteFromFriendList(const V2TIMStringVector& u
         NotifyFriendListDeleted(deletedUserIDs);
 
         // Save Tox profile to disk immediately so the deletion persists
-        extern V2TIMManagerImpl* GetCurrentInstance();
-        V2TIMManagerImpl* manager_impl = GetCurrentInstance();
-        if (!manager_impl) {
-            manager_impl = V2TIMManagerImpl::GetInstance();
-        }
-        if (manager_impl) {
-            manager_impl->SaveToxProfile();
+        if (manager_impl_) {
+            manager_impl_->SaveToxProfile();
         }
 
         // Refresh conversation cache (without NotifyNewConversations) so deleted friends'
         // conversations are removed from cache. We must NOT call RefreshCache() because it
         // calls NotifyNewConversations() which fires OnNewConversation — Dart treats that as
         // "add if not present" and would re-add the just-deleted conversation.
-        V2TIMConversationManagerImpl::GetInstance()->RefreshConversationCacheOnly();
+        if (manager_impl_) {
+            V2TIMConversationManager* cm = manager_impl_->GetConversationManager();
+            if (cm) static_cast<V2TIMConversationManagerImpl*>(cm)->RefreshConversationCacheOnly();
+        }
     } else {
         V2TIM_LOG(kWarning, "DeleteFromFriendList: No friends were successfully deleted");
     }
@@ -1085,12 +1060,7 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
         V2TIM_LOG(kInfo, "[AcceptFriendApplication] Success: Friend added");
 
         // Save Tox profile to disk so the accepted friend persists
-        {
-            extern V2TIMManagerImpl* GetCurrentInstance();
-            V2TIMManagerImpl* mi = GetCurrentInstance();
-            if (!mi) mi = V2TIMManagerImpl::GetInstance();
-            if (mi) mi->SaveToxProfile();
-        }
+        if (manager_impl_) manager_impl_->SaveToxProfile();
 
         // Notify OnFriendListAdded so UI can update
         // Normalize to 64-char public key (see AddFriend for explanation)
@@ -1113,21 +1083,12 @@ void V2TIMFriendshipManagerImpl::AcceptFriendApplication(const V2TIMFriendApplic
         if (refresh_after_accept_thread_.joinable()) {
             refresh_after_accept_thread_.join();
         }
-        refresh_after_accept_thread_ = std::thread([]() {
+        V2TIMManagerImpl* owner = manager_impl_;
+        refresh_after_accept_thread_ = std::thread([owner]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            extern V2TIMManagerImpl* GetCurrentInstance();
-            V2TIMManagerImpl* manager_impl = GetCurrentInstance();
-            if (!manager_impl) {
-                manager_impl = V2TIMManagerImpl::GetInstance();
-            }
-            if (manager_impl) {
-                V2TIMConversationManager* cm = manager_impl->GetConversationManager();
-                if (cm) {
-                    V2TIMConversationManagerImpl* cm_impl = static_cast<V2TIMConversationManagerImpl*>(cm);
-                    if (cm_impl) {
-                        cm_impl->RefreshCache();
-                    }
-                }
+            if (owner) {
+                V2TIMConversationManager* cm = owner->GetConversationManager();
+                if (cm) static_cast<V2TIMConversationManagerImpl*>(cm)->RefreshCache();
             }
         });
     } else {

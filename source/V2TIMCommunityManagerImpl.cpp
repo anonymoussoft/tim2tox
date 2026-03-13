@@ -26,21 +26,15 @@ namespace community {
     constexpr int ERR_COMM_NOT_FOUND = -103;
     constexpr int ERR_COMM_SUCCESS = 0;
     
-    // Helper function to get ToxManager from current V2TIMManagerImpl instance
+    // Helper function to get ToxManager from owner (R-06: no singleton fallback)
     ToxManager* GetToxManager(V2TIMCommunityManagerImpl* self) {
         if (!self) return nullptr;
-        // Use manager_impl_ instead of V2TIMManagerImpl::GetInstance() for multi-instance support
         V2TIMManagerImpl* manager_impl = nullptr;
         {
             std::lock_guard<std::mutex> lock(self->manager_impl_mutex_);
             manager_impl = self->manager_impl_;
         }
-        if (!manager_impl) {
-            // Fallback to default instance for backward compatibility
-            manager_impl = V2TIMManagerImpl::GetInstance();
-        }
-        if (!manager_impl) return nullptr;
-        return manager_impl->GetToxManager();
+        return manager_impl ? manager_impl->GetToxManager() : nullptr;
     }
 
     // Helper function for hex string conversion
@@ -67,9 +61,24 @@ public:
     V2TIMString desc;
 };
 
-V2TIMCommunityManagerImpl& V2TIMCommunityManagerImpl::getInstance() {
-    static V2TIMCommunityManagerImpl instance;
-    return instance;
+// Constructor (R-06: owned by V2TIMManagerImpl, no singleton). Opens per-instance DB.
+V2TIMCommunityManagerImpl::V2TIMCommunityManagerImpl(V2TIMManagerImpl* owner) : db_(nullptr), manager_impl_(owner) {
+    int64_t instance_id = 0;
+    if (owner) {
+        extern int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
+        instance_id = GetInstanceIdFromManager(owner);
+    }
+    std::string db_path = (instance_id == 0) ? "community_data.db" : ("community_data_" + std::to_string(instance_id) + ".db");
+    if (sqlite3_open(db_path.c_str(), &db_) == SQLITE_OK && db_) {
+        sqlite3_exec(db_, "CREATE TABLE IF NOT EXISTS communities (id TEXT PRIMARY KEY, name TEXT, topic_count INTEGER)", nullptr, nullptr, nullptr);
+    }
+}
+
+V2TIMCommunityManagerImpl::~V2TIMCommunityManagerImpl() {
+    if (db_) {
+        sqlite3_close(db_);
+        db_ = nullptr;
+    }
 }
 
 // 社群监听器管理
@@ -272,69 +281,6 @@ void V2TIMCommunityManagerImpl::GetTopicPermissionInPermissionGroup(const V2TIMS
     // TODO: Implement this function
     if (callback) {
         callback->OnSuccess(V2TIMTopicPermissionResultVector());
-    }
-}
-
-// 初始化数据库
-V2TIMCommunityManagerImpl::V2TIMCommunityManagerImpl() : db_(nullptr), manager_impl_(nullptr) {
-    // Database will be opened in SetManagerImpl() when instance_id is available
-    // This ensures each instance uses its own database file
-}
-
-// Multi-instance support: Set the associated V2TIMManagerImpl instance
-void V2TIMCommunityManagerImpl::SetManagerImpl(V2TIMManagerImpl* manager_impl) {
-    V2TIMManagerImpl* old_impl = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
-        old_impl = manager_impl_;
-    }
-    // When instance changes, clear in-memory caches so they are not reused for another instance
-    if (manager_impl != old_impl) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            friend_numbers_.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lock(community_mutex_);
-            communities_.clear();
-            community_info_.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lock(topic_mutex_);
-            topics_.clear();
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(manager_impl_mutex_);
-
-    // Close old database if exists
-    if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
-
-    manager_impl_ = manager_impl;
-
-    // Get instance_id and open per-instance database
-    int64_t instance_id = 0;
-    if (manager_impl) {
-        extern int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
-        instance_id = GetInstanceIdFromManager(manager_impl);
-    }
-
-    std::string db_path;
-    if (instance_id == 0) {
-        db_path = "community_data.db"; // Default instance
-    } else {
-        db_path = "community_data_" + std::to_string(instance_id) + ".db";
-    }
-
-    sqlite3_open(db_path.c_str(), &db_);
-    if (db_) {
-        sqlite3_exec(db_,
-            "CREATE TABLE IF NOT EXISTS communities ("
-            "id TEXT PRIMARY KEY, name TEXT, topic_count INTEGER)",
-            nullptr, nullptr, nullptr);
     }
 }
 

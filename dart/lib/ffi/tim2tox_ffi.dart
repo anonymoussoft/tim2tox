@@ -13,6 +13,9 @@ typedef _init_with_path_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
 typedef _set_file_recv_dir_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
 typedef _set_log_file_c = ffi.Void Function(ffi.Pointer<pkgffi.Utf8>);
 typedef _login_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
+// R-08: Async login callback (success, error_code, error_message, user_data); error_message valid only during callback.
+typedef _login_callback_native = ffi.Void Function(ffi.Int32 success, ffi.Int32 error_code, ffi.Pointer<pkgffi.Utf8> error_message, ffi.Pointer<ffi.Void> user_data);
+typedef _login_async_c = ffi.Int32 Function(ffi.Int64 instance_id, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.NativeFunction<_login_callback_native>>, ffi.Pointer<ffi.Void>);
 typedef _add_friend_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 typedef _send_text_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 typedef _poll_text_c = ffi.Int32 Function(ffi.Int64, ffi.Pointer<ffi.Int8>, ffi.Int32);
@@ -290,6 +293,8 @@ class Tim2ToxFfi {
   late final void Function(ffi.Pointer<pkgffi.Utf8>) setLogFileNative = _lib.lookupFunction<_set_log_file_c, void Function(ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_set_log_file');
   late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>) login =
       _lib.lookupFunction<_login_c, int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_login');
+  late final int Function(int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.NativeFunction<_login_callback_native>>, ffi.Pointer<ffi.Void>) loginAsync =
+      _lib.lookupFunction<_login_async_c, int Function(int, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<ffi.NativeFunction<_login_callback_native>>, ffi.Pointer<ffi.Void>)>('tim2tox_ffi_login_async');
   late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>) addFriend =
       _lib.lookupFunction<_add_friend_c, int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_add_friend');
   late final int Function(ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>) sendText =

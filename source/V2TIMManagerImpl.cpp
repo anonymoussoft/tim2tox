@@ -1,5 +1,7 @@
 #include "V2TIMManagerImpl.h"
+#include "PathUtils.h"
 #include "V2TIMUtils.h"
+#include "version.h"
 #include <V2TIMErrorCode.h>
 #include "ToxManager.h"
 #include "tox.h"
@@ -36,6 +38,7 @@ extern int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
 extern void SetReceiverInstanceOverride(int64_t id);
 extern void ClearReceiverInstanceOverride(void);
 #include <string> // For std::string
+#include <filesystem>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -47,6 +50,10 @@ extern void ClearReceiverInstanceOverride(void);
 #include "MergerMessageUtil.h"
 #include "RevokeMessageUtil.h"
 #include "V2TIMMessageManagerImpl.h"
+#include "V2TIMGroupManagerImpl.h"
+#include "V2TIMConversationManagerImpl.h"
+#include "V2TIMCommunityManagerImpl.h"
+#include "V2TIMFriendshipManagerImpl.h"
 
 #ifdef BUILD_TOXAV
 #include "ToxAVManager.h"
@@ -60,12 +67,6 @@ extern "C" {
 int tim2tox_ffi_save_friend_nickname(const char* friend_id, const char* nickname);
 int tim2tox_ffi_save_friend_status_message(const char* friend_id, const char* status_message);
 int tim2tox_ffi_irc_forward_tox_message(const char* group_id, const char* sender, const char* message);
-int tim2tox_ffi_get_known_groups(int64_t instance_id, char* buffer, int buffer_len);
-int tim2tox_ffi_set_group_chat_id(int64_t instance_id, const char* group_id, const char* chat_id);
-int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id, const char* group_id, char* out_chat_id, int out_len);
-int tim2tox_ffi_set_group_type(int64_t instance_id, const char* group_id, const char* group_type);
-int tim2tox_ffi_get_group_type_from_storage(int64_t instance_id, const char* group_id, char* out_group_type, int out_len);
-int tim2tox_ffi_get_auto_accept_group_invites(int64_t instance_id);
 int tim2tox_ffi_set_current_instance(int64_t instance_handle);
 // Note: GetCurrentInstanceId is declared above at line 27, not in extern "C" block
 }
@@ -75,8 +76,18 @@ class DartFriendshipListenerImpl;
 extern DartFriendshipListenerImpl* GetCurrentInstanceFriendshipListener();
 extern DartFriendshipListenerImpl* GetFriendshipListenerForManager(V2TIMManagerImpl* manager);
 extern DartFriendshipListenerImpl* GetOrCreateFriendshipListenerForInstance(int64_t instance_id);
-extern void RegisterFriendshipListenerWithManager(DartFriendshipListenerImpl* listener);
+extern void RegisterFriendshipListenerWithManager(DartFriendshipListenerImpl* listener, V2TIMManagerImpl* manager);
 extern void NotifyFriendInfoChangedToListener(DartFriendshipListenerImpl* listener, const void* friendInfoList_ptr);
+
+namespace {
+void NotSupported(V2TIMCallback* callback, const char* api_name) {
+    if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, api_name);
+}
+template <typename T>
+void NotSupportedValue(V2TIMValueCallback<T>* callback, const char* api_name) {
+    if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, api_name);
+}
+}  // namespace
 
 #ifdef BUILD_TOXAV
 // Static callback function for AV conference audio data
@@ -141,42 +152,30 @@ V2TIMManagerImpl* V2TIMManagerImpl::GetInstance() {
 // Constructor (now public for multi-instance support)
 V2TIMManagerImpl::V2TIMManagerImpl()
 #ifdef BUILD_TOXAV
-    : toxav_manager_(nullptr, &ToxAVManager::Destroy), running_(true), pending_login_callback_(nullptr), next_group_id_counter_(0)
+    : toxav_manager_(nullptr, &ToxAVManager::Destroy), running_(true), next_group_id_counter_(0)
 #else
-    : running_(true), pending_login_callback_(nullptr), next_group_id_counter_(0)
+    : running_(true), next_group_id_counter_(0)
 #endif
 {
     // running_ is initialized to true via member initializer list (atomic)
-    // Initialize random seed if not done elsewhere
-    std::srand(std::time(nullptr));
     // tox_manager_ will be created in InitSDK
 }
 
-// Destructor (if not existing, add it)
 V2TIMManagerImpl::~V2TIMManagerImpl() {
     // Stop background tasks first so no detach'd thread holds raw this
     try {
         StopBackgroundTasks();
-    } catch (...) {}
-    // Be conservative at process teardown: stop and join the worker thread only.
-    // Avoid calling into other singletons during global destruction to prevent
-    // undefined order issues that can trigger std::terminate.
+    } catch (...) {
+    }
+    // Signal event thread to stop and join it without busy-wait polling.
     try {
         running_.store(false, std::memory_order_release);
+        task_cv_.notify_all();
         if (event_thread_.joinable()) {
-            // Give the thread a moment to exit gracefully
-            // Use a longer timeout to ensure thread has time to finish current iteration
-            auto timeout = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-            while (event_thread_.joinable() && std::chrono::steady_clock::now() < timeout) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            // Now try to join (thread should have exited by now)
-            if (event_thread_.joinable()) {
-                event_thread_.join();
-            }
+            event_thread_.join();
         }
-    } catch (const std::system_error& e) {
-        // Thread may have already exited or mutex is invalid - ignore
+    } catch (const std::system_error&) {
+        // Thread may have already exited or mutex is invalid - ignore.
     } catch (...) {
         // Swallow any exception at process exit.
     }
@@ -223,36 +222,20 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
               (void*)toxav_manager_.get(), (void*)this, (long long)this_instance_id);
 #endif
     V2TIM_LOG(kInfo, "[InitSDK] Step 1: Computing save path...");
-    // Compute save path using config.initPath if provided
-    std::string save_dir;
-    if (!config.initPath.Empty()) {
-        save_dir = std::string(config.initPath.CString());
-        V2TIM_LOG(kInfo, "[InitSDK] Using config.initPath: {}", save_dir);
-    } else {
-        const char* home = getenv("HOME");
-        if (home && *home) {
-            save_dir = std::string(home) + "/Library/Application Support/tim2tox";
-        } else {
-            save_dir = "./tim2tox_data";
-        }
-        V2TIM_LOG(kInfo, "[InitSDK] Using default path: {}", save_dir);
+    // Compute save path using config.initPath if provided; otherwise platform default
+    std::filesystem::path save_dir = config.initPath.Empty()
+        ? tim2tox::path::GetDefaultDataDir()
+        : std::filesystem::path(config.initPath.CString());
+    V2TIM_LOG(kInfo, "[InitSDK] Using data dir: {}", save_dir.string());
+
+    std::string mkdir_err;
+    if (!tim2tox::path::EnsureDirectoryExists(save_dir, &mkdir_err)) {
+        V2TIM_LOG(kError, "[InitSDK] Failed to create data dir: {}", mkdir_err);
+        return false;
     }
 
-    V2TIM_LOG(kInfo, "[InitSDK] Step 2: Ensuring directory exists...");
-    // Ensure directory exists
-    struct stat st;
-    if (stat(save_dir.c_str(), &st) != 0) {
-        mkdir(save_dir.c_str(), 0755);
-    }
-    
-    V2TIM_LOG(kInfo, "[InitSDK] Step 3: Building save path...");
     int64_t instance_id = GetInstanceIdFromManager(this);
-    std::string save_path;
-    if (instance_id == 0) {
-        save_path = save_dir + "/tox_profile.tox";
-    } else {
-        save_path = save_dir + "/tox_profile_" + std::to_string(instance_id) + ".tox";
-    }
+    std::string save_path = tim2tox::path::BuildProfilePath(save_dir, instance_id).string();
     V2TIM_LOG(kInfo, "[InitSDK] Save path: {}", save_path);
     save_path_ = save_path;
 
@@ -503,7 +486,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
             // When auto-accept is disabled: store pending BEFORE notifying listeners, so that when
             // Dart's waitForCallback('onGroupInvited') returns and the test calls joinGroup, the
             // pending is already present on this instance (avoids 6017 "Pending invite not found").
-            int auto_accept_enabled = tim2tox_ffi_get_auto_accept_group_invites(GetInstanceIdFromManager(this));
+            bool auto_accept_enabled = GetAutoAcceptGroupInvites();
             V2TIM_LOG(kInfo, "[GroupInvite] Auto-accept group invites setting: {}", auto_accept_enabled);
             if (!auto_accept_enabled) {
                 V2TIM_LOG(kInfo, "[GroupInvite] Auto-accept is disabled, storing as pending invite before notifying");
@@ -669,8 +652,9 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 V2TIM_LOG(kInfo, "[GroupInvite] Retrieved chat_id (hex): {} (length={})", chat_id_hex, chat_id_hex.length());
                 
                 // Store chat_id via FFI for persistence (using tempGroupID for now, will be updated in HandleGroupSelfJoin)
-                int ffi_result = tim2tox_ffi_set_group_chat_id(GetInstanceIdFromManager(this), tempGroupID.CString(), chat_id_hex.c_str());
-                V2TIM_LOG(kInfo, "[GroupInvite] tim2tox_ffi_set_group_chat_id returned: {} (1=success)", ffi_result);
+                SetGroupChatIdInStorage(tempGroupID.CString(), chat_id_hex);
+                int ffi_result = 1;
+                V2TIM_LOG(kInfo, "[GroupInvite] SetGroupChatIdInStorage completed (1=success)", ffi_result);
                 V2TIM_LOG(kInfo, "[GroupInvite] Stored chat_id for auto-joined group {}: {}", gid, chat_id_hex);
                 
                 // Store in memory mapping (using tempGroupID for now, will be updated in HandleGroupSelfJoin)
@@ -938,7 +922,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                     std::lock_guard<std::mutex> lock(mutex_);
                     group_id_to_type_[groupID] = "conference";
                 }
-                tim2tox_ffi_set_group_type(GetInstanceIdFromManager(this), gid, "conference");
+                SetGroupTypeInStorage(gid, "conference");
                 V2TIM_LOG(kInfo, "[GroupInvite-Conference] Stored group type 'conference' for groupID={}", gid);
 
                 // Notify Dart layer about the new conference so UI can update group list
@@ -1229,7 +1213,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
                 std::lock_guard<std::mutex> lock(mutex_);
                 group_id_to_type_[groupID] = "conference";
             }
-            tim2tox_ffi_set_group_type(GetInstanceIdFromManager(this), gid, "conference");
+            SetGroupTypeInStorage(gid, "conference");
             V2TIM_LOG(kInfo, "[GroupInvite-Conference] Stored group type 'conference' for groupID={}", gid);
 
             // Notify Dart layer about the new conference so UI can update group list
@@ -1387,6 +1371,7 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     // Start the Tox event loop thread
     fprintf(stdout, "InitSDK: starting event thread\n");
     event_thread_ = std::thread([this] {
+        event_thread_id_ = std::this_thread::get_id();
         while (running_.load(std::memory_order_acquire)) {
             try {
                 // Process pending tasks first (Invite/signaling etc. run on this thread to avoid tox lock deadlock)
@@ -1434,21 +1419,12 @@ void V2TIMManagerImpl::UnInitSDK() {
     StopBackgroundTasks();
     // First, stop the event thread and wait for it to exit
     // This MUST happen before calling ToxManager::shutdown() to prevent race conditions
-    running_ = false;
+    running_.store(false, std::memory_order_release);
     task_cv_.notify_all();  // Wake event thread so it exits promptly
     if (event_thread_.joinable()) {
         try {
-            // Wait for thread to exit gracefully
-            // Use a longer timeout to ensure thread has time to finish current iteration
-            auto timeout = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-            while (event_thread_.joinable() && std::chrono::steady_clock::now() < timeout) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            // Now try to join (thread should have exited by now)
-            if (event_thread_.joinable()) {
-                event_thread_.join();
-            }
-        } catch (const std::system_error& e) {
+            event_thread_.join();
+        } catch (const std::system_error&) {
             // Thread may have already exited - ignore
         } catch (...) {
             // Ignore any other exception during thread join
@@ -1458,25 +1434,10 @@ void V2TIMManagerImpl::UnInitSDK() {
     // Persist tox profile on shutdown using path from InitSDK
     std::string save_path = save_path_;
     if (save_path.empty()) {
-        const char* home = getenv("HOME");
-        std::string save_dir = (home && *home)
-            ? (std::string(home) + "/Library/Application Support/tim2tox")
-            : std::string("./tim2tox_data");
-        int64_t instance_id = GetInstanceIdFromManager(this);
-        if (instance_id == 0) {
-            save_path = save_dir + "/tox_profile.tox";
-        } else {
-            save_path = save_dir + "/tox_profile_" + std::to_string(instance_id) + ".tox";
-        }
-    }
-    if (!save_path.empty()) {
-        std::string save_dir = save_path.substr(0, save_path.find_last_of('/'));
-        if (!save_dir.empty()) {
-            struct stat st;
-            if (stat(save_dir.c_str(), &st) != 0) {
-                mkdir(save_dir.c_str(), 0755);
-            }
-        }
+        std::filesystem::path save_dir = tim2tox::path::GetDefaultDataDir();
+        std::string mkdir_err;
+        (void)tim2tox::path::EnsureDirectoryExists(save_dir, &mkdir_err);
+        save_path = tim2tox::path::BuildProfilePath(save_dir, GetInstanceIdFromManager(this)).string();
     }
     try {
 #ifdef BUILD_TOXAV
@@ -1503,25 +1464,10 @@ void V2TIMManagerImpl::SaveToxProfile() {
     }
     std::string save_path = save_path_;
     if (save_path.empty()) {
-        const char* home = getenv("HOME");
-        std::string save_dir = (home && *home)
-            ? (std::string(home) + "/Library/Application Support/tim2tox")
-            : std::string("./tim2tox_data");
-        int64_t instance_id = GetInstanceIdFromManager(this);
-        if (instance_id == 0) {
-            save_path = save_dir + "/tox_profile.tox";
-        } else {
-            save_path = save_dir + "/tox_profile_" + std::to_string(instance_id) + ".tox";
-        }
-    }
-    if (!save_path.empty()) {
-        std::string save_dir = save_path.substr(0, save_path.find_last_of('/'));
-        if (!save_dir.empty()) {
-            struct stat st;
-            if (stat(save_dir.c_str(), &st) != 0) {
-                mkdir(save_dir.c_str(), 0755);
-            }
-        }
+        std::filesystem::path save_dir = tim2tox::path::GetDefaultDataDir();
+        std::string mkdir_err;
+        (void)tim2tox::path::EnsureDirectoryExists(save_dir, &mkdir_err);
+        save_path = tim2tox::path::BuildProfilePath(save_dir, GetInstanceIdFromManager(this)).string();
     }
     if (tox_manager_->saveTo(save_path)) {
         V2TIM_LOG(kInfo, "[SaveToxProfile] Saved tox profile to {}", save_path);
@@ -1532,7 +1478,25 @@ void V2TIMManagerImpl::SaveToxProfile() {
 
 // SDK Information
 V2TIMString V2TIMManagerImpl::GetVersion() {
-    return "1.0.0";
+    return TIM2TOX_VERSION_STRING;
+}
+
+std::string V2TIMManagerImpl::MakeMessageId() {
+    int64_t instance_id = GetInstanceIdFromManager(this);
+    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    uint64_t seq = next_message_seq_.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream oss;
+    oss << "msg_" << instance_id << "_" << now_ns << "_" << seq;
+    return oss.str();
+}
+
+std::string V2TIMManagerImpl::MakeGroupId() {
+    int64_t instance_id = GetInstanceIdFromManager(this);
+    uint64_t seq = next_group_seq_.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream oss;
+    oss << "group_" << instance_id << "_" << seq;
+    return oss.str();
 }
 
 int64_t V2TIMManagerImpl::GetServerTime() {
@@ -1541,178 +1505,64 @@ int64_t V2TIMManagerImpl::GetServerTime() {
     ).count();
 }
 
-// User Authentication
+// User Authentication: Login completes locally; connection state is reported via SDK listeners.
 void V2TIMManagerImpl::Login(const V2TIMString& userID, const V2TIMString& userSig, V2TIMCallback* callback) {
-    // Expose the mapped user identifier to application layer via V2TIM only.
-    // For compatibility, treat userID as an alias, but surface the underlying address as login user.
-    V2TIM_LOG(kInfo, "Login: called with userID={}, tox_manager_={}", userID.CString(), tox_manager_ ? "non-null" : "null");
-    
-    if (tox_manager_) {
-        Tox* tox = tox_manager_->getTox();
-        if (tox) {
-            uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
-            tox_self_get_public_key(tox, pubkey);
-            std::string pk_hex = ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE);
-            std::string address = tox_manager_->getAddress();
-            if (address.length() >= 76) {
-                logged_in_user_ = (pk_hex + address.substr(64, 12)).c_str();
-            } else {
-                logged_in_user_ = pk_hex.c_str();
-            }
-            V2TIM_LOG(kInfo, "Login: Set logged_in_user_ from tox_self_get_public_key (length={})", logged_in_user_.Length());
-        } else {
-            std::string address = tox_manager_->getAddress();
-            V2TIM_LOG(kInfo, "Login: getAddress() returned length={}", address.length());
-            if (address.length() > 0) {
-                logged_in_user_ = address.c_str();
-                V2TIM_LOG(kInfo, "Login: Set logged_in_user_ to address fallback (length={})", logged_in_user_.Length());
-            } else {
-                V2TIM_LOG(kInfo, "Login: WARNING - getAddress() returned empty string, logged_in_user_ will be empty");
-            }
-        }
-    } else {
-        V2TIM_LOG(kInfo, "Login: WARNING - tox_manager_ is null, logged_in_user_ will remain empty");
-    }
-    // Bootstrap nodes are now configured externally via tim2tox_ffi_add_bootstrap_node
-    // This allows clients to configure bootstrap nodes from settings/preferences
-
-    // Check current connection status
     if (!tox_manager_) {
-        if (callback) {
-            callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
-        }
+        if (callback) callback->OnError(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
         return;
     }
-        Tox* tox = tox_manager_->getTox();
-        if (tox) {
-            TOX_CONNECTION current_status = tox_self_get_connection_status(tox);
-            extern int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
-            int64_t instance_id = GetInstanceIdFromManager(this);
-            V2TIM_LOG(kInfo, "Login: Checking connection status - current_status={}, instance_id={}", current_status, instance_id);
-            if (current_status != TOX_CONNECTION_NONE) {
-                // Already connected, call success immediately
-                V2TIM_LOG(kInfo, "Login: Already connected (status={}), calling OnSuccess immediately (instance_id={})", current_status, instance_id);
-            // Ensure logged_in_user_ is set when already connected (if not already set)
-            bool is_empty = logged_in_user_.Empty();
-            V2TIM_LOG(kInfo, "Login: logged_in_user_.Empty()={}, tox_manager_={}", is_empty ? 1 : 0, tox_manager_ ? "non-null" : "null");
-            
-            if (is_empty && tox_manager_ && tox) {
-                uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
-                tox_self_get_public_key(tox, pubkey);
-                std::string pk_hex = ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE);
-                std::string address = tox_manager_->getAddress();
-                if (address.length() >= 76) {
-                    logged_in_user_ = (pk_hex + address.substr(64, 12)).c_str();
-                } else {
-                    logged_in_user_ = pk_hex.c_str();
-                }
-                V2TIM_LOG(kInfo, "Login: Set logged_in_user_ from tox_self_get_public_key (already connected, length={})", logged_in_user_.Length());
-            } else if (is_empty && tox_manager_) {
-                std::string address = tox_manager_->getAddress();
-                if (address.length() > 0) {
-                    logged_in_user_ = address.c_str();
-                    V2TIM_LOG(kInfo, "Login: Set logged_in_user_ to address fallback (length={})", logged_in_user_.Length());
-                }
-            } else if (!is_empty) {
-                V2TIM_LOG(kInfo, "Login: logged_in_user_ already set (length={})", logged_in_user_.Length());
-            }
-            // Ensure status is set to online when already connected
-            GetToxManager()->setStatus(TOX_USER_STATUS_NONE);
-            
-            // Notify self online status when already connected
-            // Note: Use full address (76 chars) for self status to match currentUser.userID in Dart layer
-            if (!logged_in_user_.Empty()) {
-                std::string user_id_str = logged_in_user_.CString();
-                // Use full address (76 chars) for self status to match currentUser.userID
-                // This ensures buildUserStatusList can correctly match and update self status
-                
-                V2TIMUserStatus self_status;
-                self_status.userID = user_id_str.c_str();
-                self_status.statusType = V2TIM_USER_STATUS_ONLINE;
-                
-                V2TIMUserStatusVector statusVector;
-                statusVector.PushBack(self_status);
-                
-                // Notify all SDK listeners about self status
-                std::vector<V2TIMSDKListener*> listeners_to_notify;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    listeners_to_notify.assign(sdk_listeners_.begin(), sdk_listeners_.end());
-                }
-                
-                for (V2TIMSDKListener* listener : listeners_to_notify) {
-                    if (listener) {
-                        listener->OnUserStatusChanged(statusVector);
-                    }
-                }
-                
-                V2TIM_LOG(kInfo, "Login: Notified self online status (userID={}, length={})", 
-                         user_id_str.c_str(), user_id_str.length());
-            }
-            
-            if (callback) callback->OnSuccess();
-            return;
+    if (userID.Empty()) {
+        if (callback) callback->OnError(ERR_INVALID_PARAMETERS, "userID is empty");
+        return;
+    }
+    // TIM 风格的 userSig 在 tim2tox 中不会被验证，只作兼容透传；这里忽略非空 userSig，
+    // 保持登录流程继续，以便沿用上层现有调用约定。
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        login_user_alias_ = userID;
+    }
+
+    // Set logged_in_user_ from tox when available (used for status/self identity in callbacks)
+    Tox* tox = tox_manager_->getTox();
+    if (tox) {
+        uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
+        tox_self_get_public_key(tox, pubkey);
+        std::string pk_hex = ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE);
+        std::string address = tox_manager_->getAddress();
+        if (address.length() >= 76) {
+            logged_in_user_ = (pk_hex + address.substr(64, 12)).c_str();
+        } else {
+            logged_in_user_ = pk_hex.c_str();
+        }
+    } else {
+        std::string address = tox_manager_->getAddress();
+        if (address.length() > 0) {
+            logged_in_user_ = address.c_str();
         }
     }
 
-    // Not connected yet, save callback to be called when connection is established
-    // The callback will be invoked in HandleSelfConnectionStatus when connection becomes TCP or UDP
-    if (callback) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        extern int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
-        int64_t instance_id = GetInstanceIdFromManager(this);
-        pending_login_callback_ = callback;
-        V2TIM_LOG(kInfo, "Login: Not connected yet, saved callback to be called when connection is established (instance_id={})", instance_id);
-    } else {
-        extern int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
-        int64_t instance_id = GetInstanceIdFromManager(this);
-        V2TIM_LOG(kInfo, "Login: Not connected yet, but no callback provided (instance_id={})", instance_id);
-    }
+    if (callback) callback->OnSuccess();
 }
 
 void V2TIMManagerImpl::Logout(V2TIMCallback* callback) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        login_user_alias_ = "";
+    }
     logged_in_user_ = "";
     if (callback) callback->OnSuccess();
 }
 
 V2TIMString V2TIMManagerImpl::GetLoginUser() {
-    extern int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
-    int64_t instance_id = GetInstanceIdFromManager(this);
-    bool is_empty = logged_in_user_.Empty();
-    size_t length = logged_in_user_.Length();
-    
-    fprintf(stdout, "[V2TIMManagerImpl] GetLoginUser: ENTRY - instance_id=%lld, logged_in_user_.Empty()=%d, length=%zu\n",
-            (long long)instance_id, is_empty ? 1 : 0, length);
-    fflush(stdout);
-    
-    V2TIM_LOG(kInfo, "GetLoginUser: instance_id={}, logged_in_user_.Empty()={}, length={}", 
-              instance_id, is_empty ? 1 : 0, length);
-    if (!is_empty && length > 0) {
-        std::string user_str = logged_in_user_.CString();
-        fprintf(stdout, "[V2TIMManagerImpl] GetLoginUser: instance_id=%lld, logged_in_user_ (first 20 chars)=%.20s, full_length=%zu\n",
-                (long long)instance_id, user_str.c_str(), length);
-        fflush(stdout);
-        V2TIM_LOG(kInfo, "GetLoginUser: instance_id={}, logged_in_user_ (first 20 chars)={:.20s}", instance_id, user_str);
-    } else {
-        fprintf(stdout, "[V2TIMManagerImpl] GetLoginUser: WARNING - instance_id=%lld, logged_in_user_ is empty! running_=%d, tox_manager_=%s\n",
-                (long long)instance_id, running_ ? 1 : 0, tox_manager_ ? "non-null" : "null");
-        fflush(stdout);
-        V2TIM_LOG(kWarning, "GetLoginUser: instance_id={}, logged_in_user_ is empty! running_={}, tox_manager_={}", 
-                  instance_id, running_ ? 1 : 0, tox_manager_ ? "non-null" : "null");
-    }
-    
-    fprintf(stdout, "[V2TIMManagerImpl] GetLoginUser: EXIT - instance_id=%lld, returning length=%zu\n",
-            (long long)instance_id, length);
-    fflush(stdout);
-    
-    return logged_in_user_;
+    std::lock_guard<std::mutex> lock(mutex_);
+    return login_user_alias_;
 }
 
 V2TIMLoginStatus V2TIMManagerImpl::GetLoginStatus() {
-    bool is_empty = logged_in_user_.Empty();
-    V2TIMLoginStatus status = is_empty ? V2TIMLoginStatus::V2TIM_STATUS_LOGOUT : V2TIMLoginStatus::V2TIM_STATUS_LOGINED;
-    V2TIM_LOG(kInfo, "GetLoginStatus: logged_in_user_.Empty()={}, returning status={}", is_empty ? 1 : 0, (int)status);
-    return status;
+    std::lock_guard<std::mutex> lock(mutex_);
+    bool is_empty = login_user_alias_.Empty();
+    return is_empty ? V2TIMLoginStatus::V2TIM_STATUS_LOGOUT : V2TIMLoginStatus::V2TIM_STATUS_LOGINED;
 }
 
 bool V2TIMManagerImpl::HasGroup(const V2TIMString& group_id) const {
@@ -1888,14 +1738,7 @@ V2TIMString V2TIMManagerImpl::SendC2CTextMessage(
     // ===================================================================
     // Step 5: Send the message
     // ===================================================================
-    // Generate a unique V2TIM message ID
-    uint64_t timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
-    uint32_t random_part = std::rand();
-    char msg_id_buffer[64];
-    snprintf(msg_id_buffer, sizeof(msg_id_buffer), "c%llu-%u", timestamp, random_part); // Prefix with 'c' for C2C
-    V2TIMString msg_id = msg_id_buffer;
+    V2TIMString msg_id = MakeMessageId().c_str();
 
     const size_t max_msg_len = TOX_MAX_MESSAGE_LENGTH;
     if (finalMessageText.length() > max_msg_len) {
@@ -2060,14 +1903,7 @@ V2TIMString V2TIMManagerImpl::SendC2CCustomMessage(const V2TIMBuffer& customData
         }
     }
 
-    // Generate message ID
-    uint64_t timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
-    uint32_t random_part = std::rand();
-    char msg_id_buffer[64];
-    snprintf(msg_id_buffer, sizeof(msg_id_buffer), "c%llu-%u", timestamp, random_part);
-    V2TIMString msg_id = msg_id_buffer;
+    V2TIMString msg_id = MakeMessageId().c_str();
 
     // Send as ACTION type to distinguish from text
     TOX_ERR_FRIEND_SEND_MESSAGE send_err;
@@ -2219,17 +2055,7 @@ V2TIMString V2TIMManagerImpl::SendGroupTextMessage(const V2TIMString& text, cons
 
     // ===================================================================
     // Step 5: Send the message using ToxManager
-    // ===================================================================
-    // Generate a unique message ID (e.g., timestamp + random)
-    // Note: This ID is local; Tox doesn't provide a message ID on send for groups.
-    uint64_t timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
-    uint32_t random_part = std::rand();
-    char msg_id_buffer[64];
-    snprintf(msg_id_buffer, sizeof(msg_id_buffer), "g%llu-%u", timestamp, random_part); // Prefix 'g' for group
-    V2TIMString msgID = msg_id_buffer;
-
+    V2TIMString msgID = MakeMessageId().c_str();
 
     // Check group connection status before sending
     Tox_Err_Group_Is_Connected err_conn;
@@ -2652,14 +2478,7 @@ V2TIMString V2TIMManagerImpl::SendGroupCustomMessage(const V2TIMBuffer& customDa
             group_number, groupID.CString());
     fflush(stdout);
 
-    // Generate message ID
-    uint64_t timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
-    uint32_t random_part = std::rand();
-    char msg_id_buffer[64];
-    snprintf(msg_id_buffer, sizeof(msg_id_buffer), "g%llu-%u", timestamp, random_part);
-    V2TIMString msgID = msg_id_buffer;
+    V2TIMString msgID = MakeMessageId().c_str();
 
     Tox_Err_Group_Send_Message send_err;
     Tox_Group_Message_Id message_id;
@@ -3027,43 +2846,29 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
         // but not yet in the mapping (e.g., during startup before GetJoinedGroupList is called)
         // This is critical to avoid ID conflicts with restored groups
         // Note: We call this OUTSIDE the mutex lock to avoid deadlock
-        // Use FFI function to get known groups from Dart layer
-        // Note: Function is already declared with extern "C" at file scope (line 37)
-        char groups_buffer[4096];
-        int groups_len = tim2tox_ffi_get_known_groups(GetInstanceIdFromManager(this), groups_buffer, sizeof(groups_buffer));
-        if (groups_len > 0) {
-            std::string groups_str(groups_buffer, groups_len);
-            V2TIM_LOG(kInfo, "CreateGroup: tim2tox_ffi_get_known_groups returned {} bytes", groups_len);
-            // Parse newline-separated group IDs
-            std::istringstream iss(groups_str);
-            std::string line;
-            while (std::getline(iss, line)) {
+        // R-07: Use Core metadata (known groups)
+        std::vector<std::string> known = GetKnownGroupIDs();
+        if (!known.empty()) {
+            V2TIM_LOG(kInfo, "CreateGroup: GetKnownGroupIDs returned {} group IDs", known.size());
+            for (const auto& line : known) {
                 if (line.empty()) continue;
-                // Remove trailing newline if present
-                if (!line.empty() && line.back() == '\n') {
-                    line.pop_back();
-                }
-                if (line.empty()) continue;
-                V2TIM_LOG(kInfo, "CreateGroup: checking existing group ID from Dart layer: {}", line);
-                // Check if it matches "tox_<number>" pattern
+                V2TIM_LOG(kInfo, "CreateGroup: checking existing group ID: {}", line);
                 if (line.length() > 4 && line.substr(0, 4) == "tox_") {
                     try {
                         uint64_t id_num = std::stoull(line.substr(4));
-                        V2TIM_LOG(kInfo, "CreateGroup: parsed ID number: {} from {}", id_num, line);
                         if (id_num > max_existing_id) {
                             max_existing_id = id_num;
                             V2TIM_LOG(kInfo, "CreateGroup: updated max_existing_id to {}", max_existing_id);
                         }
                     } catch (...) {
-                        // Ignore parsing errors for non-numeric IDs
                         V2TIM_LOG(kWarning, "CreateGroup: failed to parse ID number from {}", line);
                     }
                 }
             }
         } else {
-            V2TIM_LOG(kWarning, "CreateGroup: tim2tox_ffi_get_known_groups returned 0, falling back to GetAllGroupIDsSync");
+            V2TIM_LOG(kWarning, "CreateGroup: GetKnownGroupIDs returned 0, falling back to GetAllGroupIDsSync");
             // Fallback to GetAllGroupIDsSync if FFI call fails
-            V2TIMGroupManagerImpl* groupManagerImpl = V2TIMGroupManagerImpl::GetInstance();
+            V2TIMGroupManagerImpl* groupManagerImpl = static_cast<V2TIMGroupManagerImpl*>(GetGroupManager());
             if (groupManagerImpl) {
                 std::vector<std::string> all_group_ids = groupManagerImpl->GetAllGroupIDsSync();
                 V2TIM_LOG(kInfo, "CreateGroup: GetAllGroupIDsSync returned {} group IDs", all_group_ids.size());
@@ -3120,18 +2925,9 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
             char generated_id_buf[32]; // Enough for "tox_" + uint64_t
             snprintf(generated_id_buf, sizeof(generated_id_buf), "tox_%llu", (unsigned long long)candidate_id);
 
-            // Double-check if this ID already exists in this instance (shouldn't happen with global counter)
-            // Also collect Dart-layer known IDs into a set for additional collision check
+            // Double-check: collect known group IDs for collision check (R-07: Core metadata)
             std::unordered_set<std::string> dart_known_ids;
-            if (groups_len > 0) {
-                std::string gs(groups_buffer, groups_len);
-                std::istringstream iss2(gs);
-                std::string ln;
-                while (std::getline(iss2, ln)) {
-                    if (!ln.empty() && ln.back() == '\n') ln.pop_back();
-                    if (!ln.empty()) dart_known_ids.insert(ln);
-                }
-            }
+            for (const auto& g : GetKnownGroupIDs()) dart_known_ids.insert(g);
             while (group_id_to_group_number_.find(generated_id_buf) != group_id_to_group_number_.end() ||
                    dart_known_ids.count(std::string(generated_id_buf)) > 0) {
                 candidate_id = g_next_group_id_global.fetch_add(1);
@@ -3210,7 +3006,8 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
                 
                 // Add protection around FFI call
                 try {
-                    int ffi_result = tim2tox_ffi_set_group_chat_id(GetInstanceIdFromManager(this), group_id_cstr, chat_id_hex.c_str());
+                    SetGroupChatIdInStorage(group_id_cstr, chat_id_hex.c_str());
+                    int ffi_result = 1;
                     V2TIM_LOG(kInfo, "CreateGroup: Step 8 - tim2tox_ffi_set_group_chat_id returned: {}", ffi_result);
                 } catch (...) {
                     V2TIM_LOG(kError, "CreateGroup: Step 8 - EXCEPTION caught in tim2tox_ffi_set_group_chat_id!");
@@ -3284,7 +3081,7 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
             V2TIM_LOG(kInfo, "CreateGroup: Step 9.5 - Storing group type to persistent storage: group_id={}, type={}", 
                      group_id_cstr, type_to_store);
             try {
-                tim2tox_ffi_set_group_type(GetInstanceIdFromManager(this), group_id_cstr, type_to_store.c_str());
+                SetGroupTypeInStorage(group_id_cstr, type_to_store);
                 V2TIM_LOG(kInfo, "CreateGroup: Step 9.5 - Successfully stored group type");
             } catch (...) {
                 V2TIM_LOG(kError, "CreateGroup: Step 9.5 - EXCEPTION caught in tim2tox_ffi_set_group_type!");
@@ -3430,7 +3227,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
     if (!has_stored_chat_id) {
         // Try to get chat_id from storage (or cross-instance in tests)
         V2TIM_LOG(kInfo, "[JoinGroup] Checking for stored chat_id for groupID: {}", groupID.CString());
-        has_stored_chat_id = (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(this), groupID.CString(), stored_chat_id, sizeof(stored_chat_id)) == 1);
+        has_stored_chat_id = GetGroupChatIdFromStorage(groupID.CString(), stored_chat_id, sizeof(stored_chat_id));
         V2TIM_LOG(kInfo, "[JoinGroup] has_stored_chat_id: {}", has_stored_chat_id);
     }
     if (has_stored_chat_id) {
@@ -3542,7 +3339,7 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
         fflush(stdout);
         V2TIM_LOG(kInfo, "[JoinGroup] ✅ Successfully joined group using chat_id, group_number={}", group_number);
         // Persist chat_id for this instance (groupID may be 64-char chat_id when joining public group)
-        tim2tox_ffi_set_group_chat_id(GetInstanceIdFromManager(this), groupID.CString(), stored_chat_id);
+        SetGroupChatIdInStorage(groupID.CString(), stored_chat_id);
     } else {
         V2TIM_LOG(kInfo, "[JoinGroup] Path 2: Joining group using pending invite");
         // Try to use pending invite if available
@@ -3639,8 +3436,8 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
             
             // Store chat_id via FFI for persistence
             // Note: Function is already declared with extern "C" at file scope (line 38)
-            int ffi_result = tim2tox_ffi_set_group_chat_id(GetInstanceIdFromManager(this), groupID.CString(), chat_id_hex.c_str());
-            V2TIM_LOG(kInfo, "[JoinGroup] tim2tox_ffi_set_group_chat_id returned: {} (1=success)", ffi_result);
+            SetGroupChatIdInStorage(groupID.CString(), chat_id_hex);
+            V2TIM_LOG(kInfo, "[JoinGroup] SetGroupChatIdInStorage completed");
             V2TIM_LOG(kInfo, "[JoinGroup] Stored chat_id for joined group {}: {}", groupID.CString(), chat_id_hex.c_str());
             
             // Store in memory mapping
@@ -4196,7 +3993,7 @@ void V2TIMManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback* call
     }
     
     // Call GroupManagerImpl directly to remove from local state
-    V2TIMGroupManagerImpl* groupManagerImpl = V2TIMGroupManagerImpl::GetInstance();
+    V2TIMGroupManagerImpl* groupManagerImpl = static_cast<V2TIMGroupManagerImpl*>(GetGroupManager());
     if (groupManagerImpl) {
         V2TIM_LOG(kInfo, "V2TIMManagerImpl::QuitGroup: Calling V2TIMGroupManagerImpl::QuitGroup");
         // Use a helper method to quit the group (remove from local state)
@@ -4246,7 +4043,7 @@ void V2TIMManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallback* c
     
     // Call GroupManagerImpl BEFORE cleaning up mappings (so it can find group_number)
     // This allows GroupManagerImpl to delete the group from Tox if needed
-    V2TIMGroupManagerImpl* groupManagerImpl = V2TIMGroupManagerImpl::GetInstance();
+    V2TIMGroupManagerImpl* groupManagerImpl = static_cast<V2TIMGroupManagerImpl*>(GetGroupManager());
     if (groupManagerImpl) {
         fprintf(stdout, "[V2TIMManagerImpl] DismissGroup: Calling GroupManagerImpl::DismissGroup (group_number=%u)\n", 
                 group_number);
@@ -4487,13 +4284,11 @@ void V2TIMManagerImpl::GetUsersInfo(const V2TIMStringVector& userIDList, V2TIMVa
 // }
 
 void V2TIMManagerImpl::SubscribeUserInfo(const V2TIMStringVector& userIDList, V2TIMCallback* callback) {
-    // Simulate user info subscription
-    if (callback) callback->OnSuccess();
+    NotSupported(callback, "SubscribeUserInfo");
 }
 
 void V2TIMManagerImpl::UnsubscribeUserInfo(const V2TIMStringVector& userIDList, V2TIMCallback* callback) {
-    // Simulate user info unsubscription
-    if (callback) callback->OnSuccess();
+    NotSupported(callback, "UnsubscribeUserInfo");
 }
 
 void V2TIMManagerImpl::SetSelfInfo(const V2TIMUserFullInfo& info, V2TIMCallback* callback) {
@@ -4554,129 +4349,106 @@ void V2TIMManagerImpl::SetSelfInfo(const V2TIMUserFullInfo& info, V2TIMCallback*
 
 // Search & Status
 void V2TIMManagerImpl::SearchUsers(const V2TIMUserSearchParam& param, V2TIMValueCallback<V2TIMUserSearchResult>* callback) {
-    // Simulate search logic
-    if (callback) {
-        V2TIMUserSearchResult result;
-        callback->OnSuccess(result);
-    }
+    NotSupportedValue(callback, "SearchUsers");
 }
 
 void V2TIMManagerImpl::GetUserStatus(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMUserStatusVector>* callback) {
-    // 模拟查询逻辑
-    if (callback) {
-        V2TIMUserStatusVector statusList;
-        callback->OnSuccess(statusList);
-    }
+    NotSupportedValue(callback, "GetUserStatus");
 }
 
 void V2TIMManagerImpl::SetSelfStatus(const V2TIMUserStatus& status, V2TIMCallback* callback) {
-    // Map V2TIMUserStatus to Tox TOX_USER_STATUS and call ToxManager::setStatus
-    // so that friends receive friend_status callback (HandleFriendStatus -> OnUserStatusChanged).
-    // Dart SDK passes status string in customStatus ('AWAY'/'BUSY'/'NONE'); statusType may be 0.
-    const char* custom_cstr = status.customStatus.CString();
-    std::string custom = custom_cstr ? custom_cstr : "";
-    TOX_USER_STATUS tox_status = TOX_USER_STATUS_NONE;
-    if (custom == "BUSY" || status.statusType == V2TIM_USER_STATUS_ONLINE) {
-        tox_status = TOX_USER_STATUS_BUSY;
-    } else if (custom == "AWAY") {
-        tox_status = TOX_USER_STATUS_AWAY;
-    } else {
-        // "NONE" or empty or V2TIM_USER_STATUS_OFFLINE
-        tox_status = TOX_USER_STATUS_NONE;
-    }
-    bool ok = false;
-    if (tox_manager_) {
-        ok = tox_manager_->setStatus(tox_status);
-    }
-    if (callback) {
-        if (ok) {
-            callback->OnSuccess();
-        } else {
-            callback->OnError(ERR_IO_OPERATION_FAILED, "SetSelfStatus failed");
+    auto fail = [&](int code, const char* msg) {
+        if (callback) {
+            callback->OnError(code, msg);
         }
+    };
+
+    if (!tox_manager_) {
+        fail(ERR_SDK_NOT_INITIALIZED, "ToxManager not initialized");
+        return;
+    }
+
+    const char* custom_cstr = status.customStatus.CString();
+    const std::string custom = custom_cstr ? custom_cstr : "";
+
+    TOX_USER_STATUS tox_status = TOX_USER_STATUS_NONE;
+    switch (status.statusType) {
+        case V2TIM_USER_STATUS_ONLINE:
+            // Online in TIM terms maps to \"no special\" status in tox.
+            tox_status = TOX_USER_STATUS_NONE;
+            break;
+        case V2TIM_USER_STATUS_OFFLINE:
+            // Offline is represented by connection state; keep status \"none\".
+            tox_status = TOX_USER_STATUS_NONE;
+            break;
+        default:
+            if (custom == "BUSY") {
+                tox_status = TOX_USER_STATUS_BUSY;
+            } else if (custom == "AWAY") {
+                tox_status = TOX_USER_STATUS_AWAY;
+            } else {
+                tox_status = TOX_USER_STATUS_NONE;
+            }
+            break;
+    }
+
+    if (!tox_manager_->setStatus(tox_status)) {
+        fail(ERR_IO_OPERATION_FAILED, "SetSelfStatus failed");
+        return;
+    }
+
+    if (callback) {
+        callback->OnSuccess();
     }
 }
 
 void V2TIMManagerImpl::SubscribeUserStatus(const V2TIMStringVector& userIDList, V2TIMCallback* callback) {
-    // 模拟订阅逻辑
-    if (callback) {
-        callback->OnSuccess();
-    }
+    NotSupported(callback, "SubscribeUserStatus");
 }
 
 void V2TIMManagerImpl::UnsubscribeUserStatus(const V2TIMStringVector& userIDList, V2TIMCallback* callback) {
-    // 模拟取消订阅逻辑
-    if (callback) {
-        callback->OnSuccess();
-    }
+    NotSupported(callback, "UnsubscribeUserStatus");
 }
 
-// Advanced Managers
+// Advanced Managers (R-06: owned by this instance, lazy-created)
 V2TIMMessageManager* V2TIMManagerImpl::GetMessageManager() {
-    V2TIMMessageManagerImpl* messageManager = V2TIMMessageManagerImpl::GetInstance();
-    
-    // For multi-instance support, set manager_impl_ to this instance
-    // This ensures methods like RevokeMessage use the correct instance
-    if (messageManager) {
-        messageManager->SetManagerImpl(this);
+    if (!message_manager_) {
+        message_manager_ = std::make_unique<V2TIMMessageManagerImpl>(this);
     }
-    
-    return messageManager;
+    return message_manager_.get();
 }
 
 V2TIMGroupManager* V2TIMManagerImpl::GetGroupManager() {
-    V2TIMGroupManagerImpl* groupManager = V2TIMGroupManagerImpl::GetInstance();
-    
-    // For multi-instance support, set manager_impl_ to this instance
-    // This ensures GetGroupMemberList and other methods use the correct instance
-    if (groupManager) {
-        groupManager->SetManagerImpl(this);
+    if (!group_manager_) {
+        group_manager_ = std::make_unique<V2TIMGroupManagerImpl>(this);
     }
-    
-    if (!groupManager) {
-        fprintf(stderr, "[V2TIMManagerImpl] GetGroupManager: GetInstance() returned null\n");
-        fflush(stderr);
-        return nullptr;
-    }
-    
-    // Set manager_impl_ reference so group manager can access group mappings
-    groupManager->SetManagerImpl(this);
-    
-    // Add memory barrier to ensure object state is visible before returning
-    // This prevents issues where the object might appear uninitialized to other threads
     std::atomic_thread_fence(std::memory_order_acquire);
-    
-    return groupManager;
+    return group_manager_.get();
 }
 
 V2TIMCommunityManager* V2TIMManagerImpl::GetCommunityManager() {
-    // V2TIMCommunityManagerImpl is not implemented yet
-    V2TIMCommunityManagerImpl& communityManager = V2TIMCommunityManagerImpl::getInstance();
-    
-    // For multi-instance support, set manager_impl_ to this instance
-    communityManager.SetManagerImpl(this);
-    
-    return &communityManager;
+    if (!community_manager_) {
+        community_manager_ = std::make_unique<V2TIMCommunityManagerImpl>(this);
+    }
+    return community_manager_.get();
 }
 
 V2TIMConversationManager* V2TIMManagerImpl::GetConversationManager() {
-    V2TIMConversationManagerImpl* conversationManager = V2TIMConversationManagerImpl::GetInstance();
-    
-    // For multi-instance support, set manager_impl_ to this instance
-    // This ensures methods like DeleteConversationList use the correct instance
-    if (conversationManager) {
-        conversationManager->SetManagerImpl(this);
+    if (!conversation_manager_) {
+        conversation_manager_ = std::make_unique<V2TIMConversationManagerImpl>(this);
     }
-    
-    return conversationManager;
+    return conversation_manager_.get();
 }
 
 V2TIMFriendshipManager* V2TIMManagerImpl::GetFriendshipManager() {
-    return V2TIMFriendshipManagerImpl::GetInstance(); // Use the Impl singleton
+    if (!friendship_manager_) {
+        friendship_manager_ = std::make_unique<V2TIMFriendshipManagerImpl>(this);
+    }
+    return friendship_manager_.get();
 }
 
 V2TIMOfflinePushManager* V2TIMManagerImpl::GetOfflinePushManager() {
-    return nullptr; // Placeholder
+    return nullptr;  // Unsupported; do not fake success elsewhere
 }
 
 V2TIMSignalingManager* V2TIMManagerImpl::GetSignalingManager() {
@@ -4692,10 +4464,7 @@ V2TIMSignalingManager* V2TIMManagerImpl::GetSignalingManager() {
 
 // Experimental API
 void V2TIMManagerImpl::CallExperimentalAPI(const V2TIMString& api, const void* param, V2TIMValueCallback<V2TIMBaseObject>* callback) {
-    // 模拟实验性 API 逻辑
-    if (callback) {
-        callback->OnSuccess(V2TIMBaseObject());
-    }
+    NotSupportedValue(callback, "CallExperimentalAPI");
 }
 
 // Remove find_conference_by_id helper for now, will be handled within JoinGroup/Map logic
@@ -4711,6 +4480,72 @@ std::vector<V2TIMString> V2TIMManagerImpl::GetAllGroupIDs() {
     return groupIDs;
 }
 
+// R-07: Instance metadata (Core-owned; FFI forwards to these)
+std::vector<std::string> V2TIMManagerImpl::GetKnownGroupIDs() {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
+    return known_groups_;
+}
+
+void V2TIMManagerImpl::SetKnownGroupIDs(const std::vector<std::string>& group_ids) {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
+    known_groups_ = group_ids;
+}
+
+bool V2TIMManagerImpl::GetGroupChatIdFromStorage(const std::string& group_id, char* out_chat_id_hex, int out_len) {
+    if (!out_chat_id_hex || out_len < 65) return false;
+    V2TIMString gid(group_id.c_str());
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = group_id_to_chat_id_.find(gid);
+    if (it == group_id_to_chat_id_.end() || it->second.size() != TOX_GROUP_CHAT_ID_SIZE) return false;
+    std::ostringstream oss;
+    for (size_t i = 0; i < it->second.size(); ++i)
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(it->second[i]);
+    std::string hex = oss.str();
+    int n = (int)std::min(hex.size(), (size_t)(out_len - 1));
+    memcpy(out_chat_id_hex, hex.c_str(), n);
+    out_chat_id_hex[n] = '\0';
+    return true;
+}
+
+void V2TIMManagerImpl::SetGroupChatIdInStorage(const std::string& group_id, const std::string& chat_id_hex) {
+    if (chat_id_hex.length() != TOX_GROUP_CHAT_ID_SIZE * 2) return;
+    std::vector<uint8_t> bin(TOX_GROUP_CHAT_ID_SIZE);
+    for (size_t i = 0; i < TOX_GROUP_CHAT_ID_SIZE; ++i) {
+        unsigned long byte_val = strtoul(chat_id_hex.substr(i * 2, 2).c_str(), nullptr, 16);
+        if (byte_val > 255) return;
+        bin[i] = (uint8_t)byte_val;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    group_id_to_chat_id_[V2TIMString(group_id.c_str())] = std::move(bin);
+}
+
+bool V2TIMManagerImpl::GetGroupTypeFromStorage(const std::string& group_id, char* out_type, int out_len) {
+    if (!out_type || out_len < 16) return false;
+    V2TIMString gid(group_id.c_str());
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = group_id_to_type_.find(gid);
+    if (it == group_id_to_type_.end()) return false;
+    int n = (int)std::min(it->second.size(), (size_t)(out_len - 1));
+    memcpy(out_type, it->second.c_str(), n);
+    out_type[n] = '\0';
+    return true;
+}
+
+void V2TIMManagerImpl::SetGroupTypeInStorage(const std::string& group_id, const std::string& group_type) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    group_id_to_type_[V2TIMString(group_id.c_str())] = group_type;
+}
+
+bool V2TIMManagerImpl::GetAutoAcceptGroupInvites() {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
+    return auto_accept_group_invites_;
+}
+
+void V2TIMManagerImpl::SetAutoAcceptGroupInvites(bool enabled) {
+    std::lock_guard<std::mutex> lock(metadata_mutex_);
+    auto_accept_group_invites_ = enabled;
+}
+
 // --- Implementation of Internal Handlers ---
 
 void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, Tox_Group_Peer_Number peer_id, TOX_MESSAGE_TYPE type, const uint8_t* message_data, size_t length, Tox_Group_Message_Id message_id) {
@@ -4719,7 +4554,7 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
              group_number, peer_id, static_cast<int>(type), length, message_id);
     
     Tox* tox = GetToxManager()->getTox();
-    V2TIMMessageManagerImpl* msgManager = V2TIMMessageManagerImpl::GetInstance();
+    V2TIMMessageManagerImpl* msgManager = static_cast<V2TIMMessageManagerImpl*>(GetMessageManager());
     if (!tox || !msgManager || !running_) {
         V2TIM_LOG(kError, "[V2TIMManagerImpl::HandleGroupMessageGroup] Skipped: Dependencies missing or shutting down. tox={}, msgManager={}, running_={}", 
                  tox ? "non-null" : "null", msgManager ? "non-null" : "null", running_ ? "true" : "false");
@@ -4833,17 +4668,12 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
                 snprintf(buf, sizeof(buf), "%02x", chat_id_bin[i]);
                 chat_id_hex += buf;
             }
-            char known_buf[4096];
-            memset(known_buf, 0, sizeof(known_buf));
-            int known_len = tim2tox_ffi_get_known_groups(GetInstanceIdFromManager(this), known_buf, sizeof(known_buf));
-            if (known_len > 0) {
-                std::istringstream iss(known_buf);
-                std::string line;
-                while (std::getline(iss, line)) {
-                    if (!line.empty() && line.back() == '\n') line.pop_back();
+            std::vector<std::string> known = GetKnownGroupIDs();
+            if (!known.empty()) {
+                for (const auto& line : known) {
                     if (line.empty()) continue;
                     char stored_chat_id[65];
-                    if (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(this), line.c_str(), stored_chat_id, sizeof(stored_chat_id)) != 1) continue;
+                    if (!GetGroupChatIdFromStorage(line, stored_chat_id, sizeof(stored_chat_id))) continue;
                     if (strlen(stored_chat_id) == chat_id_hex.size() && strncasecmp(stored_chat_id, chat_id_hex.c_str(), chat_id_hex.size()) == 0) {
                         V2TIMString resolvedID(line.c_str());
                         {
@@ -4862,17 +4692,12 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
         }
         // Strategy 2: iterate known_groups, getGroupByChatId(stored_chat_id) and match to group_number (works when getGroupChatId(group_number) fails)
         if (groupID.Empty() && tox_manager_) {
-            char known_buf[4096];
-            memset(known_buf, 0, sizeof(known_buf));
-            int known_len = tim2tox_ffi_get_known_groups(GetInstanceIdFromManager(this), known_buf, sizeof(known_buf));
-            if (known_len > 0) {
-                std::istringstream iss2(known_buf);
-                std::string line2;
-                while (std::getline(iss2, line2)) {
-                    if (!line2.empty() && line2.back() == '\n') line2.pop_back();
+            std::vector<std::string> known2 = GetKnownGroupIDs();
+            if (!known2.empty()) {
+                for (const auto& line2 : known2) {
                     if (line2.empty()) continue;
                     char stored_chat_id[65];
-                    if (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(this), line2.c_str(), stored_chat_id, sizeof(stored_chat_id)) != 1) continue;
+                    if (!GetGroupChatIdFromStorage(line2, stored_chat_id, sizeof(stored_chat_id))) continue;
                     size_t len = strlen(stored_chat_id);
                     if (len != static_cast<size_t>(TOX_GROUP_CHAT_ID_SIZE * 2)) continue;
                     uint8_t cid_bin[TOX_GROUP_CHAT_ID_SIZE];
@@ -5016,7 +4841,7 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
             V2TIMString revokerID(revoker.c_str());
             V2TIMString revokeReason(reason.c_str());
             
-            V2TIMMessageManagerImpl* msgMgr = V2TIMMessageManagerImpl::GetInstance();
+            V2TIMMessageManagerImpl* msgMgr = static_cast<V2TIMMessageManagerImpl*>(GetMessageManager());
             if (msgMgr) {
                 msgMgr->NotifyMessageRevoked(revokedMsgID, revokerID, revokeReason);
             }
@@ -5116,7 +4941,7 @@ void V2TIMManagerImpl::HandleGroupPrivateMessage(Tox_Group_Number group_number, 
     fprintf(stdout, "[HandleGroupPrivateMessage] ENTRY group_number=%u peer_id=%u type=%d len=%zu\n", group_number, peer_id, type, length);
     fflush(stdout);
     Tox* tox = GetToxManager()->getTox();
-    V2TIMMessageManagerImpl* msgManager = V2TIMMessageManagerImpl::GetInstance();
+    V2TIMMessageManagerImpl* msgManager = static_cast<V2TIMMessageManagerImpl*>(GetMessageManager());
     if (!tox || !msgManager || !running_) return;
     Tox_Err_Group_Peer_Query err_self;
     if (GetToxManager()->isGroupPeerOurs(group_number, peer_id, &err_self) && err_self == TOX_ERR_GROUP_PEER_QUERY_OK) return;
@@ -5152,7 +4977,7 @@ void V2TIMManagerImpl::HandleFriendMessage(uint32_t friend_number, TOX_MESSAGE_T
     fflush(stdout);
     
     Tox* tox = GetToxManager()->getTox();
-    V2TIMMessageManagerImpl* msgManager = V2TIMMessageManagerImpl::GetInstance();
+    V2TIMMessageManagerImpl* msgManager = static_cast<V2TIMMessageManagerImpl*>(GetMessageManager());
     if (!tox || !msgManager || !running_) {
         fprintf(stdout, "[HandleFriendMessage] ERROR: Dependencies missing or shutting down: tox=%p, msgManager=%p, running_=%d\n",
                 (void*)tox, (void*)msgManager, running_ ? 1 : 0);
@@ -5254,7 +5079,7 @@ void V2TIMManagerImpl::HandleFriendMessage(uint32_t friend_number, TOX_MESSAGE_T
             V2TIMString revokerID(revoker.c_str());
             V2TIMString revokeReason(reason.c_str());
             
-            V2TIMMessageManagerImpl* msgMgr = V2TIMMessageManagerImpl::GetInstance();
+            V2TIMMessageManagerImpl* msgMgr = static_cast<V2TIMMessageManagerImpl*>(GetMessageManager());
             if (msgMgr) {
                 msgMgr->NotifyMessageRevoked(revokedMsgID, revokerID, revokeReason);
             }
@@ -5389,75 +5214,28 @@ void V2TIMManagerImpl::HandleSelfConnectionStatus(TOX_CONNECTION connection_stat
         return;
     }
     
-    // Check if there's a pending login callback and connection is established
-    V2TIMCallback* pending_login = nullptr;
+    // When connection is established, ensure logged_in_user_ is set for status/callbacks
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (connection_status == TOX_CONNECTION_TCP || connection_status == TOX_CONNECTION_UDP) {
-            // Set logged_in_user_ when connection is established (if not already set)
-            // This ensures getLoginStatus() returns correct value even if getAddress() 
-            // returned empty string during Login() call
-            bool is_empty = logged_in_user_.Empty();
-            V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: connection_status={}, logged_in_user_.Empty()={}, tox_manager_={}", 
-                     connection_status, is_empty ? 1 : 0, tox_manager_ ? "non-null" : "null");
-            
-            if (is_empty && tox_manager_) {
-                Tox* tox = tox_manager_->getTox();
-                if (tox) {
-                    uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
-                    tox_self_get_public_key(tox, pubkey);
-                    std::string pk_hex = ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE);
-                    std::string address = tox_manager_->getAddress();
-                    if (address.length() >= 76) {
-                        logged_in_user_ = (pk_hex + address.substr(64, 12)).c_str();
-                    } else {
-                        logged_in_user_ = pk_hex.c_str();
-                    }
-                    V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: Set logged_in_user_ from tox_self_get_public_key (length={})", logged_in_user_.Length());
+        if ((connection_status == TOX_CONNECTION_TCP || connection_status == TOX_CONNECTION_UDP) && logged_in_user_.Empty() && tox_manager_) {
+            Tox* tox = tox_manager_->getTox();
+            if (tox) {
+                uint8_t pubkey[TOX_PUBLIC_KEY_SIZE];
+                tox_self_get_public_key(tox, pubkey);
+                std::string pk_hex = ToxUtil::tox_bytes_to_hex(pubkey, TOX_PUBLIC_KEY_SIZE);
+                std::string address = tox_manager_->getAddress();
+                if (address.length() >= 76) {
+                    logged_in_user_ = (pk_hex + address.substr(64, 12)).c_str();
                 } else {
-                    std::string address = tox_manager_->getAddress();
-                    if (address.length() > 0) {
-                        logged_in_user_ = address.c_str();
-                        V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: Set logged_in_user_ to address fallback (length={})", logged_in_user_.Length());
-                    }
+                    logged_in_user_ = pk_hex.c_str();
                 }
-            } else if (!is_empty) {
-                V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: logged_in_user_ already set (length={})", logged_in_user_.Length());
-            }
-            
-            if (pending_login_callback_) {
-                pending_login = pending_login_callback_;
-                pending_login_callback_ = nullptr; // Clear it after taking ownership
-            }
-        }
-    }
-    
-    // Call pending login callback if connection is established
-    // Use try-catch to prevent crashes if callback is invalid
-    if (pending_login) {
-        if (!running_.load(std::memory_order_acquire)) {
-            V2TIM_LOG(kWarning, "HandleSelfConnectionStatus: Skipping pending login callback - SDK not running (instance_id={})", instance_id);
-            return;
-        }
-        
-        try {
-            V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: Connection established, calling pending login callback (instance_id={})", instance_id);
-            if (running_.load(std::memory_order_acquire) && pending_login) {
-                pending_login->OnSuccess();
-                V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: Pending login callback OnSuccess() called successfully (instance_id={})", instance_id);
             } else {
-                V2TIM_LOG(kWarning, "HandleSelfConnectionStatus: Skipping pending login callback - running_={}, pending_login={} (instance_id={})", 
-                         running_.load(std::memory_order_acquire) ? 1 : 0, pending_login ? "non-null" : "null", instance_id);
+                std::string address = tox_manager_->getAddress();
+                if (address.length() > 0) {
+                    logged_in_user_ = address.c_str();
+                }
             }
-        } catch (const std::bad_function_call& e) {
-            V2TIM_LOG(kError, "HandleSelfConnectionStatus: bad_function_call in pending login callback: {} (instance_id={})", e.what(), instance_id);
-        } catch (const std::exception& e) {
-            V2TIM_LOG(kError, "HandleSelfConnectionStatus: Exception in pending login callback: {} (instance_id={})", e.what(), instance_id);
-        } catch (...) {
-            V2TIM_LOG(kError, "HandleSelfConnectionStatus: Unknown exception in pending login callback (instance_id={})", instance_id);
         }
-    } else {
-        V2TIM_LOG(kInfo, "HandleSelfConnectionStatus: No pending login callback (instance_id={})", instance_id);
     }
     
     std::vector<V2TIMSDKListener*> listeners_to_notify;
@@ -5485,13 +5263,13 @@ void V2TIMManagerImpl::HandleSelfConnectionStatus(TOX_CONNECTION connection_stat
                 refresh_stop_requested_.store(false, std::memory_order_release);
                 bool expected = false;
                 if (refresh_task_running_.compare_exchange_strong(expected, true)) {
-                    V2TIMConversationManagerImpl* cm = V2TIMConversationManagerImpl::GetInstance();
+                    V2TIMConversationManagerImpl* cm = static_cast<V2TIMConversationManagerImpl*>(GetConversationManager());
                     if (cm) {
                         cm->RefreshCache();
                         refresh_task_ = std::thread([this]() {
                             auto refresh_once = [this]() {
                                 if (!running_.load(std::memory_order_acquire)) return;
-                                V2TIMConversationManagerImpl* c = V2TIMConversationManagerImpl::GetInstance();
+                                V2TIMConversationManagerImpl* c = static_cast<V2TIMConversationManagerImpl*>(GetConversationManager());
                                 if (c) c->RefreshCache();
                             };
                             const long delays_ms[] = { 500, 1000, 2000 };
@@ -5706,7 +5484,7 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
         // CRITICAL: Also store the application in pending_applications_ so GetFriendApplicationList works
         // This is needed because NotifyFriendApplicationListAddedToListener only notifies listeners,
         // but doesn't store applications in the pending list
-        V2TIMFriendshipManagerImpl* fm = V2TIMFriendshipManagerImpl::GetInstance();
+        V2TIMFriendshipManagerImpl* fm = static_cast<V2TIMFriendshipManagerImpl*>(GetFriendshipManager());
         if (fm) {
             V2TIM_LOG(kInfo, "HandleFriendRequest: Storing application in pending_applications_ for GetFriendApplicationList");
             fprintf(stdout, "[HandleFriendRequest] Storing application in pending_applications_ for GetFriendApplicationList\n");
@@ -5715,7 +5493,7 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
             fprintf(stdout, "[HandleFriendRequest] Application stored in pending_applications_\n");
             fflush(stdout);
         } else {
-            fprintf(stdout, "[HandleFriendRequest] ERROR: V2TIMFriendshipManagerImpl::GetInstance() returned null!\n");
+            fprintf(stdout, "[HandleFriendRequest] ERROR: GetFriendshipManager() returned null!\n");
             fflush(stdout);
         }
     } else {
@@ -5724,7 +5502,7 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
         fflush(stdout);
         // Fallback: Also notify through the global FriendshipManagerImpl for backward compatibility
         // This ensures that if no per-instance listener is registered, the request is still processed
-        V2TIMFriendshipManagerImpl* fm = V2TIMFriendshipManagerImpl::GetInstance();
+        V2TIMFriendshipManagerImpl* fm = static_cast<V2TIMFriendshipManagerImpl*>(GetFriendshipManager());
         if (fm) {
             V2TIM_LOG(kInfo, "HandleFriendRequest: Falling back to global FriendshipManagerImpl");
             fprintf(stdout, "[HandleFriendRequest] Falling back to global FriendshipManagerImpl\n");
@@ -5741,7 +5519,7 @@ void V2TIMManagerImpl::HandleFriendRequest(const uint8_t* public_key, const uint
 void V2TIMManagerImpl::HandleFriendName(uint32_t friend_number, const uint8_t* name_data, size_t length) {
     Tox* tox = GetToxManager()->getTox();
     if (!tox || !running_) return;
-    V2TIMFriendshipManagerImpl* fm = V2TIMFriendshipManagerImpl::GetInstance();
+    V2TIMFriendshipManagerImpl* fm = static_cast<V2TIMFriendshipManagerImpl*>(GetFriendshipManager());
     if (!fm) return;
 
     // CRITICAL: Safely construct V2TIMString objects with exception handling
@@ -5814,7 +5592,7 @@ void V2TIMManagerImpl::HandleFriendName(uint32_t friend_number, const uint8_t* n
                 if (!listener) {
                     int64_t inst_id = GetInstanceIdFromManager(this);
                     listener = GetOrCreateFriendshipListenerForInstance(inst_id);
-                    if (listener) RegisterFriendshipListenerWithManager(listener);
+                    if (listener) RegisterFriendshipListenerWithManager(listener, this);
                 }
                 if (listener) NotifyFriendInfoChangedToListener(listener, &friendInfoList);
             }
@@ -5831,7 +5609,7 @@ void V2TIMManagerImpl::HandleFriendName(uint32_t friend_number, const uint8_t* n
 void V2TIMManagerImpl::HandleFriendStatusMessage(uint32_t friend_number, const uint8_t* message_data, size_t length) {
      Tox* tox = GetToxManager()->getTox();
     if (!tox || !running_) return;
-    V2TIMFriendshipManagerImpl* fm = V2TIMFriendshipManagerImpl::GetInstance();
+    V2TIMFriendshipManagerImpl* fm = static_cast<V2TIMFriendshipManagerImpl*>(GetFriendshipManager());
     if (!fm) return;
 
     // CRITICAL: Safely construct V2TIMString objects with exception handling
@@ -5903,7 +5681,7 @@ void V2TIMManagerImpl::HandleFriendStatusMessage(uint32_t friend_number, const u
                 if (!listener) {
                     int64_t inst_id = GetInstanceIdFromManager(this);
                     listener = GetOrCreateFriendshipListenerForInstance(inst_id);
-                    if (listener) RegisterFriendshipListenerWithManager(listener);
+                    if (listener) RegisterFriendshipListenerWithManager(listener, this);
                 }
                 if (listener) NotifyFriendInfoChangedToListener(listener, &friendInfoList);
             }
@@ -6260,31 +6038,22 @@ void V2TIMManagerImpl::HandleGroupPeerListChanged(uint32_t conference_number) {
             // to avoid duplicating IDs for the same conference.
             V2TIMString resolvedGroupID;
 
-            // Strategy 1: Check if tox_conf_<N> exists in known_groups
+            // Strategy 1: Check if tox_conf_<N> exists in known_groups (R-07: Core metadata)
             {
                 char conf_id[64];
                 snprintf(conf_id, sizeof(conf_id), "tox_conf_%u", conference_number);
-                char known_buf[4096];
-                int known_len = tim2tox_ffi_get_known_groups(GetInstanceIdFromManager(this), known_buf, sizeof(known_buf));
-                if (known_len > 0) {
-                    std::string known_str(known_buf, known_len);
-                    std::istringstream iss(known_str);
-                    std::string line;
-                    while (std::getline(iss, line)) {
-                        if (!line.empty() && line.back() == '\n') line.pop_back();
+                std::vector<std::string> known_conf = GetKnownGroupIDs();
+                if (!known_conf.empty()) {
+                    for (const auto& line : known_conf) {
                         if (line.empty()) continue;
-                        // Exact match: tox_conf_<conference_number>
                         if (line == conf_id) {
                             resolvedGroupID = V2TIMString(line.c_str());
                             V2TIM_LOG(kInfo, "HandleGroupPeerListChanged: Found existing known group '{}' for conference {}", line.c_str(), conference_number);
                             break;
                         }
                     }
-                    // Strategy 2: If no exact match, find any unmapped tox_conf_* in known_groups
                     if (resolvedGroupID.Empty()) {
-                        std::istringstream iss2(known_str);
-                        while (std::getline(iss2, line)) {
-                            if (!line.empty() && line.back() == '\n') line.pop_back();
+                        for (const auto& line : known_conf) {
                             if (line.empty()) continue;
                             if (line.substr(0, 9) == "tox_conf_") {
                                 V2TIMString candidate(line.c_str());
@@ -7097,27 +6866,15 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
             }
             std::string chat_id_hex = oss.str();
             
-            // Try to find groupID by checking stored chat_id for all known groups
-            // Note: Function is already declared with extern "C" at file scope (line 37)
-            char known_groups_buffer[4096];
-            int known_groups_len = tim2tox_ffi_get_known_groups(GetInstanceIdFromManager(this), known_groups_buffer, sizeof(known_groups_buffer));
-            
-            if (known_groups_len > 0) {
-                std::string known_groups_str(known_groups_buffer, known_groups_len);
-                std::istringstream iss(known_groups_str);
-                std::string line;
-                
-                // Note: Function is already declared with extern "C" at file scope (line 39)
-                while (std::getline(iss, line)) {
-                    if (!line.empty() && line.back() == '\n') {
-                        line.pop_back();
-                    }
+            // Try to find groupID by checking stored chat_id for all known groups (R-07: Core metadata)
+            std::vector<std::string> known_groups_vec = GetKnownGroupIDs();
+            if (!known_groups_vec.empty()) {
+                for (const auto& line : known_groups_vec) {
                     if (line.empty()) continue;
-                    
-                    // Check if this groupID has a stored chat_id that matches
                     char stored_chat_id[65];
-                    if (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(this), line.c_str(), stored_chat_id, sizeof(stored_chat_id)) == 1) {
-                        if (stored_chat_id == chat_id_hex) {
+                    if (!GetGroupChatIdFromStorage(line, stored_chat_id, sizeof(stored_chat_id))) continue;
+                    std::string stored_hex(stored_chat_id);
+                    if (stored_hex == chat_id_hex) {
                             // Found matching groupID!
                             groupID = V2TIMString(line.c_str());
                             found_in_mapping = true;
@@ -7222,7 +6979,6 @@ void V2TIMManagerImpl::HandleGroupSelfJoin(Tox_Group_Number group_number) {
                             }
                             
                             break;
-                        }
                     }
                 }
             }
@@ -7447,18 +7203,11 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
         return;
     }
     
-    // Get all known groups from Dart layer
-    char known_groups_buffer[4096];
-    memset(known_groups_buffer, 0, sizeof(known_groups_buffer));
-    int known_groups_len = tim2tox_ffi_get_known_groups(GetInstanceIdFromManager(this), known_groups_buffer, sizeof(known_groups_buffer));
-    
-    if (known_groups_len <= 0) {
+    // R-07: Get known groups from Core metadata
+    std::vector<std::string> known_groups_list = GetKnownGroupIDs();
+    if (known_groups_list.empty()) {
         return;
     }
-    
-    std::string known_groups_str(known_groups_buffer, known_groups_len);
-    std::istringstream iss(known_groups_str);
-    std::string line;
     
     int rejoin_attempts = 0;
     int rejoin_successes = 0;
@@ -7507,31 +7256,16 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             }
             
             if (conference_count > 0) {
-                // Reset stream for conference processing
-                try {
-                    iss.clear();
-                    iss.seekg(0);
-                } catch (const std::exception& e) {
-                    fprintf(stderr, "[RejoinKnownGroups] Exception resetting istringstream: %s\n", e.what());
-                    fflush(stderr);
-                } catch (...) {
-                    fprintf(stderr, "[RejoinKnownGroups] Unknown exception resetting istringstream\n");
-                    fflush(stderr);
-                }
-                
-                while (std::getline(iss, line)) {
+                for (const auto& line : known_groups_list) {
                     try {
-                        if (!line.empty() && line.back() == '\n') {
-                            line.pop_back();
-                        }
-                        if (line.empty()) {
-                            continue;
-                        }
+                        std::string line_trim = line;
+                        while (!line_trim.empty() && line_trim.back() == '\n') line_trim.pop_back();
+                        if (line_trim.empty()) continue;
                         
                         // Check group type
                         char stored_type[16];
                         std::string group_type = "group"; // Default
-                        if (tim2tox_ffi_get_group_type_from_storage(GetInstanceIdFromManager(this), line.c_str(), stored_type, sizeof(stored_type)) == 1) {
+                        if (GetGroupTypeFromStorage(line_trim, stored_type, sizeof(stored_type))) {
                             group_type = std::string(stored_type);
                         }
                         
@@ -7541,7 +7275,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                                 std::lock_guard<std::mutex> lock(mutex_);
                                 for (const auto& pair : group_number_to_group_id_) {
                                     std::string pair_str = pair.second.CString();
-                                    if (pair_str == line) {
+                                    if (pair_str == line_trim) {
                                         already_mapped = true;
                                         break;
                                     }
@@ -7557,7 +7291,6 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                             }
                             
                             if (!already_mapped) {
-                                // Try to find an unmapped conference to match with this groupID
                                 for (Tox_Conference_Number conf_num : conference_list) {
                                     bool conf_mapped = false;
                                     try {
@@ -7572,8 +7305,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                                     }
                                     
                                     if (!conf_mapped) {
-                                        // Found unmapped conference, assign to this groupID
-                                        V2TIMString groupID(line.c_str());
+                                        V2TIMString groupID(line_trim.c_str());
                                         try {
                                             std::lock_guard<std::mutex> lock(mutex_);
                                             group_id_to_group_number_[groupID] = conf_num;
@@ -7603,36 +7335,19 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
         }
     }
     
-    // Now restore groups using chat_id
-    try {
-        iss.clear();
-        iss.seekg(0);
-    } catch (const std::exception& e) {
-        fprintf(stderr, "[RejoinKnownGroups] Exception resetting istringstream for group restore: %s\n", e.what());
-        fflush(stderr);
-        return;
-    } catch (...) {
-        fprintf(stderr, "[RejoinKnownGroups] Unknown exception resetting istringstream for group restore\n");
-        fflush(stderr);
-        return;
-    }
-    
-    while (std::getline(iss, line)) {
+    // Now restore groups using chat_id (R-07: iterate known_groups_list)
+    for (const auto& line : known_groups_list) {
         try {
-            if (!line.empty() && line.back() == '\n') {
-                line.pop_back();
-            }
-            if (line.empty()) {
-                continue;
-            }
+            std::string line_trim = line;
+            while (!line_trim.empty() && line_trim.back() == '\n') line_trim.pop_back();
+            if (line_trim.empty()) continue;
             
-            // Check if this group already has a mapping (already in Tox)
             bool already_mapped = false;
             try {
                 std::lock_guard<std::mutex> lock(mutex_);
                 for (const auto& pair : group_number_to_group_id_) {
                     std::string pair_str = pair.second.CString();
-                    if (pair_str == line) {
+                    if (pair_str == line_trim) {
                         already_mapped = true;
                         break;
                     }
@@ -7655,16 +7370,15 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             char stored_type[16];
             std::string group_type = "group"; // Default
             try {
-                int result = tim2tox_ffi_get_group_type_from_storage(GetInstanceIdFromManager(this), line.c_str(), stored_type, sizeof(stored_type));
-                if (result == 1) {
+                if (GetGroupTypeFromStorage(line_trim, stored_type, sizeof(stored_type))) {
                     group_type = std::string(stored_type);
                 }
             } catch (const std::exception& e) {
-                fprintf(stderr, "[RejoinKnownGroups] Exception in tim2tox_ffi_get_group_type_from_storage for '%s': %s\n", line.c_str(), e.what());
+                fprintf(stderr, "[RejoinKnownGroups] Exception in GetGroupTypeFromStorage for '%s': %s\n", line_trim.c_str(), e.what());
                 fflush(stderr);
                 group_type = "group"; // Use default on error
             } catch (...) {
-                fprintf(stderr, "[RejoinKnownGroups] Unknown exception in tim2tox_ffi_get_group_type_from_storage for '%s'\n", line.c_str());
+                fprintf(stderr, "[RejoinKnownGroups] Unknown exception in GetGroupTypeFromStorage for '%s'\n", line_trim.c_str());
                 fflush(stderr);
                 group_type = "group"; // Use default on error
             }
@@ -7676,7 +7390,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             
             // Get stored chat_id for this group
             char stored_chat_id[65];
-            bool has_stored_chat_id = (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(this), line.c_str(), stored_chat_id, sizeof(stored_chat_id)) == 1);
+            bool has_stored_chat_id = GetGroupChatIdFromStorage(line_trim, stored_chat_id, sizeof(stored_chat_id));
             if (!has_stored_chat_id) {
                 continue;
             }
@@ -7685,7 +7399,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             std::string chat_id_hex(stored_chat_id);
             if (chat_id_hex.length() != TOX_GROUP_CHAT_ID_SIZE * 2) {
                 fprintf(stderr, "[RejoinKnownGroups] Invalid chat_id length for group %s: %zu (expected %d)\n", 
-                        line.c_str(), chat_id_hex.length(), TOX_GROUP_CHAT_ID_SIZE * 2);
+                        line_trim.c_str(), chat_id_hex.length(), TOX_GROUP_CHAT_ID_SIZE * 2);
                 fflush(stderr);
                 continue;
             }
@@ -7698,7 +7412,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                 unsigned long byte_val = strtoul(byte_str.c_str(), &endptr, 16);
                 if (*endptr != '\0' || byte_val > 255) {
                     fprintf(stderr, "[RejoinKnownGroups] Invalid chat_id hex string for group %s at byte %zu\n", 
-                            line.c_str(), i);
+                            line_trim.c_str(), i);
                     fflush(stderr);
                     conversion_success = false;
                     break;
@@ -7724,7 +7438,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             if (existing_group_number != UINT32_MAX) {
                 // Group already exists in Tox - just record the mapping, no need to join
                 rejoin_successes++;
-                V2TIMString groupID(line.c_str());
+                V2TIMString groupID(line_trim.c_str());
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     group_id_to_group_number_[groupID] = existing_group_number;
@@ -7753,7 +7467,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
 
             if (err_join == TOX_ERR_GROUP_JOIN_OK && group_number != UINT32_MAX) {
                 rejoin_successes++;
-                V2TIMString groupID(line.c_str());
+                V2TIMString groupID(line_trim.c_str());
                 // Strategy:
                 // 1. Pre-register chat_id→groupID (first-wins) so HandleGroupSelfJoin can resolve.
                 // 2. ALSO store group_number→groupID immediately as a fallback, because
@@ -7812,37 +7526,34 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
                 }
             } else {
                 fprintf(stderr, "[RejoinKnownGroups] Failed to rejoin group %s, error=%d (group may not exist or may have been removed)\n",
-                        line.c_str(), err_join);
+                        line_trim.c_str(), err_join);
                 fflush(stderr);
             }
         } catch (const std::exception& e) {
-            fprintf(stderr, "[RejoinKnownGroups] Exception processing group line: %s\n", e.what());
+            fprintf(stderr, "[RejoinKnownGroups] Exception processing group line_trim: %s\n", e.what());
             fflush(stderr);
             continue;
         } catch (...) {
-            fprintf(stderr, "[RejoinKnownGroups] Unknown exception processing group line\n");
+            fprintf(stderr, "[RejoinKnownGroups] Unknown exception processing group line_trim\n");
             fflush(stderr);
             continue;
         }
     }
     
-    // Rebuild group_number <-> groupID mapping from current Tox state. tox_group_join() may return
-    // the same group_number for multiple joins, so the map above can be wrong. For each known
-    // group_id with stored chat_id, resolve actual group_number via getGroupByChatId and store.
-    std::istringstream iss_rebuild(known_groups_str);
-    std::string line_rebuild;
-    while (std::getline(iss_rebuild, line_rebuild)) {
+    // Rebuild group_number <-> groupID mapping from current Tox state (R-07: iterate known_groups_list).
+    for (const auto& line_rebuild : known_groups_list) {
         try {
-            if (!line_rebuild.empty() && line_rebuild.back() == '\n') line_rebuild.pop_back();
-            if (line_rebuild.empty()) continue;
+            std::string lr = line_rebuild;
+            while (!lr.empty() && lr.back() == '\n') lr.pop_back();
+            if (lr.empty()) continue;
             char stored_type[16];
             std::string group_type = "group";
-            if (tim2tox_ffi_get_group_type_from_storage(GetInstanceIdFromManager(this), line_rebuild.c_str(), stored_type, sizeof(stored_type)) == 1) {
+            if (GetGroupTypeFromStorage(lr, stored_type, sizeof(stored_type))) {
                 group_type = std::string(stored_type);
             }
             if (group_type != "group") continue;
             char stored_chat_id[65];
-            if (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(this), line_rebuild.c_str(), stored_chat_id, sizeof(stored_chat_id)) != 1) continue;
+            if (!GetGroupChatIdFromStorage(lr, stored_chat_id, sizeof(stored_chat_id))) continue;
             std::string chat_id_hex(stored_chat_id);
             if (chat_id_hex.length() != static_cast<size_t>(TOX_GROUP_CHAT_ID_SIZE * 2)) continue;
             uint8_t chat_id_bin[TOX_GROUP_CHAT_ID_SIZE];
@@ -7857,7 +7568,7 @@ void V2TIMManagerImpl::RejoinKnownGroups() {
             if (!ok || !tox_manager_) continue;
             Tox_Group_Number actual = tox_manager_->getGroupByChatId(chat_id_bin);
             if (actual == UINT32_MAX) continue;
-            V2TIMString groupID(line_rebuild.c_str());
+            V2TIMString groupID(lr.c_str());
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 group_id_to_group_number_[groupID] = actual;

@@ -203,31 +203,22 @@ void ToxManager::initialize(const Tox_Options* options,
     // V2TIMLog(kInfo, "ToxManager initialized successfully.");
 }
 
-// 关闭实现
+// 关闭实现：与 iterate() 使用相同锁顺序 (iterate_mutex_ 再 mutex_) 避免 UAF 竞态
 void ToxManager::shutdown() {
-    Tox* tox_to_remove = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
-            return;
-        }
-        is_shutting_down_.store(true, std::memory_order_release);
-        tox_to_remove = tox_.get();
+    std::scoped_lock lock(iterate_mutex_, mutex_);
+
+    if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
+        return;
     }
-    
-    // Remove from global mapping before destroying Tox instance
-    if (tox_to_remove) {
-        std::lock_guard<std::mutex> lock(g_tox_to_manager_mutex);
+
+    is_shutting_down_.store(true, std::memory_order_release);
+
+    if (Tox* tox_to_remove = tox_.get()) {
+        std::lock_guard<std::mutex> map_lock(g_tox_to_manager_mutex);
         g_tox_to_manager.erase(tox_to_remove);
     }
-    
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        // 不需要手动调用tox_kill，unique_ptr会通过toxDeleter自动处理
-        // Reset to nullptr will trigger the deleter, which calls tox_kill
-        tox_.reset(nullptr);
-    }
-    // V2TIMLog(kInfo, "ToxManager shut down.");
+
+    tox_.reset();
 }
 
 // 获取Tox实例
@@ -262,59 +253,25 @@ bool ToxManager::isShuttingDown() const {
     }
 }
 
-// 迭代实现
-void ToxManager::iterate(uint32_t timeout) {
-    // Get tox pointer and verify instance validity while holding lock
-    // Release lock before calling tox_iterate to avoid deadlock when callbacks try to acquire the same lock
+// 迭代实现：先取 iterate_mutex_ 再 mutex_，与 shutdown() 一致；不在锁外使用裸 tox 指针
+void ToxManager::iterate(uint32_t /*timeout*/) {
+    std::unique_lock<std::mutex> iter_lock(iterate_mutex_);
     Tox* tox_ptr = nullptr;
     {
-        // Use try-catch to handle cases where mutex is invalid during static destruction
-        // This can happen when the application is terminating and static objects are being destroyed
-        try {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
-                return;
-            }
-            tox_ptr = tox_.get();
-            if (!tox_ptr) {
-                return; // Invalid pointer
-            }
-        } catch (const std::system_error& e) {
-            // Mutex may be invalid during static destruction
-            // Return silently to allow graceful shutdown
-            return;
-        } catch (...) {
-            // Catch any other exception during mutex lock
-            // Return silently to allow graceful shutdown
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (is_shutting_down_.load(std::memory_order_acquire) || !tox_) {
             return;
         }
+        tox_ptr = tox_.get();
     }
-    // Call tox_iterate without holding the lock to prevent deadlock in callbacks
-    // Note: tox_ptr and 'this' must remain valid during tox_iterate execution
-    // Since ToxManager is a singleton, 'this' should always be valid
-    if (tox_ptr && !is_shutting_down_.load(std::memory_order_acquire)) {
-        try {
-            std::lock_guard<std::mutex> verify_lock(mutex_);
-            if (is_shutting_down_.load(std::memory_order_acquire) || !tox_ || tox_.get() != tox_ptr) {
-                // Tox instance was destroyed or replaced, don't call tox_iterate
-                return;
-            }
-        } catch (...) {
-            // Mutex may be invalid during shutdown - don't call tox_iterate
-            return;
-        }
-        // Serialize tox_iterate: toxcore requires "no more than one API function can operate
-        // on a single instance at any given time" (tox.h). Both event thread and
-        // iterateAllInstances (from tests) call iterate(); without this mutex they race and
-        // file_recv/other callbacks may never fire or cause undefined behavior.
-        std::lock_guard<std::mutex> iter_lock(iterate_mutex_);
-        // Now safe to call tox_iterate - we've verified tox_ptr is still valid
-        // Use try-catch to handle any exceptions during tox_iterate
-        try {
-            tox_iterate(tox_ptr, this);
-        } catch (...) {
-            // Silently ignore exceptions during tox_iterate
-        }
+    if (!tox_ptr) {
+        return;
+    }
+    // Call tox_iterate while holding iterate_mutex_ so shutdown() cannot reset tox_ until we return
+    try {
+        tox_iterate(tox_ptr, this);
+    } catch (...) {
+        // Silently ignore exceptions during tox_iterate
     }
 }
 

@@ -4,6 +4,17 @@ project(tim2tox_examples)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Ensure version.h is available for the embedded tim2tox build in this example tree.
+# We generate a local copy under this build dir and add it to the include path so
+# source/V2TIMManagerImpl.cpp can include "version.h" when compiled from tim2tox_build.
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/generated)
+configure_file(
+    ${CMAKE_SOURCE_DIR}/../source/version.h.in
+    ${CMAKE_BINARY_DIR}/generated/version.h
+    @ONLY
+)
+include_directories(${CMAKE_BINARY_DIR}/generated)
+
 # Find required packages
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SODIUM REQUIRED libsodium)

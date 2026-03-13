@@ -10,10 +10,12 @@
 #include "V2TIMLog.h" // Optional for logging
 #include "V2TIMFriendship.h"
 
+class V2TIMManagerImpl;
+class ToxManager;
+
 class V2TIMFriendshipManagerImpl : public V2TIMFriendshipManager {
 public:
-    // Singleton Instance
-    static V2TIMFriendshipManagerImpl* GetInstance();
+    explicit V2TIMFriendshipManagerImpl(V2TIMManagerImpl* owner);
 
     // Destructor
     ~V2TIMFriendshipManagerImpl() override;
@@ -67,6 +69,9 @@ public:
     void GetUserFollowInfo(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMFollowInfoVector>* callback) override;
     void CheckFollowType(const V2TIMStringVector& userIDList, V2TIMValueCallback<V2TIMFollowTypeCheckResultVector>* callback) override;
 
+    // --- Internal: get ToxManager from owner (R-06) ---
+    ToxManager* GetToxManager();
+
     // --- Internal methods for V2TIMManagerImpl to call ---
     void NotifyFriendApplicationListAdded(const V2TIMFriendApplicationVector& applicationList);
     void NotifyFriendApplicationListDeleted(const V2TIMStringVector& userIDList);
@@ -77,8 +82,6 @@ public:
     void NotifyBlackListDeleted(const V2TIMStringVector& userIDList);      // Placeholder for blacklist delete
 
 private:
-    // Private constructor for singleton
-    V2TIMFriendshipManagerImpl();
 
     // Delete copy/move constructors and assignment operators
     V2TIMFriendshipManagerImpl(const V2TIMFriendshipManagerImpl&) = delete;
@@ -108,6 +111,9 @@ private:
 
     // Joinable thread for delayed RefreshCache after AcceptFriendApplication (no detach to avoid UAF).
     std::thread refresh_after_accept_thread_;
+
+    // Owner (R-06: set in constructor, no singleton)
+    V2TIMManagerImpl* manager_impl_;
 };
 
 #endif // __V2TIM_FRIENDSHIP_MANAGER_IMPL_H__
