@@ -14,10 +14,28 @@
 // Forward declaration
 class V2TIMManagerImpl;
 
+// Value-type cache entry; no raw lastMessage pointer (by design).
+struct ConversationSnapshot {
+    std::string conversation_id;
+    std::string user_id;
+    std::string group_id;
+    std::string group_type;
+    std::string show_name;
+    std::string face_url;
+    std::string draft_text;
+    int unread_count = 0;
+    int recv_opt = 0;
+    uint64_t draft_timestamp = 0;
+    uint64_t order_key = 0;
+    uint64_t c2c_read_timestamp = 0;
+    uint64_t group_read_sequence = 0;
+    bool is_pinned = false;
+    int type = 0;
+};
+
 class V2TIMConversationManagerImpl : public V2TIMConversationManager {
 public:
-    static V2TIMConversationManagerImpl* GetInstance();
-    V2TIMConversationManagerImpl();
+    explicit V2TIMConversationManagerImpl(V2TIMManagerImpl* owner);
     ~V2TIMConversationManagerImpl() override;
 
     // 会话监听器管理
@@ -84,15 +102,12 @@ public:
         RefreshConversationCache();
     }
 
-    // Multi-instance support: Set the associated V2TIMManagerImpl instance
-    void SetManagerImpl(V2TIMManagerImpl* manager_impl);
-
 private:
     std::vector<V2TIMConversationListener*> listeners_;
     std::mutex listeners_mutex_;
 
-    // 本地会话缓存（好友列表+群组列表）
-    std::vector<V2TIMConversation> cached_conversations_;
+    // 本地会话缓存（值类型，不持有 lastMessage 裸指针）
+    std::vector<ConversationSnapshot> cached_conversations_;
     std::mutex cache_mutex_;
     
     // Track last known friend count to detect changes

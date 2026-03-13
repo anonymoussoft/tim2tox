@@ -43,6 +43,7 @@ include_directories(
 
 # Build source list explicitly and respect BUILD_TOXAV
 set(TIM2TOX_CORE_SRCS
+    PathUtils.cpp
     V2TIMManagerImpl.cpp
     V2TIMMessageManagerImpl.cpp
     V2TIMFriendshipManagerImpl.cpp

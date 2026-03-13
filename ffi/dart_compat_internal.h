@@ -122,8 +122,8 @@ DartFriendshipListenerImpl* GetFriendshipListenerForManager(V2TIMManagerImpl* ma
 // Get or create Friendship listener for a specific instance_id
 DartFriendshipListenerImpl* GetOrCreateFriendshipListenerForInstance(int64_t instance_id);
 
-// Register a Dart friendship listener with the singleton friendship manager (cast done in FFI layer)
-void RegisterFriendshipListenerWithManager(DartFriendshipListenerImpl* listener);
+// Register a Dart friendship listener with the instance's friendship manager (R-06: pass manager)
+void RegisterFriendshipListenerWithManager(DartFriendshipListenerImpl* listener, V2TIMManagerImpl* manager);
 
 // Get or create Group listener for a specific instance_id (used when registering with all instances)
 DartGroupListenerImpl* GetOrCreateGroupListenerForInstance(int64_t instance_id);

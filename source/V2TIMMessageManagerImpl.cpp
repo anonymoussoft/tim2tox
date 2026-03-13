@@ -3,7 +3,7 @@
 #include "ToxManager.h" // Potentially needed for direct Tox calls?
 #include <V2TIMErrorCode.h>
 #include <chrono> // For timestamps
-#include <cstdlib> // For rand()
+#include <atomic>
 #include <cstdio>
 #include <sys/stat.h> // For stat() to get file size
 #include "TIMResultDefine.h"
@@ -11,15 +11,8 @@
 #include "RevokeMessageUtil.h"
 #include "MessageReplyUtil.h"
 
-// Initialize singleton instance
-V2TIMMessageManagerImpl* V2TIMMessageManagerImpl::GetInstance() {
-    static V2TIMMessageManagerImpl instance;
-    return &instance;
-}
-
-// Constructor
-V2TIMMessageManagerImpl::V2TIMMessageManagerImpl() : manager_impl_(nullptr) {
-    // TODO: Initialize database connection if needed
+// Constructor (R-06: owned by V2TIMManagerImpl, no singleton)
+V2TIMMessageManagerImpl::V2TIMMessageManagerImpl(V2TIMManagerImpl* owner) : manager_impl_(owner) {
     V2TIM_LOG(kInfo, "V2TIMMessageManagerImpl initialized.");
 }
 
@@ -47,20 +40,32 @@ void V2TIMMessageManagerImpl::RemoveAdvancedMsgListener(V2TIMAdvancedMsgListener
     }
 }
 
+namespace {
+std::string MakeLocalMessageIdFallback() {
+    static std::atomic<uint64_t> s_seq{1};
+    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    uint64_t seq = s_seq.fetch_add(1, std::memory_order_relaxed);
+    return "local_" + std::to_string(now_ns) + "_" + std::to_string(seq);
+}
+}  // namespace
+
 // --- Internal Helper for Creating Base Message ---
 V2TIMMessage V2TIMMessageManagerImpl::CreateBaseMessage() {
     V2TIMMessage msg;
-    // Generate a unique message ID (client-side)
-    uint64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count();
-    uint32_t random_part = std::rand();
-    char msg_id_buffer[64];
-    // Note: ID format might differ from V2TIMManager simple sends
-    snprintf(msg_id_buffer, sizeof(msg_id_buffer), "m%llu-%u", timestamp_ms, random_part); 
-    msg.msgID = msg_id_buffer;
+    std::string msg_id_str;
+    {
+        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+        if (manager_impl_) {
+            msg_id_str = manager_impl_->MakeMessageId();
+        } else {
+            msg_id_str = MakeLocalMessageIdFallback();
+        }
+    }
+    msg.msgID = msg_id_str.c_str();
 
-    msg.timestamp = timestamp_ms / 1000; // V2TIM timestamp is in seconds
+    msg.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     // Use manager_impl_ instead of V2TIMManagerImpl::GetInstance() for multi-instance support
     V2TIMManagerImpl* manager = nullptr;
     {
@@ -795,20 +800,7 @@ void V2TIMMessageManagerImpl::SetAllReceiveMessageOpt(V2TIMReceiveMessageOpt opt
 void V2TIMMessageManagerImpl::SetAllReceiveMessageOpt(V2TIMReceiveMessageOpt opt, uint32_t startTimeStamp, uint32_t duration, V2TIMCallback* callback) { ReportNotImplemented(callback); }
 void V2TIMMessageManagerImpl::GetAllReceiveMessageOpt(V2TIMValueCallback<V2TIMReceiveMessageOptInfo>* callback) { ReportNotImplemented(callback); }
 void V2TIMMessageManagerImpl::GetHistoryMessageList(const V2TIMMessageListGetOption& option, V2TIMValueCallback<V2TIMMessageVector>* callback) {
-    // Message history is managed by Flutter layer (FfiChatService)
-    // C++ layer returns empty list - actual history retrieval is handled by Dart layer
-    V2TIMMessageVector result;
-    if (callback) {
-        try {
-            callback->OnSuccess(result);
-        } catch (...) {
-            try {
-                callback->OnError(ERR_SDK_NOT_SUPPORTED, "Exception in GetHistoryMessageList");
-            } catch (...) {
-                // Ignore errors in error handler
-            }
-        }
-    }
+    if (callback) callback->OnError(ERR_SDK_INTERFACE_NOT_SUPPORT, "GetHistoryMessageList");
 }
 void V2TIMMessageManagerImpl::RevokeMessage(const V2TIMMessage& message, V2TIMCallback* callback) {
     // 检查消息是否可以撤回
@@ -996,15 +988,9 @@ V2TIMString V2TIMMessageManagerImpl::InsertGroupMessageToLocalStorage(V2TIMMessa
         message.isSelf = false; // Default to false if manager is not available
     }
     
-    // 如果没有msgID，生成一个
     if (message.msgID.Empty()) {
-        uint64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-        uint32_t random_part = std::rand();
-        char msg_id_buffer[64];
-        snprintf(msg_id_buffer, sizeof(msg_id_buffer), "local_%llu-%u", timestamp_ms, random_part);
-        message.msgID = msg_id_buffer;
+        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+        message.msgID = manager_impl_ ? manager_impl_->MakeMessageId().c_str() : MakeLocalMessageIdFallback().c_str();
     }
     
     // 设置时间戳
@@ -1044,15 +1030,9 @@ V2TIMString V2TIMMessageManagerImpl::InsertC2CMessageToLocalStorage(V2TIMMessage
         message.isSelf = false; // Default to false if manager is not available
     }
     
-    // 如果没有msgID，生成一个
     if (message.msgID.Empty()) {
-        uint64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-        uint32_t random_part = std::rand();
-        char msg_id_buffer[64];
-        snprintf(msg_id_buffer, sizeof(msg_id_buffer), "local_%llu-%u", timestamp_ms, random_part);
-        message.msgID = msg_id_buffer;
+        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+        message.msgID = manager_impl_ ? manager_impl_->MakeMessageId().c_str() : MakeLocalMessageIdFallback().c_str();
     }
     
     // 设置时间戳
@@ -1202,23 +1182,5 @@ void V2TIMMessageManagerImpl::NotifyMessageRevoked(const V2TIMString& msgID, con
             // 同时调用旧接口（兼容性）
             listener->OnRecvMessageRevoked(msgID);
         }
-    }
-}
-
-// Multi-instance support: Set the associated V2TIMManagerImpl instance
-void V2TIMMessageManagerImpl::SetManagerImpl(V2TIMManagerImpl* manager_impl) {
-    V2TIMManagerImpl* old_impl = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
-        old_impl = manager_impl_;
-    }
-    if (manager_impl != old_impl) {
-        std::lock_guard<std::mutex> lock(receive_opt_mutex_);
-        c2c_receive_opts_.clear();
-        group_receive_opts_.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
-        manager_impl_ = manager_impl;
     }
 }

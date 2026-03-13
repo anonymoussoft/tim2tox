@@ -14,10 +14,7 @@ class V2TIMManagerImpl;
 
 class V2TIMGroupManagerImpl : public V2TIMGroupManager {
 public:
-    static V2TIMGroupManagerImpl* GetInstance();
-    V2TIMGroupManagerImpl(V2TIMManagerImpl* manager_impl = nullptr);
-    
-    void SetManagerImpl(V2TIMManagerImpl* manager_impl);
+    explicit V2TIMGroupManagerImpl(V2TIMManagerImpl* owner);
 
     ////////////////////////////// 群组管理接口 //////////////////////////////
     void CreateGroup(const V2TIMGroupInfo& info,

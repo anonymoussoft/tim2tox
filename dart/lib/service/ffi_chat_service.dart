@@ -23,6 +23,9 @@ typedef _init_c = ffi.Int32 Function();
 typedef _set_file_recv_dir_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
 typedef _login_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
+// R-08: Async login callback (C signature for NativeCallable)
+typedef _login_callback_native = ffi.Void Function(
+    ffi.Int32 success, ffi.Int32 error_code, ffi.Pointer<pkgffi.Utf8> error_message, ffi.Pointer<ffi.Void> user_data);
 typedef _add_friend_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 typedef _send_text_c = ffi.Int32 Function(
@@ -324,6 +327,10 @@ class FfiChatService {
 
   /// Instance ID for this service (set when registered); used for poll_text so the correct instance gets its events.
   int? _instanceId;
+
+  /// R-08: Async login: completer completed when native login callback fires.
+  Completer<({int success, int code, String message})>? _pendingLoginCompleter;
+  ffi.NativeCallable<_login_callback_native>? _loginNativeCallable;
 
   /// Get the preferences service (for use by SDK Platform)
   ExtendedPreferencesService? get preferencesService => _prefs;
@@ -975,11 +982,26 @@ class FfiChatService {
   }
 
   Future<void> login({required String userId, required String userSig}) async {
+    _pendingLoginCompleter = Completer<({int success, int code, String message})>();
+    _loginNativeCallable ??= ffi.NativeCallable<_login_callback_native>.listener(_onLoginCallback);
+    final instanceId = _ffi.getCurrentInstanceId();
     final puid = userId.toNativeUtf8();
     final psig = userSig.toNativeUtf8();
-    _ffi.login(puid, psig);
+    final r = _ffi.loginAsync(
+        instanceId,
+        puid,
+        psig,
+        _loginNativeCallable!.nativeFunction,
+        ffi.Pointer.fromAddress(0));
     pkgffi.malloc.free(puid);
     pkgffi.malloc.free(psig);
+    if (r != 1) {
+      _pendingLoginCompleter!.complete((success: 0, code: -1, message: 'login_async did not start'));
+    }
+    final result = await _pendingLoginCompleter!.future;
+    if (result.success != 1) {
+      throw Exception('Login failed: ${result.message} (code ${result.code})');
+    }
     // fetch self id
     final buf = pkgffi.malloc.allocate<ffi.Int8>(256);
     final n = _ffi.getLoginUser(buf, 256);
@@ -988,8 +1010,6 @@ class FfiChatService {
     }
     pkgffi.malloc.free(buf);
     // Connection status will be updated via OnConnectSuccess/OnConnectFailed events
-    // Don't set it here, wait for actual connection status callback
-    // But check current connection status immediately
     final currentStatus = _ffi.getSelfConnectionStatus();
     if (currentStatus != 0) {
       _isConnected = true;
@@ -997,6 +1017,16 @@ class FfiChatService {
     } else {
       _isConnected = false;
       _connectionStatus.add(false);
+    }
+  }
+
+  void _onLoginCallback(int success, int errorCode, ffi.Pointer<pkgffi.Utf8> errorMessage, ffi.Pointer<ffi.Void> userData) {
+    final comp = _pendingLoginCompleter;
+    _pendingLoginCompleter = null;
+    if (comp != null && !comp.isCompleted) {
+      String msg = '';
+      if (errorMessage.address != 0) msg = errorMessage.toDartString();
+      comp.complete((success: success, code: errorCode, message: msg));
     }
   }
 

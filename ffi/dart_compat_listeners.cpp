@@ -2723,12 +2723,11 @@ DartFriendshipListenerImpl* GetOrCreateFriendshipListenerForInstance(int64_t ins
     return listener;
 }
 
-// Register a Dart friendship listener with the singleton friendship manager.
-// Used by V2TIMManagerImpl when it creates a listener via GetOrCreateFriendshipListenerForInstance
-// so the cast happens in this compilation unit where DartFriendshipListenerImpl is fully defined.
-void RegisterFriendshipListenerWithManager(DartFriendshipListenerImpl* listener) {
-    if (!listener) return;
-    V2TIMFriendshipManagerImpl* fm = V2TIMFriendshipManagerImpl::GetInstance();
+// Register a Dart friendship listener with the instance's friendship manager (R-06: no singleton).
+// Used by V2TIMManagerImpl when it creates a listener via GetOrCreateFriendshipListenerForInstance.
+void RegisterFriendshipListenerWithManager(DartFriendshipListenerImpl* listener, V2TIMManagerImpl* manager) {
+    if (!listener || !manager) return;
+    V2TIMFriendshipManager* fm = manager->GetFriendshipManager();
     if (!fm) return;
     fm->AddFriendListener(static_cast<V2TIMFriendshipListener*>(listener));
 }

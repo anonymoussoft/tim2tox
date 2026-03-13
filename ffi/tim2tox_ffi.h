@@ -68,6 +68,12 @@ void tim2tox_ffi_set_log_file(const char* path);
 // Login; returns 1 on async start; completion is signaled by connection status and subsequent ops
 int tim2tox_ffi_login(const char* user_id, const char* user_sig);
 
+// R-08: Async login with explicit instance_id and completion callback.
+// callback(success, error_code, error_message, user_data): success=1 on success, 0 on failure; error_message valid only during callback.
+// Returns: 1 if login was started, 0 if instance not found / not inited / invalid args.
+typedef void (*tim2tox_login_callback_t)(int success, int error_code, const char* error_message, void* user_data);
+int tim2tox_ffi_login_async(int64_t instance_id, const char* user_id, const char* user_sig, tim2tox_login_callback_t callback, void* user_data);
+
 // Add friend; returns 1 if request submitted
 int tim2tox_ffi_add_friend(const char* user_id, const char* wording);
 

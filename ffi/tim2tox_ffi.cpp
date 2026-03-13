@@ -49,6 +49,7 @@
 #include <sys/socket.h>
 
 // Forward declarations (defined later in this file)
+V2TIMManagerImpl* GetCurrentInstance();
 int64_t GetCurrentInstanceId();
 int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager);
 int64_t GetReceiverInstanceOverride(void);
@@ -279,10 +280,10 @@ private:
 };
 
 // GlobalState - moved outside namespace so it can be accessed from FFI functions
+// R-08: inited state is per-instance (g_inited_instance_ids), not stored here
 struct GlobalState {
     SDKListenerImpl sdk_listener;
     SimpleMsgListenerImpl simple_listener;
-    std::atomic<bool> inited{false};  // Use atomic for thread-safe access
     std::string file_recv_dir = "/tmp/tim2tox_recv"; // Default directory, can be changed via tim2tox_ffi_set_file_recv_dir
     // file sending contexts: instance_id -> (key (friend_no<<32 | file_no) -> FILE* and size)
     std::mutex send_mtx;
@@ -291,6 +292,23 @@ struct GlobalState {
     // file receiving contexts: instance_id -> (key (friend_no<<32 | file_no) -> RecvCtx)
     std::map<int64_t, std::unordered_map<uint64_t, RecvCtx>> recv_files; // instance_id -> file map
 } G;
+
+// R-08: Per-instance inited state (replaces global G.inited for instance-aware checks)
+static std::mutex g_inited_mutex;
+static std::unordered_set<int64_t> g_inited_instance_ids;
+
+static void MarkInstanceInited(int64_t id) {
+    std::lock_guard<std::mutex> lk(g_inited_mutex);
+    g_inited_instance_ids.insert(id);
+}
+static void MarkInstanceUninited(int64_t id) {
+    std::lock_guard<std::mutex> lk(g_inited_mutex);
+    g_inited_instance_ids.erase(id);
+}
+static bool IsInstanceInited(int64_t id) {
+    std::lock_guard<std::mutex> lk(g_inited_mutex);
+    return g_inited_instance_ids.count(id) != 0;
+}
 
 // Helper function implementation - defined after G is complete
 void enqueue_conn_event(const char* event) {
@@ -577,9 +595,7 @@ int64_t tim2tox_ffi_create_test_instance_ex(const char* init_path, int local_dis
 
     V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: InitSDK completed successfully for instance={} (instance_id={})", (void*)instance, (long long)instance_id);
 
-    G.inited.store(true);
-    V2TIM_LOG(kInfo, "[ffi] create_test_instance_ex: Set G.inited=true for test instance, EXIT");
-
+    MarkInstanceInited(instance_id);
     return instance_id;
 }
 
@@ -683,6 +699,13 @@ int64_t GetInstanceIdFromManager(V2TIMManagerImpl* manager) {
     return kInstanceIdDestroyed;
 }
 
+// R-08: Whether the "current" instance has been inited (for FFI that don't take instance_id).
+static bool IsCurrentInstanceInited() {
+    V2TIMManagerImpl* m = GetCurrentInstance();
+    if (!m) return false;
+    return IsInstanceInited(GetInstanceIdFromManager(m));
+}
+
 // Iterate all (instance_id, manager) pairs. Used by dart_compat to register
 // group/friendship listeners with every instance when addGroupListener is called
 // (avoids race where only "current" instance gets the listener when logins run in parallel).
@@ -741,6 +764,7 @@ int tim2tox_ffi_destroy_test_instance(int64_t instance_handle) {
     
     // Remove from maps only AFTER UnInitSDK so no code path (including
     // UnInitSDK and any callbacks it joins) sees the manager as "not found".
+    MarkInstanceUninited(instance_handle);
     {
         std::lock_guard<std::mutex> lock(g_test_instances_mutex);
         g_test_instances.erase(instance_handle);
@@ -781,13 +805,13 @@ V2TIMManagerImpl* GetCurrentInstance() {
     return default_instance;
 }
 
-// Get manager for a given instance_id without changing g_current_instance_id. Used by FFI that take instance_id param.
+// R-08: Get manager for instance_id; no fallback to default (return nullptr if not found).
 static V2TIMManagerImpl* GetInstanceFromId(int64_t instance_id) {
     if (instance_id == 0) return GetCurrentInstance();
     std::lock_guard<std::mutex> lock(g_test_instances_mutex);
     auto it = g_test_instances.find(instance_id);
     if (it != g_test_instances.end()) return it->second;
-    return V2TIMManagerImpl::GetInstance();
+    return nullptr;
 }
 
 int tim2tox_ffi_init(void) {
@@ -795,7 +819,7 @@ int tim2tox_ffi_init(void) {
 }
 
 int tim2tox_ffi_init_with_path(const char* init_path) {
-    if (G.inited.load()) return 1;
+    if (IsInstanceInited(0)) return 1;
     V2TIMSDKConfig cfg;
     if (init_path && init_path[0] != '\0') {
         cfg.initPath = V2TIMString(init_path);
@@ -808,19 +832,15 @@ int tim2tox_ffi_init_with_path(const char* init_path) {
     manager_impl->AddSimpleMsgListener(&G.simple_listener);
     // Hook typing and file callbacks on this instance's ToxManager (per-instance so file recv routes correctly)
     RegisterToxManagerFileCallbacks(manager_impl);
-    
-    // IRC library will be loaded on demand when IRC app is installed
-    // Callbacks will be set up when library is loaded
-    
-    G.inited.store(true);
+    MarkInstanceInited(0);
     return 1;
 }
 
 int tim2tox_ffi_login(const char* user_id, const char* user_sig) {
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_login: ENTRY - user_id={}, user_sig={}, G.inited={}", user_id ? user_id : "(null)", user_sig ? "(provided)" : "(null)", G.inited.load());
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_login: ENTRY - user_id={}, user_sig={}, inited={}", user_id ? user_id : "(null)", user_sig ? "(provided)" : "(null)", IsCurrentInstanceInited());
 
-    if (!G.inited.load()) {
-        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_login: ERROR - G.inited is false, returning 0");
+    if (!IsCurrentInstanceInited()) {
+        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_login: ERROR - current instance not inited, returning 0");
         return 0;
     }
 
@@ -842,11 +862,45 @@ int tim2tox_ffi_login(const char* user_id, const char* user_sig) {
     return 1;
 }
 
-int tim2tox_ffi_add_friend(const char* user_id, const char* wording) {
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_add_friend: ENTRY - user_id={}, wording={}, G.inited={}", user_id ? user_id : "(null)", wording ? wording : "(null)", G.inited.load());
+int tim2tox_ffi_login_async(int64_t instance_id, const char* user_id, const char* user_sig, tim2tox_login_callback_t callback, void* user_data) {
+    int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) {
+        if (callback) callback(0, -1, "instance not found", user_data);
+        return 0;
+    }
+    if (!IsInstanceInited(id)) {
+        if (callback) callback(0, -2, "instance not inited", user_data);
+        return 0;
+    }
+    if (!user_id || !user_id[0]) {
+        if (callback) callback(0, -3, "user_id empty", user_data);
+        return 0;
+    }
+    struct LoginCb : public V2TIMCallback {
+        tim2tox_login_callback_t cb;
+        void* ud;
+        void OnSuccess() override {
+            if (cb) cb(1, 0, "", ud);
+        }
+        void OnError(int code, const V2TIMString& msg) override {
+            if (cb) {
+                std::string msg_copy(msg.CString());
+                cb(0, code, msg_copy.c_str(), ud);
+            }
+        }
+    } login_cb;
+    login_cb.cb = callback;
+    login_cb.ud = user_data;
+    manager->Login(user_id ? user_id : "", user_sig ? user_sig : "", &login_cb);
+    return 1;
+}
 
-    if (!G.inited.load() || !user_id) {
-        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_add_friend: ERROR - G.inited={}, user_id={}, returning 0", G.inited.load(), (void*)user_id);
+int tim2tox_ffi_add_friend(const char* user_id, const char* wording) {
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_add_friend: ENTRY - user_id={}, wording={}, inited={}", user_id ? user_id : "(null)", wording ? wording : "(null)", IsCurrentInstanceInited());
+
+    if (!IsCurrentInstanceInited() || !user_id) {
+        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_add_friend: ERROR - inited={}, user_id={}, returning 0", IsCurrentInstanceInited(), (void*)user_id);
         return 0;
     }
 
@@ -868,10 +922,10 @@ int tim2tox_ffi_add_friend(const char* user_id, const char* wording) {
 }
 
 int tim2tox_ffi_send_c2c_text(const char* user_id, const char* text) {
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_send_c2c_text: ENTRY - user_id={}, text_len={}, G.inited={}", user_id ? user_id : "(null)", text ? strlen(text) : 0, G.inited.load());
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_send_c2c_text: ENTRY - user_id={}, text_len={}, inited={}", user_id ? user_id : "(null)", text ? strlen(text) : 0, IsCurrentInstanceInited());
 
-    if (!G.inited.load() || !user_id || !text) {
-        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_send_c2c_text: ERROR - G.inited={}, user_id={}, text={}, returning 0", G.inited.load(), (void*)user_id, (void*)text);
+    if (!IsCurrentInstanceInited() || !user_id || !text) {
+        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_send_c2c_text: ERROR - inited={}, user_id={}, text={}, returning 0", IsCurrentInstanceInited(), (void*)user_id, (void*)text);
         return 0;
     }
 
@@ -897,7 +951,7 @@ int tim2tox_ffi_send_c2c_text(const char* user_id, const char* text) {
 }
 
 int tim2tox_ffi_send_c2c_custom(const char* user_id, const unsigned char* data, int data_len) {
-    if (!G.inited.load() || !user_id || !data || data_len <= 0) return 0;
+    if (!IsCurrentInstanceInited() || !user_id || !data || data_len <= 0) return 0;
     struct SendCb : public V2TIMSendCallback {
         void OnSuccess(const V2TIMMessage& m) override {
         }
@@ -915,17 +969,18 @@ int tim2tox_ffi_send_c2c_custom(const char* user_id, const unsigned char* data, 
 }
 
 int tim2tox_ffi_poll_text(int64_t instance_id, char* buffer, int buffer_len) {
-    if (!G.inited.load() || !buffer || buffer_len <= 0) return 0;
+    int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
+    if (!IsInstanceInited(id) || !buffer || buffer_len <= 0) return 0;
     return G.simple_listener.poll_text(instance_id, buffer, buffer_len);
 }
 
 int tim2tox_ffi_poll_custom(unsigned char* buffer, int buffer_len) {
-    if (!G.inited.load() || !buffer || buffer_len <= 0) return 0;
+    if (!IsCurrentInstanceInited() || !buffer || buffer_len <= 0) return 0;
     return G.simple_listener.poll_custom(buffer, buffer_len);
 }
 
 int tim2tox_ffi_get_login_user(char* buffer, int buffer_len) {
-    if (!G.inited.load() || !buffer || buffer_len <= 0) return 0;
+    if (!IsCurrentInstanceInited() || !buffer || buffer_len <= 0) return 0;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     auto uid = manager_impl->GetLoginUser();
     std::string s = uid.CString();
@@ -936,14 +991,14 @@ int tim2tox_ffi_get_login_user(char* buffer, int buffer_len) {
 }
 
 void tim2tox_ffi_uninit(void) {
-    if (!G.inited.load()) return;
+    if (!IsInstanceInited(0)) return;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     manager_impl->UnInitSDK();
-    G.inited.store(false);
+    MarkInstanceUninited(0);
 }
 
 void tim2tox_ffi_save_tox_profile(void) {
-    if (!G.inited.load()) return;
+    if (!IsCurrentInstanceInited()) return;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (manager_impl) {
         manager_impl->SaveToxProfile();
@@ -956,7 +1011,7 @@ void tim2tox_ffi_set_callback(tim2tox_event_cb cb, void* user_data) {
 }
 
 int tim2tox_ffi_get_friend_list(char* buffer, int buffer_len) {
-    if (!G.inited.load() || !buffer || buffer_len <= 0) return 0;
+    if (!IsCurrentInstanceInited() || !buffer || buffer_len <= 0) return 0;
     struct LCb : public V2TIMValueCallback<V2TIMFriendInfoVector> {
         std::string out;
         std::mutex m;
@@ -1004,7 +1059,7 @@ int tim2tox_ffi_get_friend_list(char* buffer, int buffer_len) {
 }
 
 int tim2tox_ffi_set_self_info(const char* nickname, const char* status_message) {
-    if (!G.inited.load()) return 0;
+    if (!IsCurrentInstanceInited()) return 0;
     V2TIMUserFullInfo info;
     if (nickname) info.nickName = nickname;
     if (status_message) info.selfSignature = status_message;
@@ -1023,7 +1078,7 @@ int tim2tox_ffi_save_friend_nickname(const char* friend_id, const char* nickname
     // Route via polling queue to avoid FFI callback from background thread
     // Flutter will poll and handle this event in its isolate
     // DO NOT call FFI callback directly from background thread - it will crash
-    if (!G.inited.load() || !friend_id || !nickname) return 0;
+    if (!IsCurrentInstanceInited() || !friend_id || !nickname) return 0;
     
     // Enqueue event via polling queue: "nickname_changed:<friend_id>:<nickname>"
     std::string line = std::string("nickname_changed:") + friend_id + ":" + nickname;
@@ -1036,7 +1091,7 @@ int tim2tox_ffi_save_friend_status_message(const char* friend_id, const char* st
     // Route via polling queue to avoid FFI callback from background thread
     // Flutter will poll and handle this event in its isolate
     // DO NOT call FFI callback directly from background thread - it will crash
-    if (!G.inited.load() || !friend_id || !status_message) return 0;
+    if (!IsCurrentInstanceInited() || !friend_id || !status_message) return 0;
     
     // Enqueue event via polling queue: "status_changed:<friend_id>:<status_message>"
     std::string line = std::string("status_changed:") + friend_id + ":" + status_message;
@@ -1072,19 +1127,20 @@ static int get_friend_applications_impl(V2TIMManager* manager, char* buffer, int
 }
 
 int tim2tox_ffi_get_friend_applications(char* buffer, int buffer_len) {
-    if (!G.inited.load() || !buffer || buffer_len <= 0) return 0;
+    if (!IsCurrentInstanceInited() || !buffer || buffer_len <= 0) return 0;
     return get_friend_applications_impl(GetCurrentInstance(), buffer, buffer_len);
 }
 
 int tim2tox_ffi_get_friend_applications_for_instance(int64_t instance_id, char* buffer, int buffer_len) {
-    if (!G.inited.load() || !buffer || buffer_len <= 0) return 0;
+    int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
+    if (!IsInstanceInited(id) || !buffer || buffer_len <= 0) return 0;
     V2TIMManager* manager = GetManagerForInstanceId(instance_id);
     if (!manager) return 0;
     return get_friend_applications_impl(manager, buffer, buffer_len);
 }
 
 int tim2tox_ffi_accept_friend(const char* user_id) {
-    if (!G.inited.load() || !user_id) return 0;
+    if (!IsCurrentInstanceInited() || !user_id) return 0;
     V2TIMFriendApplication app; app.userID = user_id;
     struct Cb : public V2TIMValueCallback<V2TIMFriendOperationResult> {
         void OnSuccess(const V2TIMFriendOperationResult& r) override {
@@ -1098,7 +1154,7 @@ int tim2tox_ffi_accept_friend(const char* user_id) {
 }
 
 int tim2tox_ffi_delete_friend(const char* user_id) {
-    if (!G.inited.load() || !user_id) return 0;
+    if (!IsCurrentInstanceInited() || !user_id) return 0;
     V2TIMStringVector ids; ids.PushBack(user_id);
     struct Cb : public V2TIMValueCallback<V2TIMFriendOperationResultVector> {
         void OnSuccess(const V2TIMFriendOperationResultVector& v) override {
@@ -1112,7 +1168,7 @@ int tim2tox_ffi_delete_friend(const char* user_id) {
 }
 
 int tim2tox_ffi_set_typing(const char* user_id, int typing_on) {
-    if (!G.inited.load() || !user_id) return 0;
+    if (!IsCurrentInstanceInited() || !user_id) return 0;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
     ToxManager* tox_manager = manager_impl->GetToxManager();
@@ -1129,7 +1185,7 @@ int tim2tox_ffi_set_typing(const char* user_id, int typing_on) {
 }
 
 int tim2tox_ffi_create_group(const char* group_name, const char* group_type, char* out_group_id, int out_len) {
-    if (!G.inited.load() || !out_group_id || out_len <= 0) {
+    if (!IsCurrentInstanceInited() || !out_group_id || out_len <= 0) {
         return 0;
     }
     struct Cb : public V2TIMValueCallback<V2TIMString> {
@@ -1201,7 +1257,7 @@ int tim2tox_ffi_create_group(const char* group_name, const char* group_type, cha
 }
 
 int tim2tox_ffi_join_group(const char* group_id, const char* request_msg) {
-    if (!G.inited.load() || !group_id) return 0;
+    if (!IsCurrentInstanceInited() || !group_id) return 0;
     struct Cb : public V2TIMCallback {
         void OnSuccess() override {}
         void OnError(int code, const V2TIMString& msg) override {
@@ -1214,7 +1270,7 @@ int tim2tox_ffi_join_group(const char* group_id, const char* request_msg) {
 }
 
 int tim2tox_ffi_send_group_text(const char* group_id, const char* text) {
-    if (!G.inited.load() || !group_id || !text) return 0;
+    if (!IsCurrentInstanceInited() || !group_id || !text) return 0;
     struct SendCb : public V2TIMSendCallback {
         void OnSuccess(const V2TIMMessage& m) override {}
         void OnError(int code, const V2TIMString& msg) override {
@@ -1226,70 +1282,37 @@ int tim2tox_ffi_send_group_text(const char* group_id, const char* text) {
     return 1;
 }
 
-// Update known groups list from Dart layer
-// This is called by Dart layer whenever knownGroups changes (e.g., after createGroup, joinGroup, quitGroup)
-// groups_str: newline-separated list of group IDs (e.g., "tox_0\ntox_1\ntox_2\n")
+// R-07: Update known groups in Core (FFI forwards to manager)
 int tim2tox_ffi_update_known_groups(int64_t instance_id, const char* groups_str) {
     if (!groups_str) return 0;
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
-    
-    std::lock_guard<std::mutex> lock(g_known_groups_mutex);
-    g_known_groups_list[instance_id].clear();
-    
-    // Parse newline-separated group IDs
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    std::vector<std::string> list;
     std::istringstream iss(groups_str);
     std::string line;
     while (std::getline(iss, line)) {
-        if (!line.empty()) {
-            // Remove trailing newline if present
-            if (!line.empty() && line.back() == '\n') {
-                line.pop_back();
-            }
-            if (!line.empty()) {
-                g_known_groups_list[instance_id].push_back(line);
-            }
-        }
+        if (!line.empty() && line.back() == '\n') line.pop_back();
+        if (!line.empty()) list.push_back(line);
     }
-    
-    return (int)g_known_groups_list[instance_id].size();
+    manager->SetKnownGroupIDs(list);
+    return (int)list.size();
 }
 
 extern "C" {
+// R-07: Read known groups from Core (FFI forwards to manager)
 int tim2tox_ffi_get_known_groups(int64_t instance_id, char* buffer, int buffer_len) {
-    if (!G.inited.load()) {
-        return 0;
-    }
-    
-    if (!buffer || buffer_len <= 0) {
-        return 0;
-    }
+    if (!buffer || buffer_len <= 0) return 0;
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
-    
-    // Simple approach: directly read from per-instance list synchronized from Dart layer
-    // No recursion, no complex callbacks, just a simple read
-    std::lock_guard<std::mutex> lock(g_known_groups_mutex);
-    
-    // Get the list for current instance (default to empty if not found)
-    auto it = g_known_groups_list.find(instance_id);
-    const std::vector<std::string>& groups = (it != g_known_groups_list.end()) ? it->second : std::vector<std::string>();
-    
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) { if (buffer_len > 0) buffer[0] = 0; return 0; }
+    std::vector<std::string> groups = manager->GetKnownGroupIDs();
     std::string result;
     for (const auto& group_id : groups) {
-        if (!group_id.empty()) {
-            result.append(group_id);
-            result.push_back('\n');
-        }
+        if (!group_id.empty()) { result.append(group_id); result.push_back('\n'); }
     }
-    
     int n = (int)std::min(result.size(), (size_t)(buffer_len - 1));
-    
-    if (n > 0) {
-        memcpy(buffer, result.data(), n);
-        buffer[n] = 0;
-    } else {
-        buffer[0] = 0;
-    }
-    
+    if (n > 0) { memcpy(buffer, result.data(), n); buffer[n] = 0; } else { buffer[0] = 0; }
     return n;
 }
 
@@ -1299,7 +1322,8 @@ int tim2tox_ffi_get_known_groups(int64_t instance_id, char* buffer, int buffer_l
 // out_len: size of output buffer (should be at least 65 for null terminator)
 // Returns: 1 on success, 0 on error
 int tim2tox_ffi_get_group_chat_id(int64_t instance_id, const char* group_id, char* out_chat_id, int out_len) {
-    if (!G.inited.load() || !group_id || !out_chat_id || out_len < 65) {
+    int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
+    if (!IsInstanceInited(id) || !group_id || !out_chat_id || out_len < 65) {
         return 0;
     }
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
@@ -1311,10 +1335,9 @@ int tim2tox_ffi_get_group_chat_id(int64_t instance_id, const char* group_id, cha
     V2TIMString groupIDStr(group_id);
     Tox_Group_Number group_number = UINT32_MAX;
     if (!manager_impl->GetGroupNumberFromID(groupIDStr, group_number)) {
-        // Try to get stored chat_id from persistence
-        extern int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id, const char* group_id, char* out_chat_id, int out_len);
+        // R-07: Try Core metadata for stored chat_id
         char stored_chat_id[65];
-        bool has_stored_chat_id = (tim2tox_ffi_get_group_chat_id_from_storage(instance_id, group_id, stored_chat_id, sizeof(stored_chat_id)) == 1);
+        bool has_stored_chat_id = manager_impl->GetGroupChatIdFromStorage(std::string(group_id), stored_chat_id, sizeof(stored_chat_id));
         
         if (has_stored_chat_id) {
             // Convert hex string to binary chat_id
@@ -1372,11 +1395,9 @@ int tim2tox_ffi_get_group_chat_id(int64_t instance_id, const char* group_id, cha
         
         // If still not found, the mapping is truly empty and we can't match
         if (group_number == UINT32_MAX) {
-            // Try to get stored chat_id from persistence and return it even if group not found
-            extern int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id, const char* group_id, char* out_chat_id, int out_len);
+            // R-07: Return stored chat_id from Core metadata even if group not found
             char stored_chat_id[65];
-            bool has_stored_chat_id = (tim2tox_ffi_get_group_chat_id_from_storage(instance_id, group_id, stored_chat_id, sizeof(stored_chat_id)) == 1);
-            
+            bool has_stored_chat_id = manager_impl->GetGroupChatIdFromStorage(std::string(group_id), stored_chat_id, sizeof(stored_chat_id));
             if (has_stored_chat_id) {
                 // Copy stored chat_id to output buffer
                 int copy_len = (int)std::min((size_t)(out_len - 1), strlen(stored_chat_id));
@@ -1417,25 +1438,13 @@ int tim2tox_ffi_get_group_chat_id(int64_t instance_id, const char* group_id, cha
     return 1;
 }
 
-// Store group chat_id to global storage (called from C++ when group is created)
+// R-07: Store group chat_id in Core (FFI forwards to manager); optionally notify Dart for persistence
 int tim2tox_ffi_set_group_chat_id(int64_t instance_id, const char* group_id, const char* chat_id) {
+    if (!group_id || !chat_id) return 0;
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
-    if (!group_id) {
-        V2TIM_LOG(kError, "[tim2tox_ffi] tim2tox_ffi_set_group_chat_id: group_id is NULL");
-    }
-    if (!chat_id) {
-        V2TIM_LOG(kError, "[tim2tox_ffi] tim2tox_ffi_set_group_chat_id: chat_id is NULL");
-    }
-    if (!group_id || !chat_id) {
-        V2TIM_LOG(kError, "[tim2tox_ffi] tim2tox_ffi_set_group_chat_id: EXIT - Returning 0 due to null parameters");
-        return 0;
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_chat_id_storage_mutex);
-        std::string group_id_str(group_id);
-        std::string chat_id_str(chat_id);
-        g_group_id_to_chat_id[instance_id][group_id_str] = chat_id_str;
-    }
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    manager->SetGroupChatIdInStorage(std::string(group_id), std::string(chat_id));
     std::ostringstream json;
     json << "{";
     json << "\"callback\":\"groupChatIdStored\",";
@@ -1454,64 +1463,22 @@ int tim2tox_ffi_set_group_chat_id(int64_t instance_id, const char* group_id, con
     return 1;
 }
 
-// Get group chat_id from storage (called from C++ to rebuild mapping).
-// Tries requested instance first; if not found, tries other instances (cross-instance
-// fallback) so a non-creator instance can join a public group by groupID.
+// R-07: Get group chat_id from Core metadata (FFI forwards to manager)
 int tim2tox_ffi_get_group_chat_id_from_storage(int64_t instance_id, const char* group_id, char* out_chat_id, int out_len) {
-    if (!group_id || !out_chat_id || out_len < 65) {
-        return 0;
-    }
+    if (!group_id || !out_chat_id || out_len < 65) return 0;
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
-    
-    const std::string group_id_str(group_id);
-    std::lock_guard<std::mutex> lock(g_chat_id_storage_mutex);
-    auto instance_it = g_group_id_to_chat_id.find(instance_id);
-    if (instance_it != g_group_id_to_chat_id.end()) {
-        auto it = instance_it->second.find(group_id_str);
-        if (it != instance_it->second.end()) {
-            const std::string& stored_id = it->second;
-            int copy_len = (int)std::min((size_t)(out_len - 1), stored_id.length());
-            memcpy(out_chat_id, stored_id.c_str(), copy_len);
-            out_chat_id[copy_len] = '\0';
-            return 1;
-        }
-    }
-    // Cross-instance fallback: try any other instance that has this group_id (e.g. in tests,
-    // Bob's instance can join a group created by Alice's instance by groupID). In a real
-    // single-instance client there are no other instances, so this loop finds nothing and
-    // behaviour is unchanged.
-    for (const auto& kv : g_group_id_to_chat_id) {
-        if (kv.first == instance_id) continue;
-        auto it = kv.second.find(group_id_str);
-        if (it != kv.second.end()) {
-            const std::string& stored_id = it->second;
-            int copy_len = (int)std::min((size_t)(out_len - 1), stored_id.length());
-            memcpy(out_chat_id, stored_id.c_str(), copy_len);
-            out_chat_id[copy_len] = '\0';
-            return 1;
-        }
-    }
-    return 0;
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    return manager->GetGroupChatIdFromStorage(std::string(group_id), out_chat_id, out_len) ? 1 : 0;
 }
 
-// Store group type to persistence (called from C++ when group is created)
-// group_id: group ID like "tox_6"
-// group_type: "group" (new API) or "conference" (old API)
-// Returns: 1 on success, 0 on error
+// R-07: Store group type in Core (FFI forwards to manager); notify Dart for persistence
 int tim2tox_ffi_set_group_type(int64_t instance_id, const char* group_id, const char* group_type) {
-    if (!group_id || !group_type) {
-        return 0;
-    }
+    if (!group_id || !group_type) return 0;
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
-    
-    // Store in memory (C++ layer)
-    {
-        std::lock_guard<std::mutex> lock(g_group_type_storage_mutex);
-        std::string group_id_str(group_id);
-        std::string group_type_str(group_type);
-        g_group_id_to_group_type[instance_id][group_id_str] = group_type_str;
-    }
-    
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    manager->SetGroupTypeInStorage(std::string(group_id), std::string(group_type));
     // Notify Dart layer to persist to SharedPreferences
     std::ostringstream json;
     json << "{";
@@ -1530,55 +1497,29 @@ int tim2tox_ffi_set_group_type(int64_t instance_id, const char* group_id, const 
     return 1;
 }
 
-// Get group type from global storage (called from C++ to determine group type)
+// R-07: Get group type from Core metadata (FFI forwards to manager)
 int tim2tox_ffi_get_group_type_from_storage(int64_t instance_id, const char* group_id, char* out_group_type, int out_len) {
-    if (!group_id || !out_group_type || out_len < 16) {
-        return 0;
-    }
+    if (!group_id || !out_group_type || out_len < 16) return 0;
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
-    
-    try {
-        std::lock_guard<std::mutex> lock(g_group_type_storage_mutex);
-        auto instance_it = g_group_id_to_group_type.find(instance_id);
-        if (instance_it != g_group_id_to_group_type.end()) {
-            auto it = instance_it->second.find(std::string(group_id));
-            if (it != instance_it->second.end()) {
-                const std::string& stored_type = it->second;
-                int copy_len = (int)std::min((size_t)(out_len - 1), stored_type.length());
-                memcpy(out_group_type, stored_type.c_str(), copy_len);
-                out_group_type[copy_len] = '\0';
-                return 1;
-            }
-        }
-        return 0;
-    } catch (const std::exception& e) {
-        return 0;
-    } catch (...) {
-        return 0;
-    }
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    return manager->GetGroupTypeFromStorage(std::string(group_id), out_group_type, out_len) ? 1 : 0;
 }
 
-// Set auto-accept group invites setting (called from Dart when setting changes)
+// R-07: Auto-accept setting in Core (FFI forwards to manager)
 int tim2tox_ffi_set_auto_accept_group_invites(int64_t instance_id, int enabled) {
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
-    
-    std::lock_guard<std::mutex> lock(g_auto_accept_group_invites_mutex);
-    g_auto_accept_group_invites[instance_id] = (enabled != 0);
-    V2TIM_LOG(kInfo, "[tim2tox_ffi] tim2tox_ffi_set_auto_accept_group_invites: set to {} for instance {}", enabled, (long long)instance_id);
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    manager->SetAutoAcceptGroupInvites(enabled != 0);
     return 1;
 }
 
-// Get auto-accept group invites setting (called from C++ before accepting invites)
 int tim2tox_ffi_get_auto_accept_group_invites(int64_t instance_id) {
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
-    
-    std::lock_guard<std::mutex> lock(g_auto_accept_group_invites_mutex);
-    auto it = g_auto_accept_group_invites.find(instance_id);
-    if (it != g_auto_accept_group_invites.end()) {
-        return it->second ? 1 : 0;
-    }
-    // Default to false if not set
-    return 0;
+    V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
+    if (!manager) return 0;
+    return manager->GetAutoAcceptGroupInvites() ? 1 : 0;
 }
 
 // Get count of conferences restored from savedata (for Dart to discover and assign group_ids)
@@ -1608,7 +1549,7 @@ int tim2tox_ffi_get_restored_conference_list(int64_t instance_id, uint32_t* out_
 }
 
 int tim2tox_ffi_rejoin_known_groups(void) {
-    if (!G.inited.load()) {
+    if (!IsCurrentInstanceInited()) {
         V2TIM_LOG(kError, "[ffi] rejoin_known_groups: SDK not initialized");
         return 0;
     }
@@ -1672,7 +1613,7 @@ int tim2tox_ffi_get_conference_peer_pubkeys(int64_t instance_id, uint32_t confer
 } // extern "C"
 
 int tim2tox_ffi_send_group_custom(const char* group_id, const unsigned char* data, int data_len) {
-    if (!G.inited.load() || !group_id || !data || data_len <= 0) return 0;
+    if (!IsCurrentInstanceInited() || !group_id || !data || data_len <= 0) return 0;
     struct SendCb : public V2TIMSendCallback {
         void OnSuccess(const V2TIMMessage& m) override { V2TIM_LOG(kInfo, "[ffi] SendGroupCustom ok, msgID={}", m.msgID.CString()); }
         void OnError(int code, const V2TIMString& msg) override { V2TIM_LOG(kInfo, "[ffi] SendGroupCustom err {}: {}", code, msg.CString()); }
@@ -1684,7 +1625,8 @@ int tim2tox_ffi_send_group_custom(const char* group_id, const unsigned char* dat
 }
 
 int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* file_path) {
-    if (!G.inited.load() || !user_id || !file_path) {
+    int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
+    if (!IsInstanceInited(id) || !user_id || !file_path) {
         V2TIM_LOG(kError, "[ffi] send_file: invalid arguments");
         return -1;
     }
@@ -1782,7 +1724,7 @@ int tim2tox_ffi_send_file(int64_t instance_id, const char* user_id, const char* 
 }
 
 int tim2tox_ffi_iterate_current_instance(int count) {
-    if (!G.inited.load() || count <= 0) return 0;
+    if (!IsCurrentInstanceInited() || count <= 0) return 0;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
     ToxManager* tox_manager = manager_impl->GetToxManager();
@@ -1794,7 +1736,7 @@ int tim2tox_ffi_iterate_current_instance(int count) {
 }
 
 int tim2tox_ffi_iterate_all_instances(int count) {
-    if (!G.inited.load() || count <= 0) return 0;
+    if (!IsCurrentInstanceInited() || count <= 0) return 0;
     std::vector<V2TIMManagerImpl*> copy;
     {
         std::lock_guard<std::mutex> lock(g_test_instances_mutex);
@@ -1815,7 +1757,7 @@ int tim2tox_ffi_iterate_all_instances(int count) {
 }
 
 int tim2tox_ffi_get_self_connection_status(void) {
-    if (!G.inited.load()) return 0;
+    if (!IsCurrentInstanceInited()) return 0;
     V2TIMManagerImpl* manager_impl = GetCurrentInstance();
     if (!manager_impl) return 0;
     ToxManager* tox_manager = manager_impl->GetToxManager();
@@ -1951,7 +1893,8 @@ extern "C" {
 // The old implementations have been removed from this file.
 
 int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t file_number, int control) {
-    if (!G.inited.load() || !user_id) {
+    int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
+    if (!IsInstanceInited(id) || !user_id) {
         V2TIM_LOG(kError, "[ffi] file_control: invalid arguments");
         return -1;
     }
@@ -2334,7 +2277,7 @@ int tim2tox_ffi_signaling_add_listener(
     tim2tox_signaling_timeout_callback_t on_timeout,
     void* user_data) {
     
-    if (!G.inited.load()) return 0;
+    if (!IsCurrentInstanceInited()) return 0;
     
     std::lock_guard<std::mutex> lock(g_signaling_callbacks_mutex);
     g_signaling_callbacks.on_invitation = on_invitation;
@@ -2353,7 +2296,7 @@ int tim2tox_ffi_signaling_add_listener(
 }
 
 void tim2tox_ffi_signaling_remove_listener(void) {
-    if (!G.inited.load()) return;
+    if (!IsCurrentInstanceInited()) return;
     
     auto* signaling_mgr = GetCurrentInstance()->GetSignalingManager();
     if (signaling_mgr) {
@@ -2368,8 +2311,8 @@ int tim2tox_ffi_signaling_invite(const char* invitee, const char* data, int onli
     V2TIM_LOG(kInfo, "[ffi] signaling_invite: called with invitee={}, data={}, timeout={}",
               invitee ? invitee : "(null)", data ? data : "(null)", timeout);
 
-    if (!G.inited.load()) {
-        V2TIM_LOG(kError, "[ffi] signaling_invite: G.inited is false");
+    if (!IsCurrentInstanceInited()) {
+        V2TIM_LOG(kError, "[ffi] signaling_invite: current instance not inited");
         return 0;
     }
 
@@ -2426,7 +2369,7 @@ int tim2tox_ffi_signaling_invite(const char* invitee, const char* data, int onli
 }
 
 int tim2tox_ffi_signaling_invite_in_group(const char* group_id, const char* invitee_list, const char* data, int online_user_only, int timeout, char* out_invite_id, int out_invite_id_len) {
-    if (!G.inited.load() || !group_id || !invitee_list || !out_invite_id || out_invite_id_len < 1) return 0;
+    if (!IsCurrentInstanceInited() || !group_id || !invitee_list || !out_invite_id || out_invite_id_len < 1) return 0;
     
     auto* signaling_mgr = GetCurrentInstance()->GetSignalingManager();
     if (!signaling_mgr) return 0;
@@ -2467,7 +2410,7 @@ int tim2tox_ffi_signaling_invite_in_group(const char* group_id, const char* invi
 }
 
 int tim2tox_ffi_signaling_cancel(const char* invite_id, const char* data) {
-    if (!G.inited.load() || !invite_id) return 0;
+    if (!IsCurrentInstanceInited() || !invite_id) return 0;
     
     auto* signaling_mgr = GetCurrentInstance()->GetSignalingManager();
     if (!signaling_mgr) return 0;
@@ -2487,7 +2430,7 @@ int tim2tox_ffi_signaling_cancel(const char* invite_id, const char* data) {
 }
 
 int tim2tox_ffi_signaling_accept(const char* invite_id, const char* data) {
-    if (!G.inited.load() || !invite_id) return 0;
+    if (!IsCurrentInstanceInited() || !invite_id) return 0;
     
     auto* signaling_mgr = GetCurrentInstance()->GetSignalingManager();
     if (!signaling_mgr) return 0;
@@ -2507,7 +2450,7 @@ int tim2tox_ffi_signaling_accept(const char* invite_id, const char* data) {
 }
 
 int tim2tox_ffi_signaling_reject(const char* invite_id, const char* data) {
-    if (!G.inited.load() || !invite_id) return 0;
+    if (!IsCurrentInstanceInited() || !invite_id) return 0;
     
     auto* signaling_mgr = GetCurrentInstance()->GetSignalingManager();
     if (!signaling_mgr) return 0;
@@ -2566,11 +2509,12 @@ namespace {
 }
 
 int tim2tox_ffi_av_initialize(int64_t instance_id) {
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_initialize() called, G.inited={}", G.inited.load() ? 1 : 0);
-    bool inited = G.inited.load();
-    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_initialize() G.inited.load() returned {}", inited ? 1 : 0);
+    int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_initialize() called, instance_id={}, inited={}", (long long)id, IsInstanceInited(id) ? 1 : 0);
+    bool inited = IsInstanceInited(id);
+    V2TIM_LOG(kInfo, "[ffi] tim2tox_ffi_av_initialize() IsCurrentInstanceInited() returned {}", inited ? 1 : 0);
     if (!inited) {
-        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_av_initialize() failed: G.inited is false");
+        V2TIM_LOG(kError, "[ffi] tim2tox_ffi_av_initialize() failed: instance not inited");
         return 0;
     }
     if (instance_id == 0) instance_id = GetCurrentInstanceId();
@@ -2935,8 +2879,8 @@ void tim2tox_ffi_av_set_video_receive_callback(int64_t instance_id, tim2tox_av_v
 uint32_t tim2tox_ffi_get_friend_number_by_user_id(const char* user_id) {
     V2TIM_LOG(kInfo, "[ffi] get_friend_number_by_user_id: called with user_id={}", user_id ? user_id : "(null)");
     
-    if (!G.inited.load()) {
-        V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: G.inited is false");
+    if (!IsCurrentInstanceInited()) {
+        V2TIM_LOG(kError, "[ffi] get_friend_number_by_user_id: current instance not inited");
         return UINT32_MAX;
     }
     
@@ -3048,8 +2992,8 @@ uint32_t tim2tox_ffi_get_friend_number_by_user_id(const char* user_id) {
 const char* tim2tox_ffi_get_user_id_by_friend_number(uint32_t friend_number) {
     V2TIM_LOG(kInfo, "[ffi] get_user_id_by_friend_number: called with friend_number={}", friend_number);
 
-    if (!G.inited.load()) {
-        V2TIM_LOG(kError, "[ffi] get_user_id_by_friend_number: G.inited is false");
+    if (!IsCurrentInstanceInited()) {
+        V2TIM_LOG(kError, "[ffi] get_user_id_by_friend_number: current instance not inited");
         return nullptr;
     }
 
@@ -3243,7 +3187,7 @@ static void on_dht_nodes_response_internal(Tox* tox, const uint8_t* public_key, 
 }
 
 int tim2tox_ffi_dht_send_nodes_request(const char* public_key, const char* ip, uint16_t port, const char* target_public_key) {
-    if (!G.inited.load()) {
+    if (!IsCurrentInstanceInited()) {
         V2TIM_LOG(kError, "[ffi] dht_send_nodes_request: SDK not initialized");
         return 0;
     }

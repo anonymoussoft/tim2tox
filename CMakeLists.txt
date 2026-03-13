@@ -1,6 +1,15 @@
-cmake_minimum_required(VERSION 3.4.1)
+cmake_minimum_required(VERSION 3.16)
 
 project(tim2tox VERSION 0.1.0 LANGUAGES C CXX)
+
+# Single source of truth for version: generated/version.h is included by source
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/generated)
+configure_file(
+  ${CMAKE_SOURCE_DIR}/source/version.h.in
+  ${CMAKE_BINARY_DIR}/generated/version.h
+  @ONLY
+)
+include_directories(${CMAKE_BINARY_DIR}/generated)
 
 # Set C/C++ standards
 set(CMAKE_C_STANDARD 11)
@@ -143,7 +152,7 @@ if(BUILD_FFI)
 endif()
 
 # Add test directory if testing is enabled
-option(BUILD_TESTS "Build tests" ON)
-if(BUILD_TESTS)
+option(TIM2TOX_BUILD_TESTS "Build tim2tox test suite" OFF)
+if(TIM2TOX_BUILD_TESTS)
   add_subdirectory(test)
 endif()

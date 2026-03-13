@@ -39,51 +39,15 @@ void DartNotifyGroupQuit(const char* group_id);
 // This is defined here so it can be accessed from tim2tox_ffi.cpp
 thread_local bool V2TIMGroupManagerImpl_in_get_known_groups_call = false;
 
-// Thread-safe singleton implementation using std::once_flag
-// This ensures the instance is fully constructed before any thread can access it
-V2TIMGroupManagerImpl* V2TIMGroupManagerImpl::GetInstance() {
-    // 不能使用静态局部变量创建抽象类实例，使用动态分配内存
-    // Use std::call_once to ensure thread-safe initialization
-    static std::once_flag init_flag;
-    static V2TIMGroupManagerImpl* instance = nullptr;
-    
-    std::call_once(init_flag, []() {
-        instance = new V2TIMGroupManagerImpl(); // 注意：这里会导致内存泄漏，但因为是单例模式，程序运行期间不会释放
-    });
-    
-    return instance;
-}
-
-////////////////////////////// 初始化数据库 //////////////////////////////
-V2TIMGroupManagerImpl::V2TIMGroupManagerImpl(V2TIMManagerImpl* manager_impl) : manager_impl_(manager_impl) {
-    V2TIM_LOG(kInfo, "[V2TIMGroupManagerImpl] Constructor ENTRY this={} manager_impl={}", static_cast<void*>(this), static_cast<void*>(manager_impl));
+// Constructor (R-06: owned by V2TIMManagerImpl, no singleton)
+V2TIMGroupManagerImpl::V2TIMGroupManagerImpl(V2TIMManagerImpl* owner) : manager_impl_(owner) {
+    V2TIM_LOG(kInfo, "[V2TIMGroupManagerImpl] Constructor ENTRY this={} owner={}", static_cast<void*>(this), static_cast<void*>(owner));
 
     // Store reference to manager_impl for accessing group mappings
     // Note: group_mutex_, member_mutex_, mute_mutex_ are automatically initialized by default constructor
 
     V2TIM_LOG(kInfo, "[V2TIMGroupManagerImpl] Constructor Mutexes initialized");
     V2TIM_LOG(kInfo, "[V2TIMGroupManagerImpl] Constructor COMPLETE this={}", static_cast<void*>(this));
-}
-
-void V2TIMGroupManagerImpl::SetManagerImpl(V2TIMManagerImpl* manager_impl) {
-    V2TIMManagerImpl* old_impl = manager_impl_;
-    if (manager_impl != old_impl) {
-        {
-            std::lock_guard<std::mutex> lock(group_mutex_);
-            groups_.clear();
-            // Do not clear group_info_: same groupID is shared across instances; clearing would
-            // drop EnsureGroupInfoExists/UpdateGroupInfoFromTopic data and break getGroupsInfo fallback.
-        }
-        {
-            std::lock_guard<std::mutex> lock(member_mutex_);
-            group_members_.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lock(mute_mutex_);
-            muted_members_.clear();
-        }
-    }
-    manager_impl_ = manager_impl;
 }
 
 // Helper function to get ToxManager from manager_impl_ or default instance
@@ -281,7 +245,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
             // CRITICAL: Also store to persistent storage via FFI
             // This ensures chat_id is available after app restart
             // Function is already declared with extern "C" at file scope
-            tim2tox_ffi_set_group_chat_id(GetInstanceIdFromManager(manager_impl_), finalGroupID.CString(), chat_id_hex.c_str());
+            manager_impl_->SetGroupChatIdInStorage(finalGroupID.CString(), chat_id_hex);
             V2TIM_LOG(kInfo, "CreateGroup: Stored chat_id to persistent storage for groupID={}, chat_id={}",
                      finalGroupID.CString(), chat_id_hex);
         }
@@ -298,7 +262,7 @@ void V2TIMGroupManagerImpl::CreateGroup(const V2TIMGroupInfo& info,
     
     // Store groupType to persistent storage
     // Function is already declared with extern "C" at file scope
-    tim2tox_ffi_set_group_type(GetInstanceIdFromManager(manager_impl_), finalGroupID.CString(), group_type.c_str());
+    manager_impl_->SetGroupTypeInStorage(finalGroupID.CString(), group_type);
     V2TIM_LOG(kInfo, "CreateGroup: Stored groupType to persistent storage for groupID={}, groupType={}",
              finalGroupID.CString(), group_type);
     
@@ -426,7 +390,7 @@ void V2TIMGroupManagerImpl::GetGroupsInfo(const V2TIMStringVector& groupIDList,
                         // Try to get from storage
                         // Function is already declared with extern "C" at file scope
                         char stored_type[16];
-                        if (tim2tox_ffi_get_group_type_from_storage(GetInstanceIdFromManager(manager_impl_), groupID.c_str(), stored_type, sizeof(stored_type)) == 1) {
+                        if (manager_impl_->GetGroupTypeFromStorage(groupID, stored_type, sizeof(stored_type))) {
                             group_type = std::string(stored_type);
                         }
                     }
@@ -450,30 +414,12 @@ void V2TIMGroupManagerImpl::GetGroupsInfo(const V2TIMStringVector& groupIDList,
                     }
                 }
             } else {
-                // Group not found in group_info_ map, check if it's in known groups list
-                // This handles the case where group exists but info hasn't been loaded yet
-                char known_groups_buffer[4096];
-                int known_groups_len = tim2tox_ffi_get_known_groups(GetInstanceIdFromManager(manager_impl_), known_groups_buffer, sizeof(known_groups_buffer) - 1);
-                
+                // R-07: Check if groupID is in Core known groups list
                 bool found_in_known = false;
-                if (known_groups_len > 0) {
-                    known_groups_buffer[known_groups_len] = '\0';
-                    std::string known_groups_str(known_groups_buffer);
-                    
-                    // Check if groupID is in the known groups list (newline-separated)
-                    // Format: "groupID1\ngroupID2\ngroupID3\n"
-                    std::string search_pattern = "\n" + groupID + "\n";
-                    
-                    if (known_groups_str.find(search_pattern) != std::string::npos) {
-                        found_in_known = true;
-                    } else if (known_groups_str.length() >= groupID.length() + 1 && 
-                               known_groups_str.substr(0, groupID.length() + 1) == groupID + "\n") {
-                        // Check if groupID is at the beginning
-                        found_in_known = true;
-                    } else if (known_groups_str.length() >= groupID.length() + 1 &&
-                               known_groups_str.substr(known_groups_str.length() - groupID.length() - 1) == "\n" + groupID) {
-                        // Check if groupID is at the end (without trailing newline)
-                        found_in_known = true;
+                if (manager_impl_) {
+                    std::vector<std::string> known = manager_impl_->GetKnownGroupIDs();
+                    for (const auto& g : known) {
+                        if (g == groupID) { found_in_known = true; break; }
                     }
                 }
                 
@@ -485,7 +431,7 @@ void V2TIMGroupManagerImpl::GetGroupsInfo(const V2TIMStringVector& groupIDList,
                         // Try to get stored chat_id for this groupID
                         // Function is already declared with extern "C" at file scope
                         char stored_chat_id[65];
-                        bool has_stored_chat_id = (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(manager_impl_), groupID.c_str(), stored_chat_id, sizeof(stored_chat_id)) == 1);
+                        bool has_stored_chat_id = manager_impl_->GetGroupChatIdFromStorage(groupID, stored_chat_id, sizeof(stored_chat_id));
                         
                         if (has_stored_chat_id) {
                             // Convert hex string to binary chat_id
@@ -552,7 +498,7 @@ void V2TIMGroupManagerImpl::GetGroupsInfo(const V2TIMStringVector& groupIDList,
                                         
                                         // Store the chat_id for this groupID (via FFI)
                                         // Function is already declared with extern "C" at file scope
-                                        tim2tox_ffi_set_group_chat_id(GetInstanceIdFromManager(manager_impl_), groupID.c_str(), chat_id_hex.c_str());
+                                        manager_impl_->SetGroupChatIdInStorage(groupID, chat_id_hex);
                                         
                                         // Rebuild the mapping
                                         manager_impl_->group_id_to_group_number_[V2TIMString(groupID.c_str())] = group_num;
@@ -576,7 +522,7 @@ void V2TIMGroupManagerImpl::GetGroupsInfo(const V2TIMStringVector& groupIDList,
                     // Try to get group type from storage
                     // Function is already declared with extern "C" at file scope
                     char stored_type[16];
-                    if (tim2tox_ffi_get_group_type_from_storage(GetInstanceIdFromManager(manager_impl_), groupID.c_str(), stored_type, sizeof(stored_type)) == 1) {
+                    if (manager_impl_->GetGroupTypeFromStorage(groupID, stored_type, sizeof(stored_type))) {
                         result.info.groupType = V2TIMString(stored_type);
                     } else {
                         result.info.groupType = V2TIMString("group"); // Default to group type
@@ -669,7 +615,7 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
         // Try to get stored chat_id for this groupID
         // Function is already declared with extern "C" at file scope
         char stored_chat_id[65];
-        bool has_stored_chat_id = (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(manager_impl_), groupID_str.c_str(), stored_chat_id, sizeof(stored_chat_id)) == 1);
+        bool has_stored_chat_id = manager_impl_->GetGroupChatIdFromStorage(groupID_str, stored_chat_id, sizeof(stored_chat_id));
         
         if (has_stored_chat_id) {
             V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Found stored chat_id for groupID={}: {}", groupID_str, stored_chat_id);
@@ -695,32 +641,15 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
         } else {
             V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: No stored chat_id found for groupID={}, trying fallback matching", groupID_str);
             
-            // Fallback: If no stored chat_id, try to match by group count
-            // This is a last resort - only works if there's exactly one group in Tox and one group in knownGroups
-            // WARNING: This is not reliable for multiple groups, but better than nothing
+            // Fallback: If no stored chat_id, try to match by group count (R-07: use Core metadata)
             size_t group_count = GetToxManagerFromImpl(manager_impl_)->getGroupListSize();
-            if (group_count > 0) {
-                // Check if this groupID is in known groups and if there's only one unmapped group
-                // Function is already declared with extern "C" at file scope
-                char known_groups_buffer[4096];
-                int known_groups_len = tim2tox_ffi_get_known_groups(GetInstanceIdFromManager(manager_impl_), known_groups_buffer, sizeof(known_groups_buffer));
+            if (group_count > 0 && manager_impl_) {
+                std::vector<std::string> known = manager_impl_->GetKnownGroupIDs();
+                bool found_in_known = false;
+                for (const auto& line : known) {
+                    if (line == groupID_str) { found_in_known = true; break; }
+                }
                 
-                if (known_groups_len > 0) {
-                    std::string known_groups_str(known_groups_buffer, known_groups_len);
-                    std::istringstream iss(known_groups_str);
-                    std::string line;
-                    bool found_in_known = false;
-                    
-                    while (std::getline(iss, line)) {
-                        if (!line.empty() && line.back() == '\n') {
-                            line.pop_back();
-                        }
-                        if (line.empty()) continue;
-                        if (line == groupID_str) {
-                            found_in_known = true;
-                        }
-                    }
-                    
                     // If this group is in known groups, and there's exactly one group in Tox
                     // and no other groups are mapped, we can try to match it
                     if (found_in_known && group_count == 1) {
@@ -764,7 +693,7 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
                                     
                                     // Store chat_id for future use
                                     // Function is already declared with extern "C" at file scope
-                                    tim2tox_ffi_set_group_chat_id(GetInstanceIdFromManager(manager_impl_), groupID_str.c_str(), chat_id_hex.c_str());
+                                    manager_impl_->SetGroupChatIdInStorage(groupID_str, chat_id_hex);
                                     V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Stored chat_id={} for groupID={} for future use",
                                               chat_id_hex, groupID_str);
                                 }
@@ -776,7 +705,6 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
                     } else if (found_in_known && group_count > 1) {
                         V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Cannot use fallback - multiple groups in Tox ({}), need chat_id to match", group_count);
                     }
-                }
             }
         }
     }
@@ -799,7 +727,7 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
     if (group_type == "group") {
         // Function is already declared with extern "C" at file scope
         char stored_type[16];
-        if (tim2tox_ffi_get_group_type_from_storage(GetInstanceIdFromManager(manager_impl_), groupID.CString(), stored_type, sizeof(stored_type)) == 1) {
+        if (manager_impl_->GetGroupTypeFromStorage(groupID.CString(), stored_type, sizeof(stored_type))) {
             group_type = std::string(stored_type);
         }
     }
@@ -936,7 +864,7 @@ void V2TIMGroupManagerImpl::DismissGroup(const V2TIMString& groupID, V2TIMCallba
 
     if (group_type == "group") {
         char stored_type[16];
-        if (tim2tox_ffi_get_group_type_from_storage(GetInstanceIdFromManager(manager_impl_), group_id_str.c_str(), stored_type, sizeof(stored_type)) == 1) {
+        if (manager_impl_->GetGroupTypeFromStorage(group_id_str, stored_type, sizeof(stored_type))) {
             group_type = std::string(stored_type);
             V2TIM_LOG(kInfo, "DismissGroup: Found group_type={} from storage", group_type);
         } else {
@@ -1067,37 +995,26 @@ void V2TIMGroupManagerImpl::GetJoinedGroupList(V2TIMValueCallback<V2TIMGroupInfo
         // Try to rebuild mappings for all known groups from Dart layer
         // This is critical for startup when groups are restored from persistence but mappings are empty
         if (manager_impl_) {
-            // Function is already declared with extern "C" at file scope
-            char known_groups_buffer[4096];
-            int known_groups_len = tim2tox_ffi_get_known_groups(GetInstanceIdFromManager(manager_impl_), known_groups_buffer, sizeof(known_groups_buffer));
-            
-            if (known_groups_len > 0) {
-                std::string known_groups_str(known_groups_buffer, known_groups_len);
-                std::istringstream iss(known_groups_str);
-                std::string line;
+            std::vector<std::string> known_list = manager_impl_->GetKnownGroupIDs();
+            if (!known_list.empty()) {
                 int rebuilt_count = 0;
+                V2TIM_LOG(kInfo, "GetJoinedGroupList: Attempting to rebuild mappings for known groups (R-07: Core metadata)");
                 
-                V2TIM_LOG(kInfo, "GetJoinedGroupList: Attempting to rebuild mappings for known groups from Dart layer");
-                
-                while (std::getline(iss, line)) {
-                    if (!line.empty() && line.back() == '\n') {
-                        line.pop_back();
-                    }
-                    if (line.empty()) continue;
+                for (const auto& line : known_list) {
+                    std::string line_trimmed = line;
+                    while (!line_trimmed.empty() && line_trimmed.back() == '\n') line_trimmed.pop_back();
+                    if (line_trimmed.empty()) continue;
                     
                     // Check if this groupID already has a mapping
                     {
                         std::lock_guard<std::mutex> lock(manager_impl_->mutex_);
-                        if (manager_impl_->group_id_to_group_number_.find(V2TIMString(line.c_str())) != manager_impl_->group_id_to_group_number_.end()) {
-                            // Mapping already exists, skip
+                        if (manager_impl_->group_id_to_group_number_.find(V2TIMString(line_trimmed.c_str())) != manager_impl_->group_id_to_group_number_.end()) {
                             continue;
                         }
                     }
                     
-                    // Try to get stored chat_id for this groupID
-                    // Function is already declared with extern "C" at file scope
                     char stored_chat_id[65];
-                    bool has_stored_chat_id = (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(manager_impl_), line.c_str(), stored_chat_id, sizeof(stored_chat_id)) == 1);
+                    bool has_stored_chat_id = manager_impl_->GetGroupChatIdFromStorage(line_trimmed, stored_chat_id, sizeof(stored_chat_id));
                     
                     if (has_stored_chat_id) {
                         // Convert hex string to binary chat_id
@@ -1109,27 +1026,25 @@ void V2TIMGroupManagerImpl::GetJoinedGroupList(V2TIMValueCallback<V2TIMGroupInfo
                                 // Rebuild the mapping
                                 {
                                     std::lock_guard<std::mutex> lock(manager_impl_->mutex_);
-                                    manager_impl_->group_id_to_group_number_[V2TIMString(line.c_str())] = matched_group_number;
-                                    manager_impl_->group_number_to_group_id_[matched_group_number] = V2TIMString(line.c_str());
+                                    manager_impl_->group_id_to_group_number_[V2TIMString(line_trimmed.c_str())] = matched_group_number;
+                                    manager_impl_->group_number_to_group_id_[matched_group_number] = V2TIMString(line_trimmed.c_str());
                                     
-                                    // Also store chat_id mapping
-                                    manager_impl_->group_id_to_chat_id_[V2TIMString(line.c_str())] = std::vector<uint8_t>(target_chat_id, target_chat_id + TOX_GROUP_CHAT_ID_SIZE);
+                                    manager_impl_->group_id_to_chat_id_[V2TIMString(line_trimmed.c_str())] = std::vector<uint8_t>(target_chat_id, target_chat_id + TOX_GROUP_CHAT_ID_SIZE);
                                     std::string chat_id_hex = chatIdToHexString(target_chat_id);
-                                    manager_impl_->chat_id_to_group_id_[chat_id_hex] = V2TIMString(line.c_str());
+                                    manager_impl_->chat_id_to_group_id_[chat_id_hex] = V2TIMString(line_trimmed.c_str());
                                 }
                                 rebuilt_count++;
                                 V2TIM_LOG(kInfo, "GetJoinedGroupList: Rebuilt mapping for groupID={} <-> group_number={}, chat_id={}",
-                                         line, matched_group_number, stored_chat_id);
+                                         line_trimmed, matched_group_number, stored_chat_id);
                                 
-                                // Add to groupIDs list
-                                groupIDs.push_back(line);
+                                groupIDs.push_back(line_trimmed);
                             } else {
                                 V2TIM_LOG(kInfo, "GetJoinedGroupList: GroupID={} has stored chat_id={} but group not found in Tox yet",
-                                          line, stored_chat_id);
+                                          line_trimmed, stored_chat_id);
                             }
                         }
                     } else {
-                        V2TIM_LOG(kInfo, "GetJoinedGroupList: GroupID={} has no stored chat_id, cannot rebuild mapping", line);
+                        V2TIM_LOG(kInfo, "GetJoinedGroupList: GroupID={} has no stored chat_id, cannot rebuild mapping", line_trimmed);
                     }
                 }
                 
@@ -1604,7 +1519,7 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
         // Try to get stored chat_id for this groupID (use target_manager_impl so we read current instance's storage after restart)
         // Function is already declared with extern "C" at file scope
         char stored_chat_id[65];
-        has_stored_chat_id = (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(target_manager_impl), groupID_str.c_str(), stored_chat_id, sizeof(stored_chat_id)) == 1);
+        has_stored_chat_id = target_manager_impl->GetGroupChatIdFromStorage(groupID_str, stored_chat_id, sizeof(stored_chat_id));
         
         V2TIM_LOG(kInfo, "[GetGroupMemberList] Checking stored chat_id for groupID={} has_stored_chat_id={}", groupID_str, has_stored_chat_id ? 1 : 0);
 
@@ -1682,7 +1597,7 @@ void V2TIMGroupManagerImpl::GetGroupMemberList(
                         V2TIM_LOG(kInfo, "[GetGroupMemberList] Fallback 2: Found unmapped group_number={} with chat_id={}, assigning to groupID={}",
                                   group_num, chat_id_hex, groupID_str);
 
-                        tim2tox_ffi_set_group_chat_id(GetInstanceIdFromManager(target_manager_impl), groupID_str.c_str(), chat_id_hex.c_str());
+                        target_manager_impl->SetGroupChatIdInStorage(groupID_str, chat_id_hex);
 
                         lookup_impl->group_id_to_group_number_[V2TIMString(groupID_str.c_str())] = group_num;
                         lookup_impl->group_number_to_group_id_[group_num] = V2TIMString(groupID_str.c_str());
@@ -2609,7 +2524,7 @@ void V2TIMGroupManagerImpl::InviteUserToGroup(
         // Try to get stored chat_id for this groupID
         // Function is already declared with extern "C" at file scope
         char stored_chat_id[65];
-        has_stored_chat_id = (tim2tox_ffi_get_group_chat_id_from_storage(GetInstanceIdFromManager(manager_impl_), group_id_str.c_str(), stored_chat_id, sizeof(stored_chat_id)) == 1);
+        has_stored_chat_id = manager_impl_->GetGroupChatIdFromStorage(group_id_str, stored_chat_id, sizeof(stored_chat_id));
         
         V2TIM_LOG(kInfo, "[InviteUserToGroup] Checking stored chat_id for groupID={} has_stored_chat_id={}", group_id_str, has_stored_chat_id ? 1 : 0);
 
@@ -2676,7 +2591,7 @@ void V2TIMGroupManagerImpl::InviteUserToGroup(
                         std::string chat_id_hex = oss.str();
 
                         V2TIM_LOG(kInfo, "[InviteUserToGroup] Fallback 2: Found unmapped group_number={} chat_id={} assigning to groupID={}", group_num, chat_id_hex, group_id_str);
-                        tim2tox_ffi_set_group_chat_id(GetInstanceIdFromManager(manager_impl_), group_id_str.c_str(), chat_id_hex.c_str());
+                        manager_impl_->SetGroupChatIdInStorage(group_id_str, chat_id_hex);
                         manager_impl_->group_id_to_group_number_[V2TIMString(group_id_str.c_str())] = group_num;
                         manager_impl_->group_number_to_group_id_[group_num] = V2TIMString(group_id_str.c_str());
                         matched_group_number = group_num;
@@ -2762,9 +2677,7 @@ void V2TIMGroupManagerImpl::InviteUserToGroup(
         // Fallback: check persistent storage if not in memory map
         if (!is_conference_group) {
             char stored_type[32];
-            if (tim2tox_ffi_get_group_type_from_storage(
-                    GetInstanceIdFromManager(manager_impl_), group_id_str.c_str(),
-                    stored_type, sizeof(stored_type)) == 1) {
+            if (manager_impl_->GetGroupTypeFromStorage(group_id_str, stored_type, sizeof(stored_type))) {
                 is_conference_group = (std::string(stored_type) == "conference");
             }
         }

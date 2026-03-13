@@ -26,10 +26,8 @@ static constexpr int ERR_SDK_COMMUNITY_NOT_FOUND = -103;
 
 class V2TIMCommunityManagerImpl : public V2TIMCommunityManager {
 public:
-    static V2TIMCommunityManagerImpl& getInstance();
-    
-    // Multi-instance support: Set the associated V2TIMManagerImpl instance
-    void SetManagerImpl(V2TIMManagerImpl* manager_impl);
+    explicit V2TIMCommunityManagerImpl(V2TIMManagerImpl* owner);
+    ~V2TIMCommunityManagerImpl() override;
     
     // Friend function to access private members
     friend ToxManager* community::GetToxManager(V2TIMCommunityManagerImpl* self);
@@ -105,8 +103,6 @@ public:
                                            V2TIMValueCallback<V2TIMTopicPermissionResultVector>* callback) override;
 
 private:
-    V2TIMCommunityManagerImpl();
-    ~V2TIMCommunityManagerImpl() = default;
     
     // Prevent copying
     V2TIMCommunityManagerImpl(const V2TIMCommunityManagerImpl&) = delete;

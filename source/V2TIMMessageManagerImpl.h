@@ -27,8 +27,7 @@ private:
     uint32_t GetConferenceNumber(const V2TIMString& groupID);
 
 public:
-    // Singleton Instance
-    static V2TIMMessageManagerImpl* GetInstance();
+    explicit V2TIMMessageManagerImpl(V2TIMManagerImpl* owner);
 
     // Destructor
     ~V2TIMMessageManagerImpl() override;
@@ -107,12 +106,7 @@ public:
     // Used by V2TIMManagerImpl::HandleFriendMessage / HandleGroupMessage
     void NotifyAdvancedListenersReceivedMessage(const V2TIMMessage& message);
 
-    // Multi-instance support: Set the associated V2TIMManagerImpl instance
-    void SetManagerImpl(V2TIMManagerImpl* manager_impl);
-
 private:
-    // Private constructor for singleton
-    V2TIMMessageManagerImpl();
 
     // Delete copy/move constructors and assignment operators
     V2TIMMessageManagerImpl(const V2TIMMessageManagerImpl&) = delete;

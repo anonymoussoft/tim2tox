@@ -18,6 +18,11 @@
 #include "V2TIMCommunityManager.h"
 
 class V2TIMSignalingManagerImpl;
+class V2TIMMessageManagerImpl;
+class V2TIMGroupManagerImpl;
+class V2TIMConversationManagerImpl;
+class V2TIMCommunityManagerImpl;
+class V2TIMFriendshipManagerImpl;
 #include "ToxManager.h"
 #include <memory>
 #include <vector>
@@ -118,8 +123,17 @@ public:
     void NotifyGroupMemberKicked(const V2TIMString& groupID, const V2TIMGroupMemberInfoVector& memberList);
     
     // Helper method to get all group IDs from mapping (for GetJoinedGroupList)
-    // This ensures we use the correct group IDs instead of generating from group_number
     std::vector<V2TIMString> GetAllGroupIDs();
+
+    // R-07: Instance metadata (Core-owned; FFI forwards to these)
+    std::vector<std::string> GetKnownGroupIDs();
+    void SetKnownGroupIDs(const std::vector<std::string>& group_ids);
+    bool GetGroupChatIdFromStorage(const std::string& group_id, char* out_chat_id_hex, int out_len);
+    void SetGroupChatIdInStorage(const std::string& group_id, const std::string& chat_id_hex);
+    bool GetGroupTypeFromStorage(const std::string& group_id, char* out_type, int out_len);
+    void SetGroupTypeInStorage(const std::string& group_id, const std::string& group_type);
+    bool GetAutoAcceptGroupInvites();
+    void SetAutoAcceptGroupInvites(bool enabled);
     
 #ifdef BUILD_TOXAV
     // Helper to resolve group_number (e.g. conference_number) to groupID (for AV callbacks)
@@ -129,12 +143,21 @@ public:
     // Helper method to get ToxManager instance (for internal use)
     ToxManager* GetToxManager() { return tox_manager_.get(); }
 
+    /** Generate a unique message ID (instance + time + seq). Safe for multi-instance. */
+    std::string MakeMessageId();
+    /** Generate a unique group/send ID (instance + seq). Safe for multi-instance. */
+    std::string MakeGroupId();
+
     // Save Tox profile to disk (call after friend list changes to persist state)
     void SaveToxProfile();
     
-    /** Run a function on the event thread (tox iterate loop). Use to avoid deadlock when calling tox API from another thread. */
+    /** Run a function on the event thread (tox iterate loop). Use to avoid deadlock when calling tox API from another thread.
+     *  If already on the event thread, runs f() inline to avoid self-deadlock. */
     template<typename R>
     R RunOnEventThread(std::function<R()> f) {
+        if (std::this_thread::get_id() == event_thread_id_) {
+            return f();
+        }
         auto promise = std::make_shared<std::promise<R>>();
         auto future = promise->get_future();
         std::function<void()> task = [f, promise]() {
@@ -192,6 +215,7 @@ private:
 #endif
     
     std::thread event_thread_;
+    std::thread::id event_thread_id_;  // Set by event thread at start; used to avoid deadlock when RunOnEventThread is called from event thread
     std::atomic<bool> running_{true};  // Use atomic to prevent compiler optimization issues
     // Joinable background tasks (no detach) to avoid UAF when instance is destroyed.
     // Use std::thread + atomic stop flag for compatibility (std::jthread is C++20 and not on all toolchains).
@@ -222,18 +246,30 @@ private:
     std::unordered_map<std::string, V2TIMString> chat_id_to_group_id_;
     // Map V2TIM GroupID string to group type ("group" or "conference")
     std::unordered_map<V2TIMString, std::string> group_id_to_type_;
+    // R-07: Instance metadata (known groups list + auto-accept; chat_id/type use maps above)
+    std::vector<std::string> known_groups_;
+    bool auto_accept_group_invites_{false};
+    std::mutex metadata_mutex_;
     // Pending group invites awaiting JoinGroup
     std::unordered_map<V2TIMString, PendingInvite> pending_group_invites_;
     // Flag to track if RejoinKnownGroups has been triggered after connection establishment
     std::atomic<bool> rejoin_triggered_{false};
-    // Pending login callback to be called when connection is established
-    V2TIMCallback* pending_login_callback_;
+    // User-facing login alias (from Login(userID)); GetLoginUser() returns this
+    V2TIMString login_user_alias_;
     // Member list snapshots for each group (for detecting join/leave)
     std::unordered_map<Tox_Group_Number, std::unordered_set<std::string>> group_peer_snapshots_;
     // (group_number, peer_public_key_hex_lower) -> peer_id, populated from HandleGroupPeerJoin for group private send
     std::unordered_map<Tox_Group_Number, std::unordered_map<std::string, Tox_Group_Peer_Number>> group_peer_id_cache_;
     // Global counter for generating unique group IDs (to avoid reusing IDs from deleted groups)
     uint64_t next_group_id_counter_;
+    std::atomic<uint64_t> next_message_seq_{1};
+    std::atomic<uint64_t> next_group_seq_{1};
+    // Per-instance sub-managers (R-06: owned by this instance, no singleton)
+    std::unique_ptr<V2TIMMessageManagerImpl> message_manager_;
+    std::unique_ptr<V2TIMGroupManagerImpl> group_manager_;
+    std::unique_ptr<V2TIMConversationManagerImpl> conversation_manager_;
+    std::unique_ptr<V2TIMCommunityManagerImpl> community_manager_;
+    std::unique_ptr<V2TIMFriendshipManagerImpl> friendship_manager_;
     // Per-instance signaling manager (multi-instance support)
     std::unique_ptr<V2TIMSignalingManagerImpl> signaling_manager_;
     
