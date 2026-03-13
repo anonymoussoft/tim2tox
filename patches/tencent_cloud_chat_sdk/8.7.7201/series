@@ -1,0 +1,3 @@
+# Patches for tencent_cloud_chat_sdk 8.7.7201 (one patch filename per line).
+# Add lines like: 0001-description.patch
+0001-tim2tox-custom-platform.patch
