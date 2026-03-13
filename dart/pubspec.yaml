@@ -10,8 +10,7 @@ environment:
 dependencies:
   ffi: ^2.1.0
   tencent_cloud_chat_sdk: any
-  tencent_cloud_chat_common:
-    path: ../../chat-uikit-flutter/tencent_cloud_chat_common
+  tencent_cloud_chat_common: ^4.1.0+1
   path_provider: ^2.1.3
   path: ^1.8.3
   crypto: ^3.0.3
