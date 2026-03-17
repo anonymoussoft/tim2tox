@@ -403,8 +403,10 @@ Conclusion: **Only some callbacks can guarantee correct routing by instance**; t
 
 Under the agreement of **single isolate + serial switching of "current instance" only through runWithInstance/runWithInstanceAsync**, if the registration and business of all listeners are included in the `runWithInstance` of the corresponding instance, and the main thread will not happen to be in the runWithInstance of "another instance" when the Tox callback is triggered, it may still work in most scenarios, but there is no guarantee** that "whose event will be sent to whom"; Strict multi-instance still requires the above C++ and Dart has two changes.
 
-## Related documents- **C++ implementation**:
-  -`tim2tox/source/ToxManager.h/cpp`
+## Related documents
+
+- **C++ implementation**:
+  - `tim2tox/source/ToxManager.h/cpp`
   - `tim2tox/source/V2TIMManagerImpl.h/cpp`
 - **FFI interface**:
   - `tim2tox/ffi/tim2tox_ffi.h/cpp`

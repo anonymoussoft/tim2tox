@@ -2,6 +2,12 @@
 
 Tim2Tox Dart 包提供了 Tim2Tox framework 的 Dart 绑定和 SDK Platform 实现。
 
+> **完整集成入口**请从仓库根目录开始：
+>
+> - 项目定位、两种接入路径、集成 5 步摘要：[`../README.md`](../README.md)
+> - 深度文档与推荐阅读路径：[`../doc/README.md`](../doc/README.md)
+> - 构建说明（唯一入口）：[`../README_BUILD.md`](../README_BUILD.md)
+
 ## 目录结构
 
 ```
@@ -26,7 +32,7 @@ tim2tox/dart/
 
 ## 使用方式
 
-### 1. 在项目中添加依赖
+### 1. 在项目中添加依赖（path 示例）
 
 ```yaml
 dependencies:
@@ -34,7 +40,7 @@ dependencies:
     path: ../tim2tox/dart
 ```
 
-### 2. 实现接口
+### 2. 实现注入接口（示意）
 
 ```dart
 import 'package:tim2tox_dart/interfaces/preferences_service.dart';
@@ -51,7 +57,7 @@ class MyPreferencesService implements PreferencesService {
 }
 ```
 
-### 3. 初始化服务
+### 3. 初始化 FfiChatService（示意）
 
 ```dart
 import 'package:tim2tox_dart/tim2tox_dart.dart';
@@ -69,7 +75,7 @@ final ffiService = FfiChatService(
 await ffiService.init();
 ```
 
-### 4. 设置 SDK Platform
+### 4. 设置 SDK Platform（如使用 Platform 路径）
 
 ```dart
 import 'package:tim2tox_dart/sdk/tim2tox_sdk_platform.dart';
@@ -79,30 +85,7 @@ TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(
 );
 ```
 
-## 状态
+## 说明
 
-✅ **核心功能已完成**
-
-- ✅ FFI 绑定层已完成
-- ✅ 抽象接口已定义
-- ✅ 服务层已重构（使用抽象接口）
-- ✅ SDK Platform 已实现（移除对客户端特定代码的依赖）
-- ✅ 消息ID统一格式（`timestamp_userID`）
-- ✅ 失败消息处理机制（超时检测、离线检测、持久化存储）
-
-## 核心特性
-
-### 消息ID管理
-
-所有消息ID使用 `timestamp_userID` 格式（毫秒级时间戳）：
-- 格式：`<timestamp>_<userID>`
-- 确保唯一性和一致性
-- 使用 `ffiService.selfId` 生成用户ID部分
-
-### 失败消息处理
-
-- **超时机制**：文本消息5秒超时，文件消息根据大小动态计算
-- **离线检测**：发送前检查联系人是否在线
-- **持久化存储**：失败消息保存到本地存储
-- **状态恢复**：客户端重启后自动恢复失败消息状态
+- 本 README 仅覆盖 Dart 包的目录结构与最小用法骨架；**接入决策与完整步骤**请以根 README 与 doc 索引为准，避免多处重复维护。
 

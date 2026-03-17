@@ -114,6 +114,6 @@ Therefore, the signaling path will be incomplete if the client does not set `Tim
 ## 7. Related documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.en.md)
-- [API_REFERENCE.md](API_REFERENCE.en.md)
+- [API Reference](../api/API_REFERENCE.en.md)
 - [MULTI_INSTANCE_SUPPORT.md](MULTI_INSTANCE_SUPPORT.en.md)
 - [../../toxee/doc/CALLING_AND_EXTENSIONS.md](../../toxee/doc/CALLING_AND_EXTENSIONS.en.md)

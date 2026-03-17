@@ -179,6 +179,6 @@ toxee 启动时的顺序是：
 ## 10. 相关文档
 
 - [ARCHITECTURE.md](ARCHITECTURE.md)
-- [API_REFERENCE.md](API_REFERENCE.md)
+- [API 参考](../api/API_REFERENCE.md)
 - [../../toxee/doc/ACCOUNT_AND_SESSION.md](../../toxee/doc/ACCOUNT_AND_SESSION.md)
 - [../../toxee/doc/IMPLEMENTATION_DETAILS.md](../../toxee/doc/IMPLEMENTATION_DETAILS.md)

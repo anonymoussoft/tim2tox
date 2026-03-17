@@ -113,6 +113,6 @@ toxee 中：
 ## 7. 相关文档
 
 - [ARCHITECTURE.md](ARCHITECTURE.md)
-- [API_REFERENCE.md](API_REFERENCE.md)
+- [API 参考](../api/API_REFERENCE.md)
 - [MULTI_INSTANCE_SUPPORT.md](MULTI_INSTANCE_SUPPORT.md)
 - [../../toxee/doc/CALLING_AND_EXTENSIONS.md](../../toxee/doc/CALLING_AND_EXTENSIONS.md)

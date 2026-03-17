@@ -276,5 +276,5 @@ RejoinKnownGroups: Matched conference_number=<number> to groupID=<group_id>
 ## 相关文档
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) - Tim2Tox 架构（包含群聊实现说明）
-- [API_REFERENCE.md](./API_REFERENCE.md) - API 参考文档
+- [API_REFERENCE.md](../api/API_REFERENCE.md) - API 参考文档
 - [toxee 群聊功能](../../toxee/doc/GROUP_CHAT_GUIDE.md) - 客户端群聊功能说明

@@ -243,7 +243,7 @@ The Dart* function compatibility layer (`dart_compat_layer`) has been fully modu
 
 #### dart_compat_layer.cpp
 - **Responsibilities**: Main entry file, ensure all modules are linked
-- **Content**: Only include header files and description comments
+- **Content**: Only includes the headers for each dart_compat_*.cpp and comments; no business logic; actual Dart* implementations live in the feature modules
 - **Number of lines**: 29 lines
 
 ## Module dependencies
