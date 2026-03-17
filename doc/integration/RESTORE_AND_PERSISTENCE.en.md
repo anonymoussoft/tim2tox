@@ -276,5 +276,5 @@ RejoinKnownGroups: Matched conference_number=<number> to groupID=<group_id>
 ## Related documents
 
 - [ARCHITECTURE.md](./ARCHITECTURE.en.md) - Tim2Tox architecture (including group chat implementation instructions)
-- [API_REFERENCE.md](./API_REFERENCE.en.md) - API reference documentation
+- [API_REFERENCE.en.md](../api/API_REFERENCE.en.md) - API reference documentation
 - [toxee group chat function](../../toxee/doc/GROUP_CHAT_GUIDE.en.md) - Client group chat function description

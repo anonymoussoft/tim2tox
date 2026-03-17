@@ -103,7 +103,7 @@ tim2tox/
 
 ### 功能文档
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md) - Tim2Tox 架构（包含群聊实现说明）
+- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md) - Tim2Tox 架构（包含群聊实现说明）
   - 群聊实现（Group vs Conference API）
   - 映射关系管理
   - 恢复机制
@@ -114,7 +114,12 @@ tim2tox/
 - **callback_bridge.h/cpp**: 回调桥接机制
 - **json_parser.h/cpp**: JSON 消息构建和解析
 
-详细说明请参考 [模块化文档](MODULARIZATION.md)。
+详细说明请参考 [模块化文档](../architecture/MODULARIZATION.md)。
+
+### 修改 FFI / dart_compat 前必读
+
+- [MODULARIZATION.md](../architecture/MODULARIZATION.md) — dart_compat 模块拆分与职责
+- [FFI_FUNCTION_DECLARATION_GUIDE.md](FFI_FUNCTION_DECLARATION_GUIDE.md) — `tim2tox_ffi_*` 的 `extern "C"` 声明规则与自检清单
 
 #### 4. Dart 绑定层 (`dart/lib/`)
 
@@ -236,6 +241,8 @@ void OnNewFeature(const V2TIMString& data) {
 
 ## 构建系统
 
+> **日常构建/跑测试请以 [README_BUILD.md](../../README_BUILD.md) 为准**（作为唯一入口，包含脚本说明与故障排除）。本节保留为 CMake 参数与产物的技术参考，尽量不重复脚本细节。
+
 ### CMake 构建
 
 Tim2Tox 使用 CMake 作为构建系统。
@@ -273,11 +280,7 @@ make -j$(nproc)
 ./build.sh
 ```
 
-构建脚本会自动：
-1. 创建 build 目录
-2. 配置 CMake
-3. 编译所有目标
-4. 生成构建产物
+更多脚本用法（包括推荐的 `build_ffi.sh`、增量/强制重建、测试运行与常见问题）请统一参考 [README_BUILD.md](../../README_BUILD.md)。
 
 ### 构建产物
 
@@ -649,6 +652,6 @@ loggerService?.error('Error message', error, stackTrace);
 
 ## 相关文档
 
-- [API 参考](API_REFERENCE.md) - 完整 API 文档
-- [Tim2Tox 架构](ARCHITECTURE.md) - 整体架构设计
-- [Tim2Tox FFI 兼容层](FFI_COMPAT_LAYER.md) - Dart* 函数兼容层说明
+- [API 参考](../api/API_REFERENCE.md) - 完整 API 文档
+- [Tim2Tox 架构](../architecture/ARCHITECTURE.md) - 整体架构设计
+- [Tim2Tox FFI 兼容层](../architecture/FFI_COMPAT_LAYER.md) - Dart* 函数兼容层说明

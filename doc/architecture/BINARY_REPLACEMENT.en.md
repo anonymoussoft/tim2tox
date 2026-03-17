@@ -252,7 +252,7 @@ int DartXXX(const char* json_param, void* user_data) {
 
 **Main functions**:
 - `DartInitDartApiDL`: Initialize Dart API
-- `DartRegisterSendPort`: Register Dart SendPort
+- `DartRegisterSendPort(int64_t send_port)`: Register Dart SendPort (signature must match native_imsdk_bindings_generated.dart)
 - `SendCallbackToDart`: Send callback message to Dart layer
 
 ### 3. json_parser.cpp/h
@@ -538,4 +538,4 @@ The C++ layer uses `fprintf(stdout, ...)` and `fprintf(stderr, ...)` to output l
 
 - [Tim2Tox FFI Compatibility Layer](FFI_COMPAT_LAYER.en.md) - Detailed implementation instructions
 - [Tim2Tox Architecture](ARCHITECTURE.en.md) - Overall architecture design
-- [Development Guide](DEVELOPMENT_GUIDE.en.md) - Development Guide
+- [Development Guide](../development/DEVELOPMENT_GUIDE.en.md) - Development Guide

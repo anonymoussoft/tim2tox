@@ -1262,34 +1262,41 @@ class FfiChatService {
                   final from = header.substring(sep + 1);
                   // Check if this group was quit - if so, don't add it back
                   if (!_quitGroups.contains(gid)) {
-                    _knownGroups.add(gid);
-                    _syncKnownGroupsToNative(); // Sync to C++ layer
-                    // Generate msgID for receipt tracking
-                    final timestamp = DateTime.now().millisecondsSinceEpoch;
-                    final sequence = _msgIDSequence++;
-                    final msgID = '${timestamp}_${sequence}_${from}_$gid';
-                    final msg = ChatMessage(
-                      text: text,
-                      fromUserId: from,
-                      isSelf: from == _selfId,
-                      timestamp: DateTime.now(),
-                      groupId: gid,
-                      msgID: msgID,
-                    );
-                    _lastByPeer[gid] = msg;
-                    if (_activePeerId == gid) {
-                      _unreadByPeer[gid] = 0;
+                    // Deduplicate: same message can be delivered twice (conference + group callback in C++)
+                    if (_isDuplicateGroupTextMessage(gid, from, text)) {
+                      _logger?.log(
+                          '[FfiChatService] Skipping duplicate group message: gid=$gid, from=$from');
+                      // If group was quit, ignore this message
                     } else {
-                      _unreadByPeer.update(gid, (v) => v + 1,
-                          ifAbsent: () => 1);
-                    }
-                    _appendHistory(gid, msg);
-                    _messages.add(msg);
-                    // Auto-send received receipt for received group messages (not self-sent)
-                    // Note: reaction messages are sent via custom messages and should not trigger receipts
-                    if (!msg.isSelf && !_isReactionMessage(text)) {
-                      unawaited(
-                          _sendReceipt(from, msgID, 'received', groupID: gid));
+                      _knownGroups.add(gid);
+                      _syncKnownGroupsToNative(); // Sync to C++ layer
+                      // Generate msgID for receipt tracking
+                      final timestamp = DateTime.now().millisecondsSinceEpoch;
+                      final sequence = _msgIDSequence++;
+                      final msgID = '${timestamp}_${sequence}_${from}_$gid';
+                      final msg = ChatMessage(
+                        text: text,
+                        fromUserId: from,
+                        isSelf: from == _selfId,
+                        timestamp: DateTime.now(),
+                        groupId: gid,
+                        msgID: msgID,
+                      );
+                      _lastByPeer[gid] = msg;
+                      if (_activePeerId == gid) {
+                        _unreadByPeer[gid] = 0;
+                      } else {
+                        _unreadByPeer.update(gid, (v) => v + 1,
+                            ifAbsent: () => 1);
+                      }
+                      _appendHistory(gid, msg);
+                      _messages.add(msg);
+                      // Auto-send received receipt for received group messages (not self-sent)
+                      // Note: reaction messages are sent via custom messages and should not trigger receipts
+                      if (!msg.isSelf && !_isReactionMessage(text)) {
+                        unawaited(
+                            _sendReceipt(from, msgID, 'received', groupID: gid));
+                      }
                     }
                   }
                   // If group was quit, ignore this message
@@ -3405,39 +3412,63 @@ class FfiChatService {
         final from = parts[2];
         // Check if this group was quit - if so, don't add it back
         if (!_quitGroups.contains(gid)) {
-          final added = _knownGroups.add(gid);
-          if (added) {
-            unawaited(
-                _persistKnownGroups()); // This will call _syncKnownGroupsToNative()
-          }
-          final timestamp = DateTime.now().millisecondsSinceEpoch;
-          final sequence = _msgIDSequence++;
-          final msgID = '${timestamp}_${sequence}_${from}_$gid';
-          final msg = ChatMessage(
-            text: data,
-            fromUserId: from,
-            isSelf: from == _selfId,
-            timestamp: DateTime.now(),
-            groupId: gid,
-            msgID: msgID,
-          );
-          _lastByPeer[gid] = msg; // reuse for group last message
-          if (_activePeerId == gid) {
-            _unreadByPeer[gid] = 0;
+          // Deduplicate: same message can be delivered twice (conference + group callback in C++)
+          if (_isDuplicateGroupTextMessage(gid, from, data)) {
+            _logger?.log(
+                '[FfiChatService] _onNativeEvent(10): Skipping duplicate group message: gid=$gid, from=$from');
           } else {
-            _unreadByPeer.update(gid, (v) => v + 1, ifAbsent: () => 1);
-          }
-          _appendHistory(gid, msg);
-          _messages.add(msg);
-          // Auto-send received receipt for received group messages (not self-sent)
-          // Note: reaction messages are sent via custom messages and should not trigger receipts
-          if (!msg.isSelf && !_isReactionMessage(data)) {
-            unawaited(_sendReceipt(from, msgID, 'received', groupID: gid));
+            final added = _knownGroups.add(gid);
+            if (added) {
+              unawaited(
+                  _persistKnownGroups()); // This will call _syncKnownGroupsToNative()
+            }
+            final timestamp = DateTime.now().millisecondsSinceEpoch;
+            final sequence = _msgIDSequence++;
+            final msgID = '${timestamp}_${sequence}_${from}_$gid';
+            final msg = ChatMessage(
+              text: data,
+              fromUserId: from,
+              isSelf: from == _selfId,
+              timestamp: DateTime.now(),
+              groupId: gid,
+              msgID: msgID,
+            );
+            _lastByPeer[gid] = msg; // reuse for group last message
+            if (_activePeerId == gid) {
+              _unreadByPeer[gid] = 0;
+            } else {
+              _unreadByPeer.update(gid, (v) => v + 1, ifAbsent: () => 1);
+            }
+            _appendHistory(gid, msg);
+            _messages.add(msg);
+            // Auto-send received receipt for received group messages (not self-sent)
+            // Note: reaction messages are sent via custom messages and should not trigger receipts
+            if (!msg.isSelf && !_isReactionMessage(data)) {
+              unawaited(_sendReceipt(from, msgID, 'received', groupID: gid));
+            }
           }
         }
         // If group was quit, ignore this message
       }
     }
+  }
+
+  /// Returns true if we already have a recent group message with the same (gid, from, text).
+  /// Used to deduplicate when both conference and group callbacks fire for the same message (tox_conf_*).
+  bool _isDuplicateGroupTextMessage(String gid, String from, String text) {
+    final list = _historyByIdInternal[gid];
+    if (list == null || list.isEmpty) return false;
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final windowMs = 5000; // 5 seconds
+    for (var i = list.length - 1; i >= 0 && i >= list.length - 20; i--) {
+      final m = list[i];
+      if (m.fromUserId == from &&
+          m.text == text &&
+          (m.timestamp.millisecondsSinceEpoch - nowMs).abs() < windowMs) {
+        return true;
+      }
+    }
+    return false;
   }
 
   void _appendHistory(String id, ChatMessage msg) {

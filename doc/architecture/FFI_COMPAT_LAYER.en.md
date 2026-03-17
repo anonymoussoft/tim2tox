@@ -17,18 +17,20 @@ This document details the implementation of the Dart* function compatibility lay
 
 The Dart* function compatibility layer is the core component of the binary replacement solution. It implements the Dart* function interface that is fully compatible with the native IM SDK, allowing `NativeLibraryManager` in the Dart layer to seamlessly switch to the tim2tox backend without modifying any Dart code.
 
+> For the overall binary replacement design (configuration + call chain), read [BINARY_REPLACEMENT.en.md](BINARY_REPLACEMENT.en.md) first. This document focuses on the Dart* compat layer itself (callbacks/JSON/implementation status).
+
 ### Core Idea
 
 1. **Exact match of function signatures**: The signatures of all Dart* functions are exactly the same as those defined in `native_imsdk_bindings_generated.dart`
-2. **On-demand implementation**: Only implement the actually used functions (about 68), rather than all defined functions (about 230)
+2. **On-demand implementation**: Only implement Dart* functions actually used by current business/tests (count with `nm -D libtim2tox_ffi.* | grep Dart`), not all functions defined in the native SDK bindings (about 230)
 3. **Callback Bridging**: Send C++ events to the Dart layer via JSON messages and `Dart_PostCObject_DL`
 4. **Binary replacement**: Just replace the dynamic library file, and the Dart layer code does not need to be modified at all.
 
 ### Advantages
 
 - ✅ **Zero Dart code modification**: Dart layer code does not need to be modified at all
-- ✅ **Significant workload reduction**: from 477 functions to 68 functions (85% reduction)
-- ✅ **Full Compatibility**: Function signature and callback format exactly match the native SDK
+- ✅ **Manageable scope**: Implementing only the functions in use keeps effort lower than implementing the full native binding set
+- ✅ **Designed for compatibility**: Function signature and callback format match the native SDK contract (verify on SDK upgrades)
 - ✅ **Easy to Maintain**: Clear module division and code structure
 
 ## Architecture design
@@ -79,7 +81,7 @@ The Dart* function compatibility layer has been split into multiple functional m
 **Total code size**: about 6764 lines (distributed in 13 module files)
 
 **Main functions**:
-- Export all actually used Dart* functions (about 131+ core functions)
+- Export actually used Dart* functions (callback setters + business API; see “Implementation status” below for counts)
 - Implement callback setting function (storage user_data, register Listener)
 - Implement business API functions (parse parameters, call V2TIM SDK)
 
@@ -132,7 +134,8 @@ bindings.DartRegisterSendPort(receivePort.sendPort.nativePort);
 
 3. **C++ layer storage SendPort**:
 ```cpp
-void DartRegisterSendPort(int send_port) {
+// Signature must match native_imsdk_bindings_generated.dart (parameter is int64_t)
+void DartRegisterSendPort(int64_t send_port) {
     g_dart_port = static_cast<Dart_Port>(send_port);
 }
 ```
@@ -153,7 +156,7 @@ void DartAdvancedMsgListenerImpl::OnRecvNewMessage(const V2TIMMessage& message) 
 }
 ```
 
-2. **Sent via Dart_PostCObject_DL**:
+2. **Sent via Dart_PostCObject_DL** (in the current implementation `user_data` is not written into the message; correlation relies on fields inside the JSON):
 ```cpp
 void SendCallbackToDart(const char* callback_type, const std::string& json_data, void* user_data) {
     Dart_CObject cobj;
@@ -371,15 +374,9 @@ The following conversion tools need to be implemented:
 - `V2TIMSignalingInfo` → JSON
 - `V2TIMTopicInfo` → JSON
 
-#### ⏳ Listener complete implementation
+#### ⏳ Listener completion (optional)
 
-The implementation of all Listener methods needs to be completed:
-
-- `DartConversationListenerImpl`: All callback methods
-- `DartGroupListenerImpl`: All callback methods
-- `DartSignalingListenerImpl`: All callback methods
-- `DartCommunityListenerImpl`: All callback methods
-- Improve the remaining methods of other Listeners
+The “Completed” section above lists the methods already implemented per Listener. Some Listeners may still have a few edge methods as stubs or to be completed. If a callback is missing, check source `ffi/dart_compat_listeners.cpp`.
 
 #### ⏳ Function symbol export verification
 
@@ -671,7 +668,7 @@ This section records issues discovered and fixed during development and testing 
 ## Related documents
 
 - [Modular Documentation](MODULARIZATION.en.md) - FFI layer modular structure and development guide
-- [FFI Function Declaration Guide](FFI_FUNCTION_DECLARATION_GUIDE.en.md) - Function declaration specifications and checklist
-- [API Reference](API_REFERENCE.en.md) - Complete API documentation
+- [FFI Function Declaration Guide](../development/FFI_FUNCTION_DECLARATION_GUIDE.en.md) - Function declaration specifications and checklist
+- [API Reference](../api/API_REFERENCE.en.md) - Complete API documentation
 - [Tim2Tox Architecture](ARCHITECTURE.en.md) - Overall architecture design
-- [Development Guide](DEVELOPMENT_GUIDE.en.md) - Development Guide
+- [Development Guide](../development/DEVELOPMENT_GUIDE.en.md) - Development Guide

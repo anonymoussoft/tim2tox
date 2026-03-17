@@ -177,6 +177,6 @@ If you are changing Bootstrap, networking or polling issues, it is recommended t
 ## 10. Related documents
 
 - [ARCHITECTURE.md](ARCHITECTURE.en.md)
-- [API_REFERENCE.md](API_REFERENCE.en.md)
+- [API Reference](../api/API_REFERENCE.en.md)
 - [../../toxee/doc/ACCOUNT_AND_SESSION.md](../../toxee/doc/ACCOUNT_AND_SESSION.en.md)
 - [../../toxee/doc/IMPLEMENTATION_DETAILS.md](../../toxee/doc/IMPLEMENTATION_DETAILS.en.md)

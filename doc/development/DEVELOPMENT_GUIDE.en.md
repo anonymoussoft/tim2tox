@@ -116,6 +116,11 @@ Provides a C interface for Dart FFI to call.
 
 For detailed instructions, please refer to [Modular Documentation](MODULARIZATION.en.md).
 
+### Read before modifying FFI / dart_compat
+
+- [MODULARIZATION.en.md](../architecture/MODULARIZATION.en.md) — dart_compat modular split and responsibilities
+- [FFI_FUNCTION_DECLARATION_GUIDE.en.md](FFI_FUNCTION_DECLARATION_GUIDE.en.md) — `extern "C"` declaration rules and checklist for `tim2tox_ffi_*`
+
 #### 4. Dart binding layer (`dart/lib/`)
 
 Provides Flutter/Dart bindings.
@@ -236,6 +241,8 @@ void OnNewFeature(const V2TIMString& data) {
 
 ## Build system
 
+> **For day-to-day build & test workflows, use [README_BUILD.md](../../README_BUILD.md) as the single source of truth** (scripts, options, troubleshooting). This section stays as a technical reference for CMake flags and build outputs, and avoids duplicating script details.
+
 ### CMake build
 
 Tim2Tox uses CMake as the build system.
@@ -273,11 +280,7 @@ Log level options:
 ./build.sh
 ```
 
-The build script automatically:
-1. Create a build directory
-2. Configure CMake
-3. Compile all targets
-4. Generate build products
+For script usage (including the recommended `build_ffi.sh`, incremental/forced rebuild, running tests, and common issues), refer to [README_BUILD.md](../../README_BUILD.md).
 
 ### Build product
 
@@ -644,6 +647,6 @@ loggerService?.error('Error message', error, stackTrace);
 
 ## Related documents
 
-- [API Reference](API_REFERENCE.en.md) - Complete API documentation
+- [API Reference](../api/API_REFERENCE.en.md) - Complete API documentation
 - [Tim2Tox Architecture](ARCHITECTURE.en.md) - Overall architecture design
 - [Tim2Tox FFI compatibility layer](FFI_COMPAT_LAYER.en.md) - Dart* function compatibility layer description
