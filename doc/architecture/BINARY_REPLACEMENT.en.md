@@ -8,7 +8,7 @@ This document details how to use the underlying Tox binary implementation to rep
 
 The binary replacement scheme (BINARY REPLACEMENT MODE) is a scheme that realizes backend switching by replacing dynamic library files, so that the Dart layer code can be switched from Tencent Cloud IM SDK to the Tox P2P protocol without any modification at all.
 
-**Current usage status**: ✅ **toxee uses hybrid mode (Binary Replacement + Platform interface)**
+**Current usage status**: ✅ **Integrators can use hybrid mode (Binary Replacement + Platform interface); for an example see a client that consumes this repo.**
 
 **Configuration method**:
 - Call the `setNativeLibraryName('tim2tox_ffi')` configuration library name at the earliest stage of `main()`
@@ -293,9 +293,9 @@ int DartXXX(const char* json_param, void* user_data) {
 | **Custom callback** | By `customCallbackHandler` | Implemented directly on Platform | `customCallbackHandler` registered to Platform |
 | **Applicable scenarios** | Rapid integration | Advanced features required | Production environment |
 
-### Mixed mode (currently used by toxee)
+### Mixed mode (recommended)
 
-toxee uses both binary replacement and the Platform interface:
+Integrators can use both binary replacement and the Platform interface, for example:
 
 1. `setNativeLibraryName('tim2tox_ffi')` — Load `libtim2tox_ffi.dylib`
 2. `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(...)` — Enable advanced features
@@ -390,6 +390,76 @@ c-toxcore (P2P communication)
 - `tim2tox/ffi/dart_compat_layer.cpp` - Dart* function implementation
 - `tim2tox/ffi/callback_bridge.cpp` - Callback bridging mechanism
 
+## Using the Dart API (tim2tox_ffi.dart) to drive the same backend
+
+The same native dynamic library (`libtim2tox_ffi`) exposes **two C interfaces**:
+
+| Entry point | Symbol prefix | Caller | Parameters / callbacks |
+|-------------|---------------|--------|-------------------------|
+| Binary replacement | `Dart*` (e.g. `DartInitSDK`) | SDK’s `NativeLibraryManager.bindings` | JSON input + `Dart_PostCObject_DL` → ReceivePort |
+| Dart API | `tim2tox_ffi_*` (e.g. `tim2tox_ffi_init`) | Dart `Tim2ToxFfi` (tim2tox_ffi.dart) | Native types + `setCallback` event callback |
+
+- Under **binary replacement**, the app only calls `setNativeLibraryName('tim2tox_ffi')`; the SDK uses the `Dart*` interface via `bindings.DartXXX(...)`. The app does **not** use tim2tox_ffi.dart directly.
+- Under the **Platform** approach, the app sets `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(...)`. Internally, `FfiChatService` uses **Tim2ToxFfi** (tim2tox_ffi.dart) to call `tim2tox_ffi_*`, driving the same backend.
+
+To drive the same Tox backend **without** the SDK’s NativeLibraryManager (e.g. standalone tests, custom UI, or sharing the same library file as binary replacement), you can use only the **Dart API (tim2tox_ffi.dart)** and follow the flow below.
+
+### 1. Load the dynamic library
+
+This is the **same** library as in binary replacement (see “Compile product” above). On the Dart side, load it with `Tim2ToxFfi.open()` (on macOS this resolves to `libtim2tox_ffi.dylib`, etc.):
+
+```dart
+import 'package:tim2tox_ffi/ffi/tim2tox_ffi.dart';
+
+final ffi = Tim2ToxFfi.open();
+```
+
+### 2. Initialization and event callback
+
+- **Init**: Before other calls, use `init()` or `initWithPath(profileDir)` (optionally with a profile directory).
+- **Events**: Register a single event callback with `setCallback(callback, userData)`. The C layer invokes it with `event_type`, `sender`, and `payload` (same semantics as globalCallback in the binary-replacement path, but via tim2tox_ffi’s C callback instead of ReceivePort).
+
+```dart
+// Init (one of)
+ffi.init();
+// Or with profile dir: ffi.initWithPath('path/to/profile'.toNativeUtf8());
+
+// Register event callback; signature is the event callback type in tim2tox_ffi.dart (event_type, sender_utf8, payload_bytes, payload_len)
+ffi.setCallback(yourEventCallbackNative, ffi.Pointer.fromAddress(0));
+```
+
+### 3. Login
+
+- Synchronous: `login(userId.toNativeUtf8(), userSig.toNativeUtf8())`
+- Asynchronous (recommended): `loginAsync(instanceId, userId, userSig, nativeCallback, userData)` and handle success/failure in the callback.
+
+After login succeeds, you can call friend, message, group, etc. APIs.
+
+### 4. Capabilities and Dart API mapping
+
+| Capability | Dart API (tim2tox_ffi.dart) |
+|------------|-----------------------------|
+| Init | `init()` / `initWithPath(...)` |
+| Login | `login(...)` / `loginAsync(...)` |
+| Events | `setCallback(...)` |
+| C2C text | `sendText(toUserId, text)` |
+| Friend list | `getFriendList(buffer, size)` |
+| Groups | `createGroup`, `joinGroup`, `sendGroupText`, `getKnownGroups`, ... |
+| Signaling / A/V | `signalingAddListenerNative`, `avInitialize`, `avStartCallNative`, ... |
+| Multi-instance / test | `createTestInstanceNative`, `setCurrentInstance`, `injectCallback`, etc. |
+
+These bind to the `tim2tox_ffi_*` symbols; the binary-replacement path uses the `Dart*` symbols. Both use the same V2TIM / ToxManager / c-toxcore backend.
+
+### 5. When to use which
+
+- **Only replace the backend with minimal Dart changes**: Use **binary replacement** (`setNativeLibraryName('tim2tox_ffi')`) and do not use tim2tox_ffi.dart directly.
+- **Need advanced features or a custom Platform**: Use the **Platform** approach (`Tim2ToxSdkPlatform` + `FfiChatService`); FfiChatService uses tim2tox_ffi.dart and the `tim2tox_ffi_*` API internally.
+- **No SDK dependency, drive the Tox backend directly**: Rely only on tim2tox_ffi.dart: `Tim2ToxFfi.open()` → `init` → `setCallback` → `login`, then call the APIs above as needed.
+
+**Key files**:
+- `tim2tox/dart/lib/ffi/tim2tox_ffi.dart` — Dart API bindings (tim2tox_ffi_*)
+- `tim2tox/dart/lib/service/ffi_chat_service.dart` — Advanced service layer used by the Platform path (uses Tim2ToxFfi internally)
+
 ## Deployment method
 
 ### 1. Compile dynamic library
@@ -412,13 +482,13 @@ make tim2tox_ffi
 **macOS**:
 ```bash
 cp tim2tox/build/ffi/libtim2tox_ffi.dylib \
-   toxee/build/macos/Build/Products/Debug/toxee.app/Contents/MacOS/
+   <client-project>/build/macos/Build/Products/Debug/<app>.app/Contents/MacOS/
 ```
 
 **Linux**:
 ```bash
 cp tim2tox/build/ffi/libtim2tox_ffi.so \
-   toxee/build/linux/x64/debug/bundle/lib/
+   <client-project>/build/linux/x64/debug/bundle/lib/
 ```
 
 ### 3. Dependency library processing

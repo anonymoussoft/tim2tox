@@ -96,13 +96,7 @@ native callback 到 Dart 的最后一跳由 trampoline 完成；它从 `userData
 
 ## 5. 与客户端的关系
 
-toxee 中：
-
-- `FakeUIKit.startWithFfi()` 创建 `CallServiceManager`
-- `HomePage.initState()` 在 Platform 设置完成后调用 `callServiceManager.initialize()`
-- `CallServiceManager` 再把 `ToxAVService`、`CallBridgeService` 和 `TUICallKitAdapter` 串起来
-
-因此，客户端若未先设置 `Tim2ToxSdkPlatform`，signaling 路径将不完整。
+客户端需在设置 `Tim2ToxSdkPlatform` 之后，创建并初始化通话相关组件（如 CallServiceManager），并串起 ToxAVService、CallBridgeService、TUICallKit 适配等。若未先设置 Platform，signaling 路径将不完整。具体接入方式与 UI 集成见各客户端项目文档。
 
 ## 6. 当前限制
 
@@ -115,4 +109,4 @@ toxee 中：
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [API 参考](../api/API_REFERENCE.md)
 - [MULTI_INSTANCE_SUPPORT.md](MULTI_INSTANCE_SUPPORT.md)
-- [../../toxee/doc/CALLING_AND_EXTENSIONS.md](../../toxee/doc/CALLING_AND_EXTENSIONS.md)
+- 通话与扩展能力的客户端侧实现见各客户端项目文档（当 Tim2Tox 作为 submodule 使用时，常见于上层仓库的 doc）。

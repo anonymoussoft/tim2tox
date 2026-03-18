@@ -277,4 +277,4 @@ RejoinKnownGroups: Matched conference_number=<number> to groupID=<group_id>
 
 - [ARCHITECTURE.md](./ARCHITECTURE.en.md) - Tim2Tox architecture (including group chat implementation instructions)
 - [API_REFERENCE.en.md](../api/API_REFERENCE.en.md) - API reference documentation
-- [toxee group chat function](../../toxee/doc/GROUP_CHAT_GUIDE.en.md) - Client group chat function description
+- For client-side group chat and UI, see each client project’s documentation (e.g. when Tim2Tox is used as a submodule, the parent repo’s doc).

@@ -2,61 +2,37 @@
 > 语言 / Language: [中文](BOOTSTRAP_AND_POLLING.md) | [English](BOOTSTRAP_AND_POLLING.en.md)
 
 
-本文档说明 Tim2Tox 当前的 Bootstrap 节点加载、连接建立和轮询机制，并补充 toxee 在启动、设置页和局域网 Bootstrap 场景下的接入方式。
+本文档说明 Tim2Tox 的 Bootstrap 节点加载、连接建立与轮询机制。客户端（接入方）负责节点来源、保存与 UI；Tim2Tox 只消费通过 `BootstrapService` 暴露的当前节点三元组并驱动轮询。
 
 ## 1. 范围
 
 这条链路横跨两层：
 
-- `toxee`：负责选择和保存当前 Bootstrap 节点、决定启动顺序、提供局域网 Bootstrap UI。
-- `tim2tox/dart`：负责把保存下来的 `host/port/publicKey` 应用到 Tox 实例，并通过 `startPolling()` 驱动连接状态、消息、文件与 AV 事件。
+- **客户端**：负责选择和保存当前 Bootstrap 节点、决定启动顺序、提供节点配置 UI（如手动/自动/局域网等）；实现 `BootstrapService` 接口并注入给 `FfiChatService`。
+- **tim2tox/dart**：负责把 `BootstrapService` 提供的 `host/port/publicKey` 应用到 Tox 实例，并通过 `startPolling()` 驱动连接状态、消息、文件与 AV 事件。
 
-需要注意的是，Tim2Tox 内部并没有单独的“局域网 Bootstrap 模式”分支。框架真正消费的始终只是一个当前 Bootstrap 节点三元组。
+Tim2Tox 内部没有单独的“局域网 Bootstrap 模式”分支，框架消费的始终是当前 Bootstrap 节点三元组。局域网等模式是客户端的配置层概念。
 
-## 2. Bootstrap 节点来源
+## 2. Bootstrap 节点来源（客户端侧）
 
-当前存在三种来源：
+常见来源由客户端实现，例如：
 
 1. 手动输入
-2. 自动从 `https://nodes.tox.chat/json` 拉取
-3. 局域网内的本地 Bootstrap 服务
+2. 从公共节点列表（如 `https://nodes.tox.chat/json`）拉取
+3. 局域网内的本地 Bootstrap 服务（若客户端支持）
 
-toxee 侧相关代码：
+Tim2Tox 侧仅依赖接口：
 
-- `lib/util/bootstrap_nodes.dart`：从公共节点列表拉取节点，失败时退回硬编码 fallback 列表。
-- `lib/ui/settings/bootstrap_settings_section.dart`：管理 `auto` / `manual` / `lan` 三种模式。
-- `lib/ui/settings/bootstrap_nodes_page.dart`：列出在线节点、做探测、切换当前节点。
-- `lib/util/lan_bootstrap_service.dart`：启动或探测本地 Bootstrap 服务。
+- `dart/lib/interfaces/bootstrap_service.dart`：暴露当前节点的 `host/port/publicKey` 读取与写入。
+- `dart/lib/service/ffi_chat_service.dart`：在 `init()` 期间调用 `_loadAndApplySavedBootstrapNode()` 从 `BootstrapService` 读取并应用。
 
-Tim2Tox 侧相关代码：
+## 3. 节点选择与保存（客户端侧）
 
-- `dart/lib/interfaces/bootstrap_service.dart`：只暴露当前节点的 `host/port/publicKey` 读取与写入。
-- `dart/lib/service/ffi_chat_service.dart`：在 `init()` 期间调用 `_loadAndApplySavedBootstrapNode()`。
+客户端需在 `FfiChatService.init()` 之前或通过 `BootstrapService` 提供可用节点，例如：
 
-## 3. 节点选择与保存
-
-### 自动模式
-
-toxee 在 `_StartupGate._decide()` 中会先检查 Bootstrap 模式：
-
-- 非桌面平台如果检测到 `lan`，会强制回退到 `auto`
-- `auto` 模式下，如果当前还没有保存节点，会先拉取公共节点列表，并把第一个在线节点写入 `Prefs.setCurrentBootstrapNode(...)`
-
-这样做的目的是保证第一次启动时，在 `FfiChatService.init()` 之前就已经有一份可用节点配置。
-
-### 手动模式
-
-设置页手动输入节点后，会直接调用 `Prefs.setCurrentBootstrapNode(host, port, pubkey)`。之后 `FfiChatService.init()` 会在 `_loadAndApplySavedBootstrapNode()` 中读取并应用它。
-
-### 局域网 Bootstrap 模式
-
-局域网 Bootstrap 模式是 toxee 的配置层概念，不是 Tim2Tox 内部协议分支。当前实现里：
-
-- 桌面端可以通过 `LanBootstrapServiceManager.startLocalBootstrapService(port)` 启动一个本地 Tox 实例作为 Bootstrap 服务
-- 该服务会生成独立 profile、登录为 `BootstrapService`、取出 `udpPort` 和 `dhtId`，再启动自己的 `startPolling()`
-- UI 层会显示它的 `ip/port/pubkey`
-
-但 Tim2Tox 内部最终仍然只识别“当前 Bootstrap 节点”。因此局域网 Bootstrap 服务要真正参与连接，仍然需要把对应的 `host/port/pubkey` 写回当前节点配置。
+- **自动模式**：启动前若尚未保存节点，可拉取公共节点列表并写入当前配置，保证首次 `init()` 时已有可用节点。
+- **手动模式**：设置页输入后写入当前配置；`FfiChatService.init()` 会在 `_loadAndApplySavedBootstrapNode()` 中读取并应用。
+- **局域网模式**（若客户端支持）：本地 Bootstrap 服务暴露 `host/port/pubkey` 后，客户端将其写回当前节点配置，Tim2Tox 仍只识别“当前 Bootstrap 节点”。
 
 ## 4. Tim2Tox 如何应用 Bootstrap 节点
 
@@ -82,17 +58,7 @@ toxee 在 `_StartupGate._decide()` 中会先检查 Bootstrap 模式：
 
 它不保证此时已经完成联网。真正的连接变化依赖轮询队列中的 `conn:success` / `conn:failed` 事件。
 
-toxee 启动时的顺序是：
-
-1. `_StartupGate` 保证当前有可用 Bootstrap 节点
-2. 初始化 `FfiChatService`
-3. `FakeUIKit.startWithFfi(service)`
-4. `_initTIMManagerSDK()`
-5. `service.startPolling()`
-6. 监听 `connectionStatusStream`
-7. 在 20 秒内等到连接成功则预加载好友；否则超时后也进入首页
-
-因此 `startPolling()` 是联网和消息消费的真正起点，不只是“后台刷新”。
+**客户端启动顺序建议**：在具备可用 Bootstrap 节点后，初始化 `FfiChatService`，再调用 `startPolling()`，并监听 `connectionStatusStream`。`startPolling()` 是联网和消息消费的起点，需在适当时机调用。具体顺序与 UI 流程见各客户端项目文档。
 
 ## 6. 轮询循环
 
@@ -136,49 +102,16 @@ toxee 启动时的顺序是：
 
 这也是为什么文件传输期间会把 poll 间隔压到 `50ms`，并允许单轮批量 drain 队列。
 
-## 8. toxee 侧的维护注意点
+## 8. 客户端侧注意点（摘要）
 
-### 切换节点
+- **切换节点**：可调用 `service.addBootstrapNode(...)` 写入新节点并视需再次 `service.login(...)`，无需重建整个 `FfiChatService`。
+- **测试节点**：若复用 `addBootstrapNode(...)` 做探测，成功时当前节点配置会被更新，属实现层面的副作用。
+- **局域网 Bootstrap**（若客户端支持）：本地服务暴露 `ip/port/pubkey` 后，仍需将对应三元组写回当前节点配置，Tim2Tox 不区分节点来源。
 
-`BootstrapNodesPage` 中切换节点的实际动作是：
+具体实现与维护顺序见各客户端仓库文档；以 Tim2Tox 为本仓库时，优先阅读本仓库内 `dart/lib/interfaces/bootstrap_service.dart` 与 `dart/lib/service/ffi_chat_service.dart`。
 
-1. `service.addBootstrapNode(...)`
-2. `service.login(...)`
+## 9. 相关文档
 
-也就是“写入新节点并重新 login”，不是重建整个 `FfiChatService`。
-
-### 测试节点
-
-在设置页或节点列表页，如果 `service != null`，测试动作直接复用 `addBootstrapNode(...)`。这会带来一个实现层面的副作用：
-
-- 测试成功时，当前节点配置也会被更新
-
-如果只是登录页场景，没有现成 `service`，才会退化为普通 TCP 探测。
-
-### 局域网 Bootstrap 服务
-
-本地服务只在桌面端支持。当前实现主要是：
-
-- 启动一个独立 Tox 实例
-- 暴露它的 `ip/port/pubkey`
-- 允许 UI 做存活探测
-
-它本身不替代 `currentBootstrapNode` 这套配置模型。
-
-## 9. 建议的维护顺序
-
-如果你在改 Bootstrap、联网或轮询问题，建议按这个顺序读代码：
-
-1. `toxee/lib/main.dart`
-2. `toxee/lib/ui/settings/bootstrap_settings_section.dart`
-3. `toxee/lib/util/bootstrap_nodes.dart`
-4. `toxee/lib/util/lan_bootstrap_service.dart`
-5. `tim2tox/dart/lib/interfaces/bootstrap_service.dart`
-6. `tim2tox/dart/lib/service/ffi_chat_service.dart`
-
-## 10. 相关文档
-
-- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [ARCHITECTURE.md](../architecture/ARCHITECTURE.md)
 - [API 参考](../api/API_REFERENCE.md)
-- [../../toxee/doc/ACCOUNT_AND_SESSION.md](../../toxee/doc/ACCOUNT_AND_SESSION.md)
-- [../../toxee/doc/IMPLEMENTATION_DETAILS.md](../../toxee/doc/IMPLEMENTATION_DETAILS.md)
+- 示例客户端的启动、Bootstrap 与账号会话说明见该客户端项目文档，例如 [toxee](https://github.com/anonymoussoft/toxee)（当 Tim2Tox 作为 submodule 被使用时，常见于上层仓库的 doc）。

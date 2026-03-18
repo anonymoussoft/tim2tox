@@ -2,61 +2,37 @@
 > Language: [Chinese](BOOTSTRAP_AND_POLLING.md) | [English](BOOTSTRAP_AND_POLLING.en.md)
 
 
-This document describes Tim2Tox’s current Bootstrap node loading, connection establishment, and polling mechanisms, and supplements the toxee’s access methods in startup, settings pages, and LAN Bootstrap scenarios.
+This document describes Tim2Tox’s Bootstrap node loading, connection establishment, and polling mechanisms. The client (integrator) is responsible for node sources, persistence, and UI; Tim2Tox only consumes the current node triple exposed via `BootstrapService` and drives the poll loop.
 
 ## 1. Scope
 
 This link spans two layers:
 
-- `toxee`: Responsible for selecting and saving the current Bootstrap node, determining the startup sequence, and providing the LAN Bootstrap UI.
-- `tim2tox/dart`: Responsible for applying the saved `host/port/publicKey` to the Tox instance, and driving connection status, messages, files and AV events through `startPolling()`.
+- **Client**: Responsible for selecting and saving the current Bootstrap node, startup order, and node configuration UI (e.g. manual/auto/LAN); implements `BootstrapService` and injects it into `FfiChatService`.
+- **tim2tox/dart**: Responsible for applying the `host/port/publicKey` from `BootstrapService` to the Tox instance and driving connection status, messages, files, and AV events via `startPolling()`.
 
-It should be noted that there is no separate "LAN Bootstrap mode" branch within Tim2Tox. What the framework really consumes is always just a triple of the current Bootstrap node.
+Tim2Tox has no separate “LAN Bootstrap mode” branch; the framework always consumes the current Bootstrap node triple. LAN or other modes are client-side configuration concepts.
 
-## 2. Bootstrap node source
+## 2. Bootstrap node sources (client side)
 
-Three sources currently exist:
+Sources are implemented by the client, for example:
 
 1. Manual input
-2. Automatically pull from `https://nodes.tox.chat/json`
-3. Local Bootstrap service within LAN
+2. Pull from a public node list (e.g. `https://nodes.tox.chat/json`)
+3. Local Bootstrap service on LAN (if the client supports it)
 
-toxee side related code:
+Tim2Tox only depends on the interface:
 
-- `lib/util/bootstrap_nodes.dart`: Pull nodes from the public node list, and fall back to the hardcoded fallback list on failure.
-- `lib/ui/settings/bootstrap_settings_section.dart`: Manage three modes of `auto` / `manual` / `lan`.
-- `lib/ui/settings/bootstrap_nodes_page.dart`: List online nodes, perform detection, and switch current nodes.
-- `lib/util/lan_bootstrap_service.dart`: Start or detect the local Bootstrap service.
+- `dart/lib/interfaces/bootstrap_service.dart`: Exposes reading and writing of the current node’s `host/port/publicKey`.
+- `dart/lib/service/ffi_chat_service.dart`: Calls `_loadAndApplySavedBootstrapNode()` during `init()` to read from `BootstrapService` and apply.
 
-Related code on Tim2Tox side:
+## 3. Node selection and saving (client side)
 
-- `dart/lib/interfaces/bootstrap_service.dart`: Only expose `host/port/publicKey` reading and writing of the current node.
-- `dart/lib/service/ffi_chat_service.dart`: Call `_loadAndApplySavedBootstrapNode()` during `init()`.
+The client must provide a usable node before or via `BootstrapService` when `FfiChatService.init()` runs, for example:
 
-## 3. Node selection and saving
-
-### Automatic mode
-
-toxee will first check Bootstrap mode in `_StartupGate._decide()`:
-
-- If `lan` is detected on a non-desktop platform, it will be forced to fall back to `auto`.
-- In `auto` mode, if the node has not been saved yet, the public node list will be pulled first and the first online node will be written to `Prefs.setCurrentBootstrapNode(...)`
-
-The purpose of this is to ensure that when starting for the first time, there is already a usable node configuration before `FfiChatService.init()`.
-
-### Manual mode
-
-After manually entering the node on the settings page, `Prefs.setCurrentBootstrapNode(host, port, pubkey)` will be called directly. `FfiChatService.init()` will then read and apply it in `_loadAndApplySavedBootstrapNode()`.
-
-### LAN Bootstrap mode
-
-The LAN Bootstrap mode is the configuration layer concept of toxee, not the internal protocol branch of Tim2Tox. In the current implementation:
-
-- The desktop can start a local Tox instance as a Bootstrap service through `LanBootstrapServiceManager.startLocalBootstrapService(port)`
-- This service will generate an independent profile, log in as `BootstrapService`, take out `udpPort` and `dhtId`, and then start its own `startPolling()`
-- The UI layer will show its `ip/port/pubkey`
-
-But Tim2Tox still only recognizes the "current Bootstrap node" internally. Therefore, if the LAN Bootstrap service wants to actually participate in the connection, it still needs to write the corresponding `host/port/pubkey` back to the current node configuration.
+- **Automatic mode**: Before first `init()`, if no node is saved yet, fetch a public node list and write the current config so the first `init()` has a node.
+- **Manual mode**: After the user enters a node on a settings page, write the current config; `FfiChatService.init()` reads and applies it in `_loadAndApplySavedBootstrapNode()`.
+- **LAN mode** (if supported): Once the local Bootstrap service exposes `host/port/pubkey`, the client writes that triple into the current node config; Tim2Tox still only sees “current Bootstrap node”.
 
 ## 4. How Tim2Tox applies Bootstrap nodes
 
@@ -80,19 +56,9 @@ This means that in pages with `service` instances, the "test node" is not a pure
 - Read the current `selfId`
 - Use `getSelfConnectionStatus()` to push the current connection status immediately
 
-It does not guarantee that networking has been completed at this time. Real connection changes rely on the `conn:success` / `conn:failed` events in the polling queue.
+It does not guarantee that networking is complete at that time. Actual connection changes come from `conn:success` / `conn:failed` in the polling queue.
 
-The order when toxee is started is:
-
-1. `_StartupGate` ensures that there are currently available Bootstrap nodes
-2. Initialize `FfiChatService`
-3.`FakeUIKit.startWithFfi(service)`
-4. `_initTIMManagerSDK()`
-5.`service.startPolling()`
-6. Monitor `connectionStatusStream`
-7. Wait until the connection is successful within 20 seconds to preload the friends; otherwise, it will also enter the homepage after timeout.
-
-So `startPolling()` is the real starting point for networking and messaging consumption, not just a "background refresh".
+**Suggested client startup order**: After a usable Bootstrap node is available, initialize `FfiChatService`, then call `startPolling()` and listen to `connectionStatusStream`. `startPolling()` is the real starting point for networking and message consumption and must be called at the right time. For concrete order and UI flow, see each client project’s documentation.
 
 ## 6. Polling loop
 
@@ -136,47 +102,16 @@ Among them:
 
 This is why the poll interval is pressed to `50ms` during file transfer and a single round of batch drain queue is allowed.
 
-## 8. Maintenance points on the toxee side
+## 8. Client-side notes (summary)
 
-### Switch nodes
+- **Switching nodes**: Call `service.addBootstrapNode(...)` to write a new node and optionally call `service.login(...)` again; no need to recreate `FfiChatService`.
+- **Testing nodes**: If reusing `addBootstrapNode(...)` for probing, a successful test will also update the current node config; that is an implementation-side effect.
+- **LAN Bootstrap** (if supported): The local service exposes `ip/port/pubkey`; the client must still write that triple into the current node config. Tim2Tox does not distinguish node sources.
 
-The actual action of switching nodes in `BootstrapNodesPage` is:
+For concrete implementation and maintenance order, see each client repo’s documentation. When working in the Tim2Tox repo, read `dart/lib/interfaces/bootstrap_service.dart` and `dart/lib/service/ffi_chat_service.dart` first.
 
-1. `service.addBootstrapNode(...)`
-2.`service.login(...)`
+## 9. Related documents
 
-That is, "write the new node and log in again", not rebuild the entire `FfiChatService`.
-
-### Test node
-
-On the settings page or node list page, if `service != null`, the test action directly reuses `addBootstrapNode(...)`. This has an implementation-level side effect:
-
-- When the test is successful, the current node configuration will also be updatedIf it is just a login page scenario and there is no ready-made `service`, it will degrade to ordinary TCP detection.
-
-### LAN Bootstrap service
-
-Local services are only supported on the desktop. The current implementation is mainly:
-
-- Start an independent Tox instance
-- `ip/port/pubkey` who exposed it
-- Allow UI to do liveness detection
-
-It does not replace the `currentBootstrapNode` configuration model.
-
-## 9. Recommended maintenance sequence
-
-If you are changing Bootstrap, networking or polling issues, it is recommended to read the code in this order:
-
-1.`toxee/lib/main.dart`
-2. `toxee/lib/ui/settings/bootstrap_settings_section.dart`
-3. `toxee/lib/util/bootstrap_nodes.dart`
-4. `toxee/lib/util/lan_bootstrap_service.dart`
-5. `tim2tox/dart/lib/interfaces/bootstrap_service.dart`
-6. `tim2tox/dart/lib/service/ffi_chat_service.dart`
-
-## 10. Related documents
-
-- [ARCHITECTURE.md](ARCHITECTURE.en.md)
+- [ARCHITECTURE.en.md](../architecture/ARCHITECTURE.en.md)
 - [API Reference](../api/API_REFERENCE.en.md)
-- [../../toxee/doc/ACCOUNT_AND_SESSION.md](../../toxee/doc/ACCOUNT_AND_SESSION.en.md)
-- [../../toxee/doc/IMPLEMENTATION_DETAILS.md](../../toxee/doc/IMPLEMENTATION_DETAILS.en.md)
+- For an example client’s startup, Bootstrap, and account/session docs, see that client’s project, e.g. [toxee](https://github.com/anonymoussoft/toxee) (when Tim2Tox is used as a submodule, the parent repo’s doc).

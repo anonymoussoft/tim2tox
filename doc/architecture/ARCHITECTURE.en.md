@@ -15,7 +15,7 @@ This document is for **framework maintainers** and **integration engineers**. It
 - [7. Callback bridging mechanism](#7-callback-bridging-mechanism)
 - [8. Bootstrap and polling](#8-bootstrap-and-polling)
 - [9. Multi-instance support: purpose and boundaries](#9-multi-instance-support-purpose-and-boundaries)
-- [10. Relationship with the client (e.g. toxee)](#10-relationship-with-the-client-eg-toxee)
+- [10. Relationship with the integrating client](#10-relationship-with-the-integrating-client)
 - [11. Common extension points](#11-common-extension-points)
 - [12. Risks and testing recommendations](#12-risks-and-testing-recommendations)
 
@@ -28,7 +28,7 @@ This document is for **framework maintainers** and **integration engineers**. It
 | **Bridge UIKit and Tox** | Upper layer is Tencent Cloud Chat UIKit / V2TIM-style API; lower layer is c-toxcore P2P protocol. Tim2Tox performs semantic mapping and data translation. |
 | **Compatible V2TIM calls and callback format** | Callers (SDK/app) do not need to change business logic. Callback format (e.g. apiCallback/globalCallback JSON) matches the native SDK contract so listener dispatch works unchanged. |
 | **Dual paths** | Support **binary replacement path** (NativeLibraryManager → Dart*) and **Platform/FfiChatService path** (TencentCloudChatSdkPlatform → FfiChatService → tim2tox_ffi_*). Clients can use one or both. |
-| **Reusable, not tied to a specific client** | Dependencies are injected via interfaces (Preferences, Logger, Bootstrap, EventBus, ConversationManager, etc.); no direct dependency on toxee or any app code. Any Flutter chat client can reuse Tim2Tox. |
+| **Reusable, not tied to a specific client** | Dependencies are injected via interfaces (Preferences, Logger, Bootstrap, EventBus, ConversationManager, etc.); no direct dependency on any particular app. Any Flutter chat client can reuse Tim2Tox. |
 
 ---
 
@@ -259,7 +259,7 @@ See [FFI_COMPAT_LAYER.md](FFI_COMPAT_LAYER.en.md).
 - **Per round**: Call `tim2tox_ffi_poll_text(instance_id, buffer, len)` (and custom, etc.) to read from the queue; parse line-based events (e.g. `conn:success`, `c2c:`, `gtext:`, `file_request:`, `file_done:`), update connection state, message streams, file progress. For multi-instance, poll each instance in `_knownInstanceIds`; non-default instances are prioritized so file_request is consumed in time.
 - **Interval**: Shorter (e.g. 50ms) when there is file transfer or multi-instance; 200ms when recently active; 1000ms when idle. Profile is saved periodically (e.g. every 60s).
 
-See [BOOTSTRAP_AND_POLLING.en.md](../integration/BOOTSTRAP_AND_POLLING.en.md) for details and toxee-side configuration.
+See [BOOTSTRAP_AND_POLLING.en.md](../integration/BOOTSTRAP_AND_POLLING.en.md) for details and client-side contract.
 
 ---
 
@@ -275,18 +275,16 @@ See [MULTI_INSTANCE_SUPPORT.en.md](../development/MULTI_INSTANCE_SUPPORT.en.md).
 
 ---
 
-## 10. Relationship with the client (e.g. toxee)
+## 10. Relationship with the integrating client
 
-toxee uses a **hybrid** setup:
+Integrators can use a **hybrid** setup (binary replacement + Platform); the client owns UI and interface injection, Tim2Tox provides the core:
 
-- **Binary replacement**: In `main()`, `setNativeLibraryName('tim2tox_ffi')` so the SDK loads `libtim2tox_ffi`. Most TIMManager/NativeLibraryManager calls go through Dart* → V2TIM without changing SDK call sites.
-- **Platform**: `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(ffiService: ffiChatService)`. When `isCustomPlatform == true`, the SDK routes a subset of methods to the Platform (exact count depends on SDK version), and Tim2ToxSdkPlatform delegates to FfiChatService (history, polling, some callbacks, call bridge, etc.).
-- **Division of work**:
-  - History (getHistoryMessageList, clearHistory, etc.) is provided by Platform → FfiChatService → MessageHistoryPersistence.
-  - Login, send message, friend list, groups can go through either binary replacement (Dart*) or Platform depending on SDK routing; in hybrid mode Platform fills gaps (custom callbacks, Bootstrap write, calls).
-- **Client responsibilities**: toxee provides Bootstrap settings UI, node sources (auto/manual/lan), FakeUIKit, message/session UI, and injects Preferences, Logger, BootstrapService, etc. into FfiChatService.
+- **Binary replacement**: Call `setNativeLibraryName('tim2tox_ffi')` as early as possible so the SDK loads `libtim2tox_ffi`. Most TIMManager/NativeLibraryManager calls then go through Dart* → V2TIM.
+- **Platform**: Set `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(ffiService: ffiChatService)`. When `isCustomPlatform == true`, the SDK routes a subset of methods to the Platform; Tim2ToxSdkPlatform delegates to FfiChatService (history, polling, callbacks, call bridge, etc.).
+- **Division of work**: History (getHistoryMessageList, clearHistory, etc.) is provided by Platform → FfiChatService; login, send message, friends, groups can go through binary replacement or Platform; in hybrid mode Platform fills custom callbacks, Bootstrap write, calls.
+- **Client responsibilities**: Provide Bootstrap settings and node sources, message/session UI, and implement Preferences, Logger, BootstrapService, etc. and inject them into FfiChatService.
 
-See [BINARY_REPLACEMENT.en.md](BINARY_REPLACEMENT.en.md) for routing behavior and the main [README](../../README.en.md) integration section.
+For a full example and startup order, see each client project’s documentation. See [BINARY_REPLACEMENT.en.md](BINARY_REPLACEMENT.en.md) for routing and the main [README](../../README.en.md) integration section.
 
 ---
 

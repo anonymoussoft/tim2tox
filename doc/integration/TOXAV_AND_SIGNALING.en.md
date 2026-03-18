@@ -95,15 +95,9 @@ Design reasons:
 
 The last hop from native callback to Dart is completed by trampoline; it reads `instance_id` from `userData` and then delivers it to the corresponding service instance.
 
-## 5. Relationship with clients
+## 5. Relationship with the client
 
-In toxee:
-
-- `FakeUIKit.startWithFfi()` Created by `CallServiceManager`
-- `HomePage.initState()` calls `callServiceManager.initialize()` after the Platform setup is complete
-- `CallServiceManager` then connect `ToxAVService`, `CallBridgeService` and `TUICallKitAdapter`
-
-Therefore, the signaling path will be incomplete if the client does not set `Tim2ToxSdkPlatform` first.
+The client must create and initialize the call-related components (e.g. CallServiceManager) after setting `Tim2ToxSdkPlatform`, and wire ToxAVService, CallBridgeService, TUICallKit adapter, etc. If Platform is not set first, the signaling path will be incomplete. For concrete integration and UI, see each client project’s documentation.
 
 ## 6. Current Limitations
 
@@ -116,4 +110,4 @@ Therefore, the signaling path will be incomplete if the client does not set `Tim
 - [ARCHITECTURE.md](ARCHITECTURE.en.md)
 - [API Reference](../api/API_REFERENCE.en.md)
 - [MULTI_INSTANCE_SUPPORT.md](MULTI_INSTANCE_SUPPORT.en.md)
-- [../../toxee/doc/CALLING_AND_EXTENSIONS.md](../../toxee/doc/CALLING_AND_EXTENSIONS.en.md)
+- For client-side calling and extensions implementation, see each client project’s documentation (e.g. when Tim2Tox is used as a submodule, the parent repo’s doc).

@@ -15,7 +15,7 @@
 - [7. 回调桥接机制](#7-回调桥接机制)
 - [8. Bootstrap 与 Polling](#8-bootstrap-与-polling)
 - [9. 多实例支持的用途与边界](#9-多实例支持的用途与边界)
-- [10. 与客户端（如 toxee）的关系](#10-与客户端如-toxee-的关系)
+- [10. 与接入客户端的关系](#10-与接入客户端的关系)
 - [11. 常见扩展方式](#11-常见扩展方式)
 - [12. 风险点与测试建议](#12-风险点与测试建议)
 
@@ -28,7 +28,7 @@
 | **连接 UIKit 与 Tox** | 上层为 Tencent Cloud Chat UIKit / V2TIM 风格 API，底层为 c-toxcore P2P 协议；Tim2Tox 负责语义映射与数据转换。 |
 | **兼容 V2TIM 调用与回调格式** | 调用方（SDK/应用）无需改写业务逻辑；回调格式（如 apiCallback/globalCallback JSON）与原生 SDK 约定一致，便于监听器分发。 |
 | **双路径并存** | 支持**二进制替换路径**（NativeLibraryManager → Dart*）与 **Platform/FfiChatService 路径**（TencentCloudChatSdkPlatform → FfiChatService → tim2tox_ffi_*），客户端可择一或混合使用。 |
-| **可复用、不绑定具体客户端** | 通过接口注入（Preferences、Logger、Bootstrap、EventBus、ConversationManager 等）依赖，不直接依赖 toxee 或任意 App 代码，可被其他 Flutter 聊天客户端复用。 |
+| **可复用、不绑定具体客户端** | 通过接口注入（Preferences、Logger、Bootstrap、EventBus、ConversationManager 等）依赖，不直接依赖任一具体 App 代码，可被任意 Flutter 聊天客户端复用。 |
 
 ---
 
@@ -256,7 +256,7 @@ c-toxcore / ToxManager    V2TIM Listener 实现      json_parser / callback_brid
 - **每轮逻辑**：调用 `tim2tox_ffi_poll_text(instance_id, buffer, len)`（及 custom 等）从队列取事件；解析行格式（如 `conn:success`、`c2c:`、`gtext:`、`file_request:`、`file_done:` 等），更新连接状态、消息流、文件进度等；多实例时按 `_knownInstanceIds` 轮询各 instance，优先处理非默认实例以便 file_request 等及时被消费。  
 - **间隔策略**：有文件传输或多实例时用较短间隔（如 50ms）；最近有活动时 200ms；空闲 1000ms；另设 profile 定期保存（如 60s）。  
 
-Bootstrap 与 Polling 的详细流程与 toxee 侧配置见 [BOOTSTRAP_AND_POLLING.md](../integration/BOOTSTRAP_AND_POLLING.md)。
+Bootstrap 与 Polling 的详细流程与客户端侧约定见 [BOOTSTRAP_AND_POLLING.md](../integration/BOOTSTRAP_AND_POLLING.md)。
 
 ---
 
@@ -272,18 +272,16 @@ Bootstrap 与 Polling 的详细流程与 toxee 侧配置见 [BOOTSTRAP_AND_POLLI
 
 ---
 
-## 10. 与客户端（如 toxee）的关系
+## 10. 与接入客户端的关系
 
-toxee 采用**混合架构**：
+接入方可采用**混合架构**（二进制替换 + Platform），由客户端负责 UI 与接口注入，Tim2Tox 提供底层能力：
 
-- **二进制替换**：`main()` 中 `setNativeLibraryName('tim2tox_ffi')`，SDK 加载 `libtim2tox_ffi`，大部分 TIMManager/NativeLibraryManager 调用走 Dart* → V2TIM，无需改 SDK 调用代码。  
-- **Platform**：设置 `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(ffiService: ffiChatService)`；当 `isCustomPlatform == true` 时，SDK 将配置的若干方法路由到 Platform（具体数量随 SDK 版本而定），由 Tim2ToxSdkPlatform 委托给 FfiChatService（历史、轮询、部分回调、通话桥等）。  
-- **分工**：  
-  - 历史消息、clearHistory、getHistoryMessageList 等由 Platform → FfiChatService → MessageHistoryPersistence 提供。  
-  - 登录、发消息、好友列表、群组等既可走二进制替换（Dart*）也可走 Platform，取决于 SDK 路由表；混合下部分能力由 Platform 补足（如自定义回调、Bootstrap 写入、通话）。  
-- **客户端职责**：toxee 提供 Bootstrap 设置页、节点来源（auto/manual/lan）、FakeUIKit 与消息/会话 UI，并注入 Preferences、Logger、BootstrapService 等接口给 FfiChatService。
+- **二进制替换**：在应用最早阶段 `setNativeLibraryName('tim2tox_ffi')`，SDK 加载 `libtim2tox_ffi`，大部分 TIMManager/NativeLibraryManager 调用走 Dart* → V2TIM。  
+- **Platform**：设置 `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(ffiService: ffiChatService)`；当 `isCustomPlatform == true` 时，SDK 将配置的若干方法路由到 Platform，由 Tim2ToxSdkPlatform 委托给 FfiChatService（历史、轮询、部分回调、通话桥等）。  
+- **分工**：历史消息、clearHistory、getHistoryMessageList 等由 Platform → FfiChatService 提供；登录、发消息、好友/群组等可走二进制替换或 Platform，混合下由 Platform 补足自定义回调、Bootstrap 写入、通话等。  
+- **客户端职责**：提供 Bootstrap 设置与节点来源、消息/会话 UI，并实现 Preferences、Logger、BootstrapService 等接口注入给 FfiChatService。
 
-路由行为见 [BINARY_REPLACEMENT.md](BINARY_REPLACEMENT.md)、主 [README](../../README.md) 集成方案。
+完整示例与启动顺序见各客户端项目文档。路由行为见 [BINARY_REPLACEMENT.md](BINARY_REPLACEMENT.md)、主 [README](../../README.md) 集成方案。
 
 ---
 

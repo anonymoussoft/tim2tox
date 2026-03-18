@@ -8,7 +8,7 @@
 
 二进制替换方案（BINARY REPLACEMENT MODE）是一种通过替换动态库文件来实现后端切换的方案，使得 Dart 层代码完全不需要修改，就能从腾讯云 IM SDK 切换到 Tox P2P 协议。
 
-**当前使用状态**: ✅ **toxee 使用混合模式（Binary Replacement + Platform 接口）**
+**当前使用状态**: ✅ **接入方可使用混合模式（Binary Replacement + Platform 接口）；示例见采用本仓库的上层客户端。**
 
 **配置方式**:
 - 在 `main()` 最早期调用 `setNativeLibraryName('tim2tox_ffi')` 配置库名
@@ -293,9 +293,9 @@ int DartXXX(const char* json_param, void* user_data) {
 | **自定义 callback** | 通过 `customCallbackHandler` | 直接在 Platform 实现 | `customCallbackHandler` 注册到 Platform |
 | **适用场景** | 快速集成 | 需要高级功能 | 生产环境 |
 
-### 混合模式（toxee 当前使用）
+### 混合模式（推荐）
 
-toxee 同时使用二进制替换和 Platform 接口：
+接入方可同时使用二进制替换和 Platform 接口，例如：
 
 1. `setNativeLibraryName('tim2tox_ffi')` — 加载 `libtim2tox_ffi.dylib`
 2. `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(...)` — 启用高级功能
@@ -392,6 +392,76 @@ c-toxcore (P2P 通信)
 - `tim2tox/ffi/dart_compat_layer.cpp` - Dart* 函数实现
 - `tim2tox/ffi/callback_bridge.cpp` - 回调桥接机制
 
+## 使用 Dart API（tim2tox_ffi.dart）驱动同一后端
+
+同一套原生动态库（`libtim2tox_ffi`）对外提供**两套 C 接口**，对应两种用法：
+
+| 入口 | 符号前缀 | 调用方 | 参数/回调 |
+|------|----------|--------|-----------|
+| 二进制替换 | `Dart*`（如 `DartInitSDK`） | SDK 的 `NativeLibraryManager.bindings` | JSON 入参 + `Dart_PostCObject_DL` → ReceivePort |
+| Dart API | `tim2tox_ffi_*`（如 `tim2tox_ffi_init`） | Dart 层 `Tim2ToxFfi`（tim2tox_ffi.dart） | 原生类型 + `setCallback` 事件回调 |
+
+- **二进制替换方案**下，应用只调用 `setNativeLibraryName('tim2tox_ffi')`，由 SDK 通过 `bindings.DartXXX(...)` 使用 `Dart*` 接口，应用侧**不直接使用** tim2tox_ffi.dart。
+- **Platform 方案**下，应用设置 `TencentCloudChatSdkPlatform.instance = Tim2ToxSdkPlatform(...)`，内部通过 `FfiChatService` 使用 **Tim2ToxFfi**（即 tim2tox_ffi.dart）调用 `tim2tox_ffi_*`，驱动同一套后端。
+
+若希望**不依赖 SDK 的 NativeLibraryManager**，直接用 Dart 代码驱动同一套 Tox 后端（例如独立测试、自研 UI、或与二进制替换共用同一库文件），可仅使用 **Dart API（tim2tox_ffi.dart）** 按下列方式实现“同一后端”的初始化与调用流程。
+
+### 1. 加载动态库
+
+与二进制替换使用的是**同一动态库**（编译产物见上文「编译产物」）。Dart 侧通过 `Tim2ToxFfi.open()` 按平台查找并打开该库（macOS 下为 `libtim2tox_ffi.dylib` 等）：
+
+```dart
+import 'package:tim2tox_ffi/ffi/tim2tox_ffi.dart';
+
+final ffi = Tim2ToxFfi.open();
+```
+
+### 2. 初始化与事件回调
+
+- **初始化**：在调用其他接口前调用 `init()` 或 `initWithPath(profileDir)`（可选指定 profile 目录）。
+- **事件回调**：通过 `setCallback(callback, userData)` 注册统一事件回调；C 层会按 `event_type`、`sender`、`payload` 回调，对应 Tox 消息、好友、群组等事件（与二进制替换方案中的 globalCallback 语义一致，但走的是 tim2tox_ffi 的 C 回调而非 ReceivePort）。
+
+```dart
+// 初始化（二选一）
+ffi.init();
+// 或指定 profile 目录：ffi.initWithPath('path/to/profile'.toNativeUtf8());
+
+// 注册事件回调：签名见 tim2tox_ffi.dart 中 event 回调类型（event_type, sender_utf8, payload_bytes, payload_len）
+ffi.setCallback(yourEventCallbackNative, ffi.Pointer.fromAddress(0));
+```
+
+### 3. 登录
+
+- 同步：`login(userId.toNativeUtf8(), userSig.toNativeUtf8())`
+- 异步（推荐）：`loginAsync(instanceId, userId, userSig, nativeCallback, userData)`，在回调中处理成功/失败。
+
+登录成功后即可调用好友、消息、群组等接口。
+
+### 4. 典型能力与 Dart API 对应关系
+
+| 能力 | Dart API（tim2tox_ffi.dart） |
+|------|------------------------------|
+| 初始化 | `init()` / `initWithPath(...)` |
+| 登录 | `login(...)` / `loginAsync(...)` |
+| 事件接收 | `setCallback(...)` |
+| C2C 文本 | `sendText(toUserId, text)` |
+| 好友列表 | `getFriendList(buffer, size)` |
+| 群组 | `createGroup`, `joinGroup`, `sendGroupText`, `getKnownGroups`, ... |
+| 信令/音视频 | `signalingAddListenerNative`, `avInitialize`, `avStartCallNative`, ... |
+| 多实例/测试 | `createTestInstanceNative`, `setCurrentInstance`, `injectCallback` 等 |
+
+以上接口均直接绑定到 `tim2tox_ffi_*` 符号，与二进制替换使用的 `Dart*` 符号不同，但底层同为 V2TIM/ToxManager/c-toxcore，行为一致。
+
+### 5. 与二进制替换的选用建议
+
+- **仅做后端替换、尽量少改 Dart**：使用**二进制替换**（`setNativeLibraryName('tim2tox_ffi')`），不直接使用 tim2tox_ffi.dart。
+- **需要高级能力或自定义 Platform**：使用 **Platform 方案**（`Tim2ToxSdkPlatform` + `FfiChatService`），此时由 FfiChatService 内部通过 tim2tox_ffi.dart 调用 `tim2tox_ffi_*`。
+- **不依赖 SDK、直接驱动 Tox 后端**：仅依赖 tim2tox_ffi.dart，`Tim2ToxFfi.open()` → `init` → `setCallback` → `login`，再按需调用上述能力接口。
+
+**关键文件**:
+- `tim2tox/dart/lib/ffi/tim2tox_ffi.dart` — Dart API 绑定（tim2tox_ffi_*）
+- `tim2tox/dart/lib/service/ffi_chat_service.dart` — Platform 方案下的高级服务层（内部使用 Tim2ToxFfi）
+
 ## 部署方式
 
 ### 1. 编译动态库
@@ -411,16 +481,16 @@ make tim2tox_ffi
 
 ### 2. 打包到应用
 
-**macOS**:
+**macOS**（路径以实际客户端项目为准）:
 ```bash
 cp tim2tox/build/ffi/libtim2tox_ffi.dylib \
-   toxee/build/macos/Build/Products/Debug/toxee.app/Contents/MacOS/
+   <客户端项目>/build/macos/Build/Products/Debug/<app>.app/Contents/MacOS/
 ```
 
 **Linux**:
 ```bash
 cp tim2tox/build/ffi/libtim2tox_ffi.so \
-   toxee/build/linux/x64/debug/bundle/lib/
+   <客户端项目>/build/linux/x64/debug/bundle/lib/
 ```
 
 ### 3. 依赖库处理
