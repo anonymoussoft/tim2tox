@@ -42,8 +42,7 @@
 - `isCustomPlatform` routing behavior: see [architecture/BINARY_REPLACEMENT.en.md](architecture/BINARY_REPLACEMENT.en.md) and SDK source; no dedicated troubleshooting page.
 - [architecture/PLATFORM_VS_V2TIM_AND_CONVERSATION_LISTENER.en.md](architecture/PLATFORM_VS_V2TIM_AND_CONVERSATION_LISTENER.en.md) - Analysis of the relationship between Platform and V2TIM under binary replacement
 
-## Client linkage
+## Example client
 
 - [Main README](../README.en.md)
-- [toxee Documentation Index](../../../doc/README.en.md)
-- [toxee Account and Session](../../../doc/reference/ACCOUNT_AND_SESSION.en.md)
+- A client that uses Tim2Tox is [toxee](https://github.com/anonymoussoft/toxee). For its documentation and account/session details, see the [toxee repository](https://github.com/anonymoussoft/toxee); when Tim2Tox is used as a submodule, the parent repo’s `doc/` may also apply.

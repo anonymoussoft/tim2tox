@@ -116,6 +116,35 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// sidebar and conversation list show the new unread count.
   void Function(String? groupId)? onGroupMessageReceivedForUnread;
 
+  /// Prefer the parsed chat-message group id, but fall back to the V2 message group id.
+  /// Conference messages can arrive with only the latter populated.
+  static String? resolveGroupIdForUnread({
+    String? chatMessageGroupId,
+    String? v2GroupId,
+  }) {
+    if (chatMessageGroupId != null && chatMessageGroupId.isNotEmpty) {
+      return chatMessageGroupId;
+    }
+    if (v2GroupId != null && v2GroupId.isNotEmpty) {
+      return v2GroupId;
+    }
+    return null;
+  }
+
+  /// Prefer per-instance listeners, but fall back to global listeners when the
+  /// instance-specific list is empty. This must also work for `instanceId == 0`,
+  /// because the main app registers most listeners only in the global lists.
+  static List<T> selectDispatchListeners<T>({
+    required int instanceId,
+    required List<T> instanceListeners,
+    required List<T> globalListeners,
+  }) {
+    if (instanceListeners.isNotEmpty) {
+      return instanceListeners;
+    }
+    return globalListeners;
+  }
+
   // Set current instance for static callbacks
   final ConversationManagerProvider? conversationManagerProvider;
   final ExtendedPreferencesService? _preferencesService;
@@ -1740,6 +1769,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             print(
                 '[Tim2ToxSdkPlatform] Message already exists in history, skipping persistence save');
         }
+        ffiService.refreshConversationCacheFromHistory(conversationId);
 
         if (_debugLog)
           print(
@@ -1753,8 +1783,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
         // When a group message is received (not from self), increment unread and refresh
         // so sidebar and conversation list show unread count (native path does not go through FakeIM).
-        if (!chatMsg.isSelf && (chatMsg.groupId ?? '').isNotEmpty) {
-          onGroupMessageReceivedForUnread?.call(chatMsg.groupId);
+        final groupIdForUnread = resolveGroupIdForUnread(
+          chatMessageGroupId: chatMsg.groupId,
+          v2GroupId: v2Msg.groupID,
+        );
+        if (!chatMsg.isSelf && (groupIdForUnread ?? '').isNotEmpty) {
+          onGroupMessageReceivedForUnread?.call(groupIdForUnread);
         }
 
         // Clean up forward message cache after message is successfully added to target conversation
@@ -2455,13 +2489,26 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       return;
     }
     final type = GlobalCallbackType.fromValue(callbackType);
-    var sdkList = _instanceSdkListeners[instanceId] ?? [];
-    if (sdkList.isEmpty && instanceId != 0) sdkList = _sdkListeners;
-    var advList = _instanceAdvancedMsgListeners[instanceId] ?? [];
-    if (advList.isEmpty && instanceId != 0) advList = _advancedMsgListeners;
-    var grpList = _instanceGroupListeners[instanceId] ?? [];
-    if (grpList.isEmpty) grpList = _groupListeners;
-    final convList = _instanceConversationListeners[instanceId] ?? [];
+    final sdkList = selectDispatchListeners<V2TimSDKListener>(
+      instanceId: instanceId,
+      instanceListeners: _instanceSdkListeners[instanceId] ?? [],
+      globalListeners: _sdkListeners,
+    );
+    final advList = selectDispatchListeners<V2TimAdvancedMsgListener>(
+      instanceId: instanceId,
+      instanceListeners: _instanceAdvancedMsgListeners[instanceId] ?? [],
+      globalListeners: _advancedMsgListeners,
+    );
+    final grpList = selectDispatchListeners<V2TimGroupListener>(
+      instanceId: instanceId,
+      instanceListeners: _instanceGroupListeners[instanceId] ?? [],
+      globalListeners: _groupListeners,
+    );
+    final convList = selectDispatchListeners<V2TimConversationListener>(
+      instanceId: instanceId,
+      instanceListeners: _instanceConversationListeners[instanceId] ?? [],
+      globalListeners: _conversationListeners,
+    );
 
     switch (type) {
       case GlobalCallbackType.ConversationEvent:
@@ -3297,8 +3344,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     final convToNotify = V2TimConversation(conversationID: conversationID);
     // Populate faceUrl from cache so UIKit widgets can display the latest avatar
     // without needing a separate getConversation round-trip.
-    final cachedPath = _friendAvatarPathCache[receiver] ??
-        _friendAvatarPathCache[c2cKey];
+    final cachedPath =
+        _friendAvatarPathCache[receiver] ?? _friendAvatarPathCache[c2cKey];
     if (cachedPath != null && cachedPath.isNotEmpty) {
       convToNotify.faceUrl = cachedPath;
     }

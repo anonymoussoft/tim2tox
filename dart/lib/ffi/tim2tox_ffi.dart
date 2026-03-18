@@ -678,9 +678,9 @@ class Tim2ToxFfi {
       // Try system library path (Flutter's default)
       return Tim2ToxFfi._(ffi.DynamicLibrary.open(libName));
     } catch (e) {
-      // If that fails, try common Android library paths
+      // If that fails, try generic system/vendor paths only (no app-specific path;
+      // this library must not hardcode any client app package name).
       final possiblePaths = [
-        '/data/data/com.example.toxee/lib/$libName',
         '/system/lib/$libName',
         '/vendor/lib/$libName',
       ];

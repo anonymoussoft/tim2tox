@@ -42,8 +42,7 @@
 - `isCustomPlatform` 路由行为见 [architecture/BINARY_REPLACEMENT.md](architecture/BINARY_REPLACEMENT.md) 与 SDK 源码，无独立排障页。
 - [architecture/PLATFORM_VS_V2TIM_AND_CONVERSATION_LISTENER.md](architecture/PLATFORM_VS_V2TIM_AND_CONVERSATION_LISTENER.md) - 二进制替换下 Platform 与 V2TIM 关系分析
 
-## 客户端联动
+## 示例客户端
 
 - [主 README](../README.md)
-- [toxee 文档索引](../../../doc/README.md)
-- [toxee 账号与会话](../../../doc/reference/ACCOUNT_AND_SESSION.md)
+- 使用 Tim2Tox 的客户端包括 [toxee](https://github.com/anonymoussoft/toxee)。其文档与账号/会话说明见 [toxee 仓库](https://github.com/anonymoussoft/toxee)；当 Tim2Tox 作为 submodule 被使用时，也可在上层仓库的 `doc/` 中查看。

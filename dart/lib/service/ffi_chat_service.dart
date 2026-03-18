@@ -25,7 +25,10 @@ typedef _login_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 // R-08: Async login callback (C signature for NativeCallable)
 typedef _login_callback_native = ffi.Void Function(
-    ffi.Int32 success, ffi.Int32 error_code, ffi.Pointer<pkgffi.Utf8> error_message, ffi.Pointer<ffi.Void> user_data);
+    ffi.Int32 success,
+    ffi.Int32 error_code,
+    ffi.Pointer<pkgffi.Utf8> error_message,
+    ffi.Pointer<ffi.Void> user_data);
 typedef _add_friend_c = ffi.Int32 Function(
     ffi.Pointer<pkgffi.Utf8>, ffi.Pointer<pkgffi.Utf8>);
 typedef _send_text_c = ffi.Int32 Function(
@@ -578,6 +581,19 @@ class FfiChatService {
 
   int getUnreadOf(String peerId) => _unreadByPeer[peerId] ?? 0;
 
+  /// Refresh the in-memory last-message cache for a conversation from persisted history.
+  /// This is used when a message is written through a native/UI path that bypasses
+  /// [_appendHistory] but should still update conversation preview state immediately.
+  void refreshConversationCacheFromHistory(String conversationId) {
+    final normalizedId = ConversationIdUtils.normalize(conversationId);
+    final history = getHistory(normalizedId);
+    if (history.isEmpty) return;
+
+    final sortedHistory = List<ChatMessage>.from(history)
+      ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    _lastByPeer[normalizedId] = sortedHistory.first;
+  }
+
   /// Increment unread count for a group. Used when a group message is received via
   /// the native path (OnRecvNewMessage) so sidebar and conversation list show unread.
   void incrementGroupUnread(String groupId) {
@@ -982,21 +998,20 @@ class FfiChatService {
   }
 
   Future<void> login({required String userId, required String userSig}) async {
-    _pendingLoginCompleter = Completer<({int success, int code, String message})>();
-    _loginNativeCallable ??= ffi.NativeCallable<_login_callback_native>.listener(_onLoginCallback);
+    _pendingLoginCompleter =
+        Completer<({int success, int code, String message})>();
+    _loginNativeCallable ??=
+        ffi.NativeCallable<_login_callback_native>.listener(_onLoginCallback);
     final instanceId = _ffi.getCurrentInstanceId();
     final puid = userId.toNativeUtf8();
     final psig = userSig.toNativeUtf8();
-    final r = _ffi.loginAsync(
-        instanceId,
-        puid,
-        psig,
-        _loginNativeCallable!.nativeFunction,
-        ffi.Pointer.fromAddress(0));
+    final r = _ffi.loginAsync(instanceId, puid, psig,
+        _loginNativeCallable!.nativeFunction, ffi.Pointer.fromAddress(0));
     pkgffi.malloc.free(puid);
     pkgffi.malloc.free(psig);
     if (r != 1) {
-      _pendingLoginCompleter!.complete((success: 0, code: -1, message: 'login_async did not start'));
+      _pendingLoginCompleter!.complete(
+          (success: 0, code: -1, message: 'login_async did not start'));
     }
     final result = await _pendingLoginCompleter!.future;
     if (result.success != 1) {
@@ -1020,7 +1035,8 @@ class FfiChatService {
     }
   }
 
-  void _onLoginCallback(int success, int errorCode, ffi.Pointer<pkgffi.Utf8> errorMessage, ffi.Pointer<ffi.Void> userData) {
+  void _onLoginCallback(int success, int errorCode,
+      ffi.Pointer<pkgffi.Utf8> errorMessage, ffi.Pointer<ffi.Void> userData) {
     final comp = _pendingLoginCompleter;
     _pendingLoginCompleter = null;
     if (comp != null && !comp.isCompleted) {
@@ -1294,8 +1310,8 @@ class FfiChatService {
                       // Auto-send received receipt for received group messages (not self-sent)
                       // Note: reaction messages are sent via custom messages and should not trigger receipts
                       if (!msg.isSelf && !_isReactionMessage(text)) {
-                        unawaited(
-                            _sendReceipt(from, msgID, 'received', groupID: gid));
+                        unawaited(_sendReceipt(from, msgID, 'received',
+                            groupID: gid));
                       }
                     }
                   }
@@ -5158,7 +5174,9 @@ class FfiChatService {
         if (await dir.exists()) {
           await for (final entity in dir.list()) {
             if (entity is File &&
-                p.basename(entity.path).startsWith('friend_${friendId}_avatar')) {
+                p
+                    .basename(entity.path)
+                    .startsWith('friend_${friendId}_avatar')) {
               try {
                 await entity.delete();
               } catch (_) {}
