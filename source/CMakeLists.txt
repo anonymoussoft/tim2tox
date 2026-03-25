@@ -4,7 +4,9 @@ cmake_minimum_required(VERSION 3.4.1)
 set(BINARY_NAME "tim2tox")
 
 # Compiler warnings
-add_definitions(-Wfatal-errors)
+if(NOT MSVC)
+    add_definitions(-Wfatal-errors)
+endif()
 
 # Find dependencies (libsodium)
 find_package(Sodium QUIET)
