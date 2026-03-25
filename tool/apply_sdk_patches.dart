@@ -46,6 +46,26 @@ void main(List<String> args) async {
     exit(0);
   }
 
+  // Initialize a git repo in the SDK dir so git apply works.
+  // git apply requires a git repository context.
+  if (!Directory('${sdk.path}/.git').existsSync()) {
+    stdout.writeln('Initializing git repo in SDK dir for patching...');
+    int c = await _run(sdk.path, 'git', ['init']);
+    if (c != 0) {
+      stderr.writeln('apply_sdk_patches: git init failed');
+      exit(1);
+    }
+    // Configure line endings to preserve LF
+    await _run(sdk.path, 'git', ['config', 'core.autocrlf', 'false']);
+    await _run(sdk.path, 'git', ['config', 'core.eol', 'lf']);
+    // Stage all files so git apply can work
+    c = await _run(sdk.path, 'git', ['add', '-A']);
+    if (c != 0) {
+      stderr.writeln('apply_sdk_patches: git add failed');
+      exit(1);
+    }
+  }
+
   for (final name in lines) {
     final patchFile = File('${patchesDir.path}/$name');
     if (!patchFile.existsSync()) {
