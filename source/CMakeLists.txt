@@ -118,14 +118,21 @@ if(BUILD_TOXAV)
 endif()
 
 # Compiler options
-target_compile_options(tim2tox
-    PRIVATE
-    -Wall
-    -Wextra
-    -Werror
-    -Wno-unused-parameter
-    -fPIC
-)
+if(MSVC)
+    target_compile_options(tim2tox
+        PRIVATE
+        /W3
+    )
+else()
+    target_compile_options(tim2tox
+        PRIVATE
+        -Wall
+        -Wextra
+        -Werror
+        -Wno-unused-parameter
+        -fPIC
+    )
+endif()
 
 if(APPLE)
     target_compile_options(tim2tox
