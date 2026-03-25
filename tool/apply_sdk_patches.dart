@@ -58,6 +58,8 @@ void main(List<String> args) async {
     // Configure line endings to preserve LF
     await _run(sdk.path, 'git', ['config', 'core.autocrlf', 'false']);
     await _run(sdk.path, 'git', ['config', 'core.eol', 'lf']);
+    // Normalize SDK file line endings to LF before staging (Windows CI fix)
+    _normalizeSdkLineEndings(sdk);
     // Stage all files so git apply can work
     c = await _run(sdk.path, 'git', ['add', '-A']);
     if (c != 0) {
@@ -107,4 +109,40 @@ Future<int> _run(String cwd, String executable, List<String> args) async {
   if (r.stdout.toString().trim().isNotEmpty) stdout.write(r.stdout);
   if (r.stderr.toString().trim().isNotEmpty) stderr.write(r.stderr);
   return r.exitCode;
+}
+
+void _normalizeSdkLineEndings(Directory sdkDir) {
+  const textExtensions = {
+    '.dart',
+    '.yaml',
+    '.yml',
+    '.json',
+    '.xml',
+    '.gradle',
+    '.kts',
+    '.java',
+    '.kt',
+    '.m',
+    '.mm',
+    '.swift',
+    '.h',
+    '.hpp',
+    '.c',
+    '.cc',
+    '.cpp',
+    '.txt',
+    '.md',
+  };
+
+  for (final entity in sdkDir.listSync(recursive: true)) {
+    if (entity is! File) continue;
+    final lowerPath = entity.path.toLowerCase();
+    if (!textExtensions.any(lowerPath.endsWith)) continue;
+
+    final contents = entity.readAsStringSync();
+    final normalized = contents.replaceAll('\r\n', '\n');
+    if (contents != normalized) {
+      entity.writeAsStringSync(normalized);
+    }
+  }
 }
