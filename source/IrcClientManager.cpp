@@ -1,13 +1,41 @@
 // IrcClientManager.cpp
 #include "IrcClientManager.h"
 #include "V2TIMLog.h"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
+
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib, "ws2_32.lib")
+  typedef int socklen_t;
+  typedef long long ssize_t;
+  #define IRC_CLOSE_SOCKET(s) closesocket(s)
+  #define IRC_ERRNO WSAGetLastError()
+  #define IRC_EINPROGRESS WSAEWOULDBLOCK
+  static void irc_set_nonblocking(int sock, bool nonblocking) {
+      u_long mode = nonblocking ? 1 : 0;
+      ioctlsocket(sock, FIONBIO, &mode);
+  }
+#else
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  #include <netdb.h>
+  #include <unistd.h>
+  #include <fcntl.h>
+  #include <sys/ioctl.h>
+  #define IRC_CLOSE_SOCKET(s) close(s)
+  #define IRC_ERRNO errno
+  #define IRC_EINPROGRESS EINPROGRESS
+  static void irc_set_nonblocking(int sock, bool nonblocking) {
+      int flags = fcntl(sock, F_GETFL, 0);
+      if (nonblocking) {
+          fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+      } else {
+          fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+      }
+  }
+#endif
+
 #include <cstring>
 #include <cstdio>
 #include <sstream>
@@ -71,15 +99,14 @@ int IrcClientManager::connectToServer(const std::string& server, int port, bool 
         }
 
         // Set non-blocking
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+        irc_set_nonblocking(sock, true);
 
         if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
             break;
         }
 
         // Check if connection is in progress
-        if (errno == EINPROGRESS) {
+        if (IRC_ERRNO == IRC_EINPROGRESS) {
             fd_set write_fds;
             FD_ZERO(&write_fds);
             FD_SET(sock, &write_fds);
@@ -90,13 +117,13 @@ int IrcClientManager::connectToServer(const std::string& server, int port, bool 
             if (select(sock + 1, nullptr, &write_fds, nullptr, &timeout) > 0) {
                 int error = 0;
                 socklen_t len = sizeof(error);
-                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0) {
+                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len) == 0 && error == 0) {
                     break;
                 }
             }
         }
 
-        close(sock);
+        IRC_CLOSE_SOCKET(sock);
         sock = -1;
     }
 
@@ -108,8 +135,7 @@ int IrcClientManager::connectToServer(const std::string& server, int port, bool 
     }
 
     // Set back to blocking
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+    irc_set_nonblocking(sock, false);
 
     V2TIM_LOG(kInfo, "[IRC] Connected to {}:{}{}", server, port, use_ssl ? " (SSL)" : "");
     return sock;
@@ -360,7 +386,7 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
             if (channel->use_ssl) {
                 if (!performSslHandshake(channel)) {
                     V2TIM_LOG(kError, "[IRC] SSL handshake failed");
-                    close(channel->sock_fd);
+                    IRC_CLOSE_SOCKET(channel->sock_fd);
                     channel->sock_fd = -1;
                     // Try to reconnect
                     attemptReconnect(channel);
@@ -419,8 +445,12 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
         
         int ret = select(channel->sock_fd + 1, &read_fds, nullptr, nullptr, &timeout);
         if (ret < 0) {
+#ifdef _WIN32
+            break;
+#else
             if (errno == EINTR) continue;
             break;
+#endif
         }
         
         if (ret == 0) {
@@ -440,8 +470,9 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
                     V2TIM_LOG(kInfo, "[IRC] Connection closed for {}", channel->channel);
                     updateConnectionStatus(channel, ConnectionStatus::Disconnected, "Connection closed");
                 } else {
-                    V2TIM_LOG(kError, "[IRC] recv error for {}: {}", channel->channel, strerror(errno));
-                    updateConnectionStatus(channel, ConnectionStatus::Error, std::string("Recv error: ") + strerror(errno));
+                    int sock_err = IRC_ERRNO;
+                    V2TIM_LOG(kError, "[IRC] recv error for {}: error code {}", channel->channel, sock_err);
+                    updateConnectionStatus(channel, ConnectionStatus::Error, std::string("Recv error: ") + std::to_string(sock_err));
                 }
                 
                 // Try to reconnect if not explicitly stopped
@@ -478,7 +509,7 @@ void IrcClientManager::channelThread(IrcChannel* channel) {
     
     // Cleanup
     if (channel->sock_fd >= 0) {
-        close(channel->sock_fd);
+        IRC_CLOSE_SOCKET(channel->sock_fd);
         channel->sock_fd = -1;
     }
     channel->connected = false;
@@ -564,7 +595,7 @@ bool IrcClientManager::disconnectChannel(const std::string& channel) {
     
     // Close socket to wake up thread
     if (irc_channel->sock_fd >= 0) {
-        close(irc_channel->sock_fd);
+        IRC_CLOSE_SOCKET(irc_channel->sock_fd);
         irc_channel->sock_fd = -1;
     }
     
@@ -646,7 +677,7 @@ void IrcClientManager::shutdown() {
     for (auto& pair : channels_) {
         pair.second->should_stop = true;
         if (pair.second->sock_fd >= 0) {
-            close(pair.second->sock_fd);
+            IRC_CLOSE_SOCKET(pair.second->sock_fd);
             pair.second->sock_fd = -1;
         }
     }
@@ -750,7 +781,7 @@ void IrcClientManager::attemptReconnect(IrcChannel* channel) {
     
     // Close old socket
     if (channel->sock_fd >= 0) {
-        close(channel->sock_fd);
+        IRC_CLOSE_SOCKET(channel->sock_fd);
         channel->sock_fd = -1;
     }
     
@@ -766,7 +797,7 @@ void IrcClientManager::attemptReconnect(IrcChannel* channel) {
     if (channel->use_ssl) {
         if (!performSslHandshake(channel)) {
             V2TIM_LOG(kError, "[IRC] SSL handshake failed on reconnect");
-            close(channel->sock_fd);
+            IRC_CLOSE_SOCKET(channel->sock_fd);
             channel->sock_fd = -1;
             return;
         }

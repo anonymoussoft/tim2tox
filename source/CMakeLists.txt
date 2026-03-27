@@ -71,6 +71,15 @@ endif()
 
 add_library(tim2tox STATIC ${TIM2TOX_SRCS})
 
+if(WIN32)
+    # tim2tox headers use TIM_API to switch between __declspec(dllexport)/__declspec(dllimport).
+    # This project builds tim2tox as a static library, then links it into tim2tox_ffi (a SHARED library).
+    # Marking TIM_EXPORT for the core build prevents MSVC from treating V2TIM* symbols as dllimport-only.
+    target_compile_definitions(tim2tox PRIVATE TIM_EXPORT=1)
+    # Link Winsock2 for IrcClientManager socket operations
+    target_link_libraries(tim2tox PUBLIC ws2_32)
+endif()
+
 if(BUILD_TOXAV)
     target_compile_definitions(tim2tox PRIVATE BUILD_TOXAV=1)
 endif()
@@ -124,6 +133,7 @@ if(MSVC)
     target_compile_options(tim2tox
         PRIVATE
         /W3
+        /utf-8
     )
 else()
     target_compile_options(tim2tox
