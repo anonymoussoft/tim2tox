@@ -4,6 +4,7 @@
 #include "V2TIMLog.h"
 #include "toxcore/tox.h"
 #include <fstream>
+#include <chrono>
 #include <string> // Required for std::to_string
 #include <vector> // Required for std::vector
 #include <system_error> // For std::system_error

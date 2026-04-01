@@ -10,7 +10,27 @@
 #include <unordered_map>
 #if defined(_WIN32) || defined(_WIN64)
 #include <process.h>
+// Avoid Windows min/max macros interfering with std::min/std::max
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+// Some Windows headers define macros like ERROR that can break C++ enum/scope usage.
+#ifdef ERROR
+#undef ERROR
+#endif
+#ifdef WARNING
+#undef WARNING
+#endif
+#ifdef INFO
+#undef INFO
+#endif
+#ifdef DEBUG
+#undef DEBUG
+#endif
+#ifdef FATAL
+#undef FATAL
+#endif
 #define getpid _getpid
 #else
 #include <unistd.h>

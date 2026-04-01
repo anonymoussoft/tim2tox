@@ -5,7 +5,7 @@
 #include <chrono> // For timestamps
 #include <atomic>
 #include <cstdio>
-#include <sys/stat.h> // For stat() to get file size
+#include <filesystem>
 #include "TIMResultDefine.h"
 #include "MergerMessageUtil.h"
 #include "RevokeMessageUtil.h"
@@ -179,9 +179,13 @@ V2TIMMessage V2TIMMessageManagerImpl::CreateFileMessage(const V2TIMString& fileP
     fileElem->filename = fileName;
     fileElem->fileSize = 0;
     if (filePath.Length() > 0) {
-        struct stat st;
-        if (stat(filePath.CString(), &st) == 0 && S_ISREG(st.st_mode)) {
-            fileElem->fileSize = static_cast<uint64_t>(st.st_size);
+        try {
+            const std::string path = filePath.CString();
+            if (std::filesystem::is_regular_file(path)) {
+                fileElem->fileSize = static_cast<uint64_t>(std::filesystem::file_size(path));
+            }
+        } catch (...) {
+            // If the path is invalid or inaccessible, just keep fileSize=0.
         }
     }
     msg.elemList.PushBack(fileElem);

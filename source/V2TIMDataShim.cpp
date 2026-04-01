@@ -8,6 +8,7 @@
 #include "V2TIMFriendship.h"
 #include "V2TIMGroup.h"
 #include "V2TIMConversation.h"
+#include "V2TIMCommunity.h"
 #include "V2TIMOfficialAccount.h"
 #include "V2TIMListener.h"
 #include "V2TIMCallback.h"
@@ -240,6 +241,14 @@ SHIM_IMPL_VECTOR(V2TIMConversationOperationResult)
 SHIM_IMPL_VECTOR(V2TIMOfficialAccountInfoResult)
 SHIM_IMPL_VECTOR(V2TIMReceiveMessageOptInfo)
 
+// Community (topic/permission group) vector wrappers
+SHIM_IMPL_VECTOR(V2TIMTopicOperationResult)
+SHIM_IMPL_VECTOR(V2TIMTopicInfoResult)
+SHIM_IMPL_VECTOR(V2TIMTopicPermissionResult)
+SHIM_IMPL_VECTOR(V2TIMPermissionGroupInfoResult)
+SHIM_IMPL_VECTOR(V2TIMPermissionGroupMemberOperationResult)
+SHIM_IMPL_VECTOR(V2TIMPermissionGroupOperationResult)
+
 // 2) Implement pointer vector wrapper for V2TIMElem declared via DEFINE_POINT_VECTOR
 class TXPV2TIMElemVectorIMPL {
 public:
@@ -431,6 +440,226 @@ TXV2TIMStringToV2TIMBufferMap& TXV2TIMStringToV2TIMBufferMap::operator=(const TX
     return *this;
 }
 
+// 3) Implement minimal map wrapper (String -> String)
+// Used by group/topic attribute handlers in community-related code paths.
+class TXV2TIMStringToV2TIMStringMapIMPL {
+public:
+    bool Insert(const V2TIMString& k, const V2TIMString& v) {
+        for (auto& kv : items_) {
+            if (kv.first == k) { kv.second = v; return true; }
+        }
+        items_.emplace_back(k, v);
+        return true;
+    }
+
+    void Erase(const V2TIMString& k) {
+        for (size_t i = 0; i < items_.size(); ++i) {
+            if (items_[i].first == k) { items_.erase(items_.begin() + i); return; }
+        }
+    }
+
+    size_t Count(const V2TIMString& k) const {
+        for (const auto& kv : items_) if (kv.first == k) return 1;
+        return 0;
+    }
+
+    size_t Size() const { return items_.size(); }
+
+    V2TIMString Get(const V2TIMString& k) const {
+        for (const auto& kv : items_) if (kv.first == k) return kv.second;
+        return V2TIMString();
+    }
+
+    V2TIMString& operator[](const V2TIMString& k) {
+        for (auto& kv : items_) if (kv.first == k) return kv.second;
+        items_.emplace_back(k, V2TIMString());
+        return items_.back().second;
+    }
+
+    TXV2TIMStringVector AllKeys() const {
+        TXV2TIMStringVector keys;
+        for (const auto& kv : items_) keys.PushBack(kv.first);
+        return keys;
+    }
+
+    TXV2TIMStringToV2TIMStringMapIMPL() = default;
+    TXV2TIMStringToV2TIMStringMapIMPL(const TXV2TIMStringToV2TIMStringMapIMPL& other) : items_(other.items_) {}
+    TXV2TIMStringToV2TIMStringMapIMPL& operator=(const TXV2TIMStringToV2TIMStringMapIMPL& other) {
+        if (this != &other) items_ = other.items_;
+        return *this;
+    }
+
+private:
+    std::vector<std::pair<V2TIMString, V2TIMString>> items_;
+};
+
+TXV2TIMStringToV2TIMStringMap::TXV2TIMStringToV2TIMStringMap()
+    : impl_(new TXV2TIMStringToV2TIMStringMapIMPL()) {}
+
+TXV2TIMStringToV2TIMStringMap::TXV2TIMStringToV2TIMStringMap(const TXV2TIMStringToV2TIMStringMap& map)
+    : impl_(map.impl_ ? new TXV2TIMStringToV2TIMStringMapIMPL(*map.impl_)
+                       : new TXV2TIMStringToV2TIMStringMapIMPL()) {}
+
+TXV2TIMStringToV2TIMStringMap::~TXV2TIMStringToV2TIMStringMap() {
+    if (impl_) {
+        try { delete impl_; } catch (...) {}
+        impl_ = nullptr;
+    }
+}
+
+bool TXV2TIMStringToV2TIMStringMap::Insert(const V2TIMString& key, const V2TIMString& value) {
+    if (!impl_) impl_ = new TXV2TIMStringToV2TIMStringMapIMPL();
+    return impl_->Insert(key, value);
+}
+
+void TXV2TIMStringToV2TIMStringMap::Erase(const V2TIMString& key) {
+    if (impl_) impl_->Erase(key);
+}
+
+size_t TXV2TIMStringToV2TIMStringMap::Count(const V2TIMString& key) const {
+    return impl_ ? impl_->Count(key) : 0;
+}
+
+size_t TXV2TIMStringToV2TIMStringMap::Size() const {
+    return impl_ ? impl_->Size() : 0;
+}
+
+V2TIMString TXV2TIMStringToV2TIMStringMap::Get(const V2TIMString& key) const {
+    return impl_ ? impl_->Get(key) : V2TIMString();
+}
+
+V2TIMString& TXV2TIMStringToV2TIMStringMap::operator[](const V2TIMString& key) {
+    if (!impl_) impl_ = new TXV2TIMStringToV2TIMStringMapIMPL();
+    return (*impl_)[key];
+}
+
+const V2TIMStringVector TXV2TIMStringToV2TIMStringMap::AllKeys() const {
+    return impl_ ? impl_->AllKeys() : V2TIMStringVector();
+}
+
+TXV2TIMStringToV2TIMStringMap& TXV2TIMStringToV2TIMStringMap::operator=(const TXV2TIMStringToV2TIMStringMap& map) {
+    if (this != &map) {
+        if (impl_ && map.impl_) {
+            *impl_ = *map.impl_;
+        } else if (!impl_ && map.impl_) {
+            impl_ = new TXV2TIMStringToV2TIMStringMapIMPL(*map.impl_);
+        }
+    }
+    return *this;
+}
+
+// 3.x) Implement minimal map wrapper (String -> GroupMemberFullInfoVector)
+class TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL {
+public:
+    bool Insert(const V2TIMString& k, const V2TIMGroupMemberFullInfoVector& v) {
+        for (auto& kv : items_) {
+            if (kv.first == k) { kv.second = v; return true; }
+        }
+        items_.emplace_back(k, v);
+        return true;
+    }
+
+    void Erase(const V2TIMString& k) {
+        for (size_t i = 0; i < items_.size(); ++i) {
+            if (items_[i].first == k) { items_.erase(items_.begin() + i); return; }
+        }
+    }
+
+    size_t Count(const V2TIMString& k) const {
+        for (const auto& kv : items_) if (kv.first == k) return 1;
+        return 0;
+    }
+
+    size_t Size() const { return items_.size(); }
+
+    V2TIMGroupMemberFullInfoVector Get(const V2TIMString& k) const {
+        for (const auto& kv : items_) if (kv.first == k) return kv.second;
+        return V2TIMGroupMemberFullInfoVector();
+    }
+
+    V2TIMGroupMemberFullInfoVector& operator[](const V2TIMString& k) {
+        for (auto& kv : items_) if (kv.first == k) return kv.second;
+        items_.emplace_back(k, V2TIMGroupMemberFullInfoVector());
+        return items_.back().second;
+    }
+
+    TXV2TIMStringVector AllKeys() const {
+        TXV2TIMStringVector keys;
+        for (const auto& kv : items_) keys.PushBack(kv.first);
+        return keys;
+    }
+
+    TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL() = default;
+    TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL(const TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL& other)
+        : items_(other.items_) {}
+
+    TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL& operator=(const TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL& other) {
+        if (this != &other) items_ = other.items_;
+        return *this;
+    }
+
+private:
+    std::vector<std::pair<V2TIMString, V2TIMGroupMemberFullInfoVector>> items_;
+};
+
+TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap()
+    : impl_(new TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL()) {}
+
+TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap(
+    const TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap& map)
+    : impl_(map.impl_ ? new TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL(*map.impl_)
+                       : new TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL()) {}
+
+TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::~TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap() {
+    if (impl_) {
+        try { delete impl_; } catch (...) {}
+        impl_ = nullptr;
+    }
+}
+
+bool TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::Insert(
+    const V2TIMString& key, const V2TIMGroupMemberFullInfoVector& value) {
+    if (!impl_) impl_ = new TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL();
+    return impl_->Insert(key, value);
+}
+
+void TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::Erase(const V2TIMString& key) {
+    if (impl_) impl_->Erase(key);
+}
+
+size_t TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::Count(const V2TIMString& key) const {
+    return impl_ ? impl_->Count(key) : 0;
+}
+
+size_t TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::Size() const {
+    return impl_ ? impl_->Size() : 0;
+}
+
+V2TIMGroupMemberFullInfoVector TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::Get(const V2TIMString& key) const {
+    return impl_ ? impl_->Get(key) : V2TIMGroupMemberFullInfoVector();
+}
+
+V2TIMGroupMemberFullInfoVector& TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::operator[](const V2TIMString& key) {
+    if (!impl_) impl_ = new TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL();
+    return (*impl_)[key];
+}
+
+const V2TIMStringVector TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::AllKeys() const {
+    return impl_ ? impl_->AllKeys() : V2TIMStringVector();
+}
+
+TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap&
+TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap::operator=(const TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMap& map) {
+    if (this != &map) {
+        if (impl_ && map.impl_) {
+            *impl_ = *map.impl_;
+        } else if (!impl_ && map.impl_) {
+            impl_ = new TXV2TIMStringToV2TIMGroupMemberFullInfoVectorMapIMPL(*map.impl_);
+        }
+    }
+    return *this;
+}
+
 // 4) Trivial out-of-line definitions for various V2TIM types
 #define DEF_EMPTY_CTORS(type) \
     type::type() = default; \
@@ -617,6 +846,10 @@ DEF_EMPTY_CTORS(V2TIMConversation)
 V2TIMConversation& V2TIMConversation::operator=(const V2TIMConversation&) = default;
 DEF_EMPTY_CTORS(V2TIMConversationOperationResult)
 V2TIMConversationOperationResult& V2TIMConversationOperationResult::operator=(const V2TIMConversationOperationResult&) = default;
+
+// Conversation filter used by listener callbacks
+DEF_EMPTY_CTORS(V2TIMConversationListFilter)
+V2TIMConversationListFilter& V2TIMConversationListFilter::operator=(const V2TIMConversationListFilter& filter) = default;
 // V2TIMConversationResult needs explicit constructor to ensure conversationList is initialized
 V2TIMConversationResult::V2TIMConversationResult() : nextSeq(0), isFinished(false), conversationList() {}
 V2TIMConversationResult::V2TIMConversationResult(const V2TIMConversationResult& other) 
@@ -658,6 +891,29 @@ V2TIMMessageListGetOption::~V2TIMMessageListGetOption() {
     // Vectors and V2TIMString destructors will be called automatically
     // They have try-catch protection in their own destructors
     // If they crash, we can't recover, but at least we've ensured lastMsg is safe
+}
+
+// Community/topic/permission group types and methods (minimal stubs for linkability).
+DEF_EMPTY_CTORS(V2TIMTopicInfo)
+V2TIMTopicInfo& V2TIMTopicInfo::operator=(const V2TIMTopicInfo& topicInfo) = default;
+
+DEF_EMPTY_CTORS(V2TIMTopicOperationResult)
+DEF_EMPTY_CTORS(V2TIMTopicInfoResult)
+DEF_EMPTY_CTORS(V2TIMTopicPermissionResult)
+
+DEF_EMPTY_CTORS(V2TIMPermissionGroupInfoResult)
+DEF_EMPTY_CTORS(V2TIMPermissionGroupInfo)
+DEF_EMPTY_CTORS(V2TIMPermissionGroupMemberInfoResult)
+DEF_EMPTY_CTORS(V2TIMPermissionGroupMemberOperationResult)
+DEF_EMPTY_CTORS(V2TIMPermissionGroupOperationResult)
+
+DEF_EMPTY_CTORS(V2TIMSignalingInfo)
+
+// V2TIMMessage local storage: locally saved, not sent to peer.
+// For link-time compatibility we provide a minimal no-op implementation.
+void V2TIMMessage::SetLocalCustomData(const V2TIMBuffer &localCustomData, V2TIMCallback *callback) {
+    (void)localCustomData;
+    (void)callback;
 }
 
 

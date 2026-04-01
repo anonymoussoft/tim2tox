@@ -1,18 +1,67 @@
-#include <uuid/uuid.h> // 需要链接 libuuid
+#ifndef _WIN32
+#include <uuid/uuid.h> // Requires linking libuuid
+#endif
 #include <string>
 #include "V2TIMUtils.h"
 #include <vector>
 #include <cstring>
+#include <random>
+#include <sstream>
+#include <iomanip>
 
 #define TOX_PUBLIC_KEY_SIZE 32
 #define TOX_ADDRESS_STRING_LENGTH (TOX_PUBLIC_KEY_SIZE * 2)
 
+// Network byte order helpers.
+// MSVC on Windows may not provide htonl/ntohl without Winsock headers, so we keep
+// a tiny implementation local to this translation unit.
+#ifdef _WIN32
+static inline uint32_t tim2tox_htonl(uint32_t host) {
+    return ((host & 0x000000FFu) << 24) |
+           ((host & 0x0000FF00u) << 8) |
+           ((host & 0x00FF0000u) >> 8) |
+           ((host & 0xFF000000u) >> 24);
+}
+static inline uint32_t tim2tox_ntohl(uint32_t net) {
+    // For 32-bit, htonl and ntohl are the same byte swap.
+    return tim2tox_htonl(net);
+}
+#else
+static inline uint32_t tim2tox_htonl(uint32_t host) { return htonl(host); }
+static inline uint32_t tim2tox_ntohl(uint32_t net) { return ntohl(net); }
+#endif
+
 std::string GenerateUniqueID() {
+#ifdef _WIN32
+    // Windows build: generate UUID-like string without external uuid library.
+    // Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint32_t> dist(0, 255);
+
+    uint8_t bytes[16];
+    for (int i = 0; i < 16; ++i) {
+        bytes[i] = static_cast<uint8_t>(dist(gen));
+    }
+
+    // Version 4 (random) and variant bits.
+    bytes[6] = static_cast<uint8_t>((bytes[6] & 0x0F) | 0x40);
+    bytes[8] = static_cast<uint8_t>((bytes[8] & 0x3F) | 0x80);
+
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (int i = 0; i < 16; ++i) {
+        oss << std::setw(2) << static_cast<int>(bytes[i]);
+        if (i == 3 || i == 5 || i == 7 || i == 9) oss << '-';
+    }
+    return oss.str();
+#else
     uuid_t uuid;
     uuid_generate_random(uuid);
     char uuid_str[37];
     uuid_unparse(uuid, uuid_str);
     return std::string(uuid_str);
+#endif
 }
 
 /**
@@ -20,12 +69,10 @@ std::string GenerateUniqueID() {
  * @return 0-15为有效值，0xFF表示无效字符
  */
 static uint8_t hex_char_to_byte(char c) {
-    switch(c) {
-    case '0'...'9': return c - '0';
-    case 'A'...'F': return c - 'A' + 10;
-    case 'a'...'f': return c - 'a' + 10;
-    default:        return 0xFF; // 无效字符标记
-    }
+    if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
+    if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
+    if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
+    return 0xFF; // Invalid character marker
 }
 
 bool tox_address_to_string(const uint8_t* public_key, char* address) {
@@ -87,7 +134,7 @@ std::vector<uint8_t> SerializePacket(const SignalingPacket& packet) {
     buffer.insert(buffer.end(), packet.data.begin(), packet.data.end());
 
     // 序列化 timeout (4字节)
-    uint32_t timeoutBE = htonl(packet.timeout); // 转为网络字节序
+    uint32_t timeoutBE = tim2tox_htonl(packet.timeout); // Convert to network byte order
     buffer.insert(buffer.end(), reinterpret_cast<uint8_t*>(&timeoutBE), 
                reinterpret_cast<uint8_t*>(&timeoutBE) + sizeof(uint32_t));
 
@@ -142,7 +189,7 @@ SignalingPacket ParsePacket(const uint8_t* data, size_t length) {
     }
     uint32_t timeoutBE;
     memcpy(&timeoutBE, data + offset, sizeof(uint32_t));
-    packet.timeout = ntohl(timeoutBE); // 转为主机字节序
+    packet.timeout = tim2tox_ntohl(timeoutBE); // Convert to host byte order
 
     return packet;
 }

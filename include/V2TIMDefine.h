@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2021 Tencent. All rights reserved.
+// Copyright (c) 2021 Tencent. All rights reserved.
 
 #ifndef __V2TIM_DEFINE_H__
 #define __V2TIM_DEFINE_H__

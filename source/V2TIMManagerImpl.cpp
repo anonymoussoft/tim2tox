@@ -41,7 +41,9 @@ extern void ClearReceiverInstanceOverride(void);
 #include <filesystem>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <fstream>
 #include <thread>
 #include <system_error> // For std::system_error
@@ -2980,7 +2982,7 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
             }
             std::string chat_id_hex = oss.str();
             V2TIM_LOG(kInfo, "CreateGroup: Step 8 - chat_id_hex length={}, first 16 chars={}", 
-                      chat_id_hex.length(), chat_id_hex.substr(0, std::min(16UL, chat_id_hex.length())));
+                      chat_id_hex.length(), chat_id_hex.substr(0, std::min<size_t>(16, chat_id_hex.length())));
             
             // Validate finalGroupID before using CString()
             V2TIM_LOG(kInfo, "CreateGroup: Step 8 - Validating finalGroupID before calling CString()");
@@ -3002,7 +3004,7 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
                 // Note: Function is already declared with extern "C" at file scope (line 38)
                 V2TIM_LOG(kInfo, "CreateGroup: Step 8 - Calling tim2tox_ffi_set_group_chat_id");
                 V2TIM_LOG(kInfo, "CreateGroup: Step 8 - Parameters: group_id={}, chat_id={}", 
-                          group_id_cstr, chat_id_hex.substr(0, std::min(16UL, chat_id_hex.length())));
+                          group_id_cstr, chat_id_hex.substr(0, std::min<size_t>(16, chat_id_hex.length())));
                 
                 // Add protection around FFI call
                 try {
@@ -4674,7 +4676,11 @@ void V2TIMManagerImpl::HandleGroupMessageGroup(Tox_Group_Number group_number, To
                     if (line.empty()) continue;
                     char stored_chat_id[65];
                     if (!GetGroupChatIdFromStorage(line, stored_chat_id, sizeof(stored_chat_id))) continue;
+                    #if defined(_WIN32) || defined(_WIN64)
+                    if (strlen(stored_chat_id) == chat_id_hex.size() && _strnicmp(stored_chat_id, chat_id_hex.c_str(), chat_id_hex.size()) == 0) {
+                    #else
                     if (strlen(stored_chat_id) == chat_id_hex.size() && strncasecmp(stored_chat_id, chat_id_hex.c_str(), chat_id_hex.size()) == 0) {
+                    #endif
                         V2TIMString resolvedID(line.c_str());
                         {
                             std::lock_guard<std::mutex> lock(mutex_);

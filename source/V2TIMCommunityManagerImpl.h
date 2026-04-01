@@ -7,7 +7,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#ifndef _WIN32
 #include <sqlite3.h>
+#endif
 #include <string>
 
 // Forward declaration
@@ -124,7 +126,12 @@ private:
     std::unordered_map<std::string, std::vector<std::pair<std::string, V2TIMTopicInfo>>> topics_;
     std::unordered_map<std::string, uint32_t> friend_numbers_;
     
+#ifndef _WIN32
     sqlite3* db_;
+#else
+    // Windows build: sqlite is optional; community manager uses in-memory storage in this project.
+    void* db_;
+#endif
     uint32_t topic_counter_ = 0;
     
     // Reference to V2TIMManagerImpl for multi-instance support
