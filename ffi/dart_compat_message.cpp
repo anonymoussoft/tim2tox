@@ -372,6 +372,8 @@ extern "C" {
     // Message Query Functions
     // ============================================================================
     
+    } // extern "C"
+
     // Helper: Parse JSON array of strings (simple implementation)
     // Expected format: ["string1", "string2", ...] or {"key": ["string1", "string2", ...]}
     static std::vector<std::string> ParseJsonStringArray(const std::string& json_str) {
@@ -575,6 +577,7 @@ extern "C" {
         }
     };
     
+    extern "C" {
     // DartFindMessages: Find messages by message IDs
     // Signature: int DartFindMessages(Pointer<Char> json_message_id_array, Pointer<Void> user_data)
     int DartFindMessages(const char* json_message_id_array, void* user_data) {

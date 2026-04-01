@@ -4,8 +4,11 @@
 #include <cstdio>
 #include <cstdint>
 #include <csignal>
+#ifndef _WIN32
 #include <execinfo.h>
 #include <unistd.h>
+#endif
+#include <cstdlib>
 
 // Store Dart_Port for sending callbacks
 static Dart_Port g_dart_port = ILLEGAL_PORT;
@@ -13,6 +16,11 @@ static std::mutex g_dart_port_mutex;
 static bool g_dart_api_initialized = false;
 
 static void PrintBacktraceOnSignal(int sig) {
+#if defined(_WIN32)
+    fprintf(stderr, "\n[callback_bridge] FATAL: received signal %d\n", sig);
+    fflush(stderr);
+    std::exit(128 + sig);
+#else
     void* frames[64];
     int n = backtrace(frames, 64);
     fprintf(stderr, "\n[callback_bridge] FATAL: received signal %d\n", sig);
@@ -20,6 +28,7 @@ static void PrintBacktraceOnSignal(int sig) {
     fprintf(stderr, "[callback_bridge] FATAL: end backtrace\n");
     fflush(stderr);
     _exit(128 + sig);
+#endif
 }
 
 static void InstallCrashHandlersOnce() {
@@ -28,7 +37,9 @@ static void InstallCrashHandlersOnce() {
     installed = true;
     signal(SIGSEGV, PrintBacktraceOnSignal);
     signal(SIGABRT, PrintBacktraceOnSignal);
+#ifdef SIGBUS
     signal(SIGBUS, PrintBacktraceOnSignal);
+#endif
 }
 
 extern "C" {

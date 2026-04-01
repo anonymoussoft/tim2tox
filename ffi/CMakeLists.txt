@@ -1,14 +1,74 @@
 cmake_minimum_required(VERSION 3.4.1)
 
-# Add nlohmann/json library (header-only, recommended for better JSON parsing)
-# Option 1: Using FetchContent (automatically downloads at configure time)
-include(FetchContent)
-FetchContent_Declare(json
-    URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+# Add nlohmann/json library (header-only)
+#
+# We avoid CMake FetchContent here because the generated ExternalProject build
+# step can fail on some toolchain/CMake combinations (the logs show `gmake &&`).
+# Since nlohmann/json is header-only, we only need to download+extract once and
+# provide include directories.
+set(NLOHMANN_JSON_VERSION "3.12.0")
+set(NLOHMANN_JSON_URL
+    "https://github.com/nlohmann/json/releases/download/v${NLOHMANN_JSON_VERSION}/json.tar.xz"
 )
-set(JSON_Install OFF CACHE INTERNAL "")
-set(JSON_BuildTests OFF CACHE INTERNAL "")
-FetchContent_MakeAvailable(json)
+
+set(_json_deps_dir "${CMAKE_BINARY_DIR}/_deps")
+set(_json_tar "${_json_deps_dir}/nlohmann_json_${NLOHMANN_JSON_VERSION}.tar.xz")
+set(_json_src_dir "${_json_deps_dir}/nlohmann_json-src")
+set(_json_include_dir "${_json_src_dir}/single_include")
+
+if(NOT EXISTS "${_json_include_dir}/nlohmann/json.hpp")
+    file(MAKE_DIRECTORY "${_json_deps_dir}")
+
+    if(NOT EXISTS "${_json_tar}")
+        message(STATUS "Downloading nlohmann/json ${NLOHMANN_JSON_VERSION} ...")
+        file(DOWNLOAD
+            "${NLOHMANN_JSON_URL}"
+            "${_json_tar}"
+            SHOW_PROGRESS
+            STATUS status
+            LOG log
+        )
+        list(GET status 0 _json_download_status)
+        if(NOT _json_download_status EQUAL 0)
+            message(FATAL_ERROR "Failed to download nlohmann/json: ${log}")
+        endif()
+    endif()
+
+    # Extract into a temp directory, then rename the single top-level folder.
+    set(i 1234)
+    while(EXISTS "${_json_deps_dir}/ex-nlohmann-json${i}")
+        math(EXPR i "${i} + 1")
+    endwhile()
+    set(ut_dir "${_json_deps_dir}/ex-nlohmann-json${i}")
+    file(MAKE_DIRECTORY "${ut_dir}")
+
+    message(STATUS "Extracting nlohmann/json ...")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E tar xfz "${_json_tar}"
+        WORKING_DIRECTORY "${ut_dir}"
+        RESULT_VARIABLE rv
+    )
+    if(NOT rv EQUAL 0)
+        file(REMOVE_RECURSE "${ut_dir}")
+        message(FATAL_ERROR "Failed to extract nlohmann/json tarball (rv=${rv})")
+    endif()
+
+    file(GLOB contents "${ut_dir}/*")
+    list(REMOVE_ITEM contents "${ut_dir}/.DS_Store")
+    list(LENGTH contents n)
+    if(NOT n EQUAL 1 OR NOT IS_DIRECTORY "${contents}")
+        set(contents "${ut_dir}")
+    endif()
+
+    file(REMOVE_RECURSE "${_json_src_dir}")
+    file(RENAME ${contents} "${_json_src_dir}")
+    file(REMOVE_RECURSE "${ut_dir}")
+endif()
+
+add_library(nlohmann_json::nlohmann_json INTERFACE IMPORTED)
+set_target_properties(nlohmann_json::nlohmann_json PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${_json_include_dir}"
+)
 
 # FFI shared library for Flutter/Dart bindings
 # Note: dart_api_dl.c will be added after we find it
@@ -31,6 +91,19 @@ add_library(tim2tox_ffi SHARED
     dart_compat_other.cpp
 )
 
+# On Windows, ensure plain C/C++ API symbols are exported from the shared DLL.
+# This is required for FFI entrypoints like tim2tox_ffi_set_log_file that are
+# declared in headers but not explicitly decorated with __declspec(dllexport).
+if(WIN32)
+    set_target_properties(tim2tox_ffi PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+endif()
+
+# For Windows builds, tim2tox_ffi is SHARED and links against the static tim2tox.
+# Define TIM_EXPORT so TIM_API doesn't force dllimport-only behavior (which breaks static linking).
+if(WIN32)
+    target_compile_definitions(tim2tox_ffi PRIVATE TIM_EXPORT=1)
+endif()
+
 # Set include directories
 target_include_directories(tim2tox_ffi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
@@ -38,6 +111,13 @@ target_include_directories(tim2tox_ffi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/c-toxcore
     ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/c-toxcore/toxcore
 )
+
+# MSVC: ensure UTF-8 source files are parsed correctly.
+# This project vendors some C/C++ headers with UTF-8 content/comments; without /utf-8
+# MSVC can mis-parse them and trigger cascading syntax errors (e.g. in V2TIMFriendship.h).
+if(MSVC)
+    target_compile_options(tim2tox_ffi PRIVATE /utf-8)
+endif()
 
 # Add Dart API DL include path
 # Try to find Flutter/Dart SDK include directory
@@ -107,11 +187,18 @@ elseif(UNIX AND NOT APPLE)
     endif()
 elseif(WIN32)
     # Windows - support vcpkg and standard paths
+    set(_vcpkg_triplet "x64-windows")
+    if(DEFINED CMAKE_VS_PLATFORM_NAME AND (CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64"))
+        set(_vcpkg_triplet "arm64-windows")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
+        set(_vcpkg_triplet "arm64-windows")
+    endif()
+
     if(DEFINED ENV{VCPKG_ROOT})
-        target_include_directories(tim2tox_ffi PRIVATE $ENV{VCPKG_ROOT}/installed/x64-windows/include)
+        target_include_directories(tim2tox_ffi PRIVATE $ENV{VCPKG_ROOT}/installed/${_vcpkg_triplet}/include)
     endif()
     # Also check standard Windows include paths
-    target_include_directories(tim2tox_ffi PRIVATE "C:/vcpkg/installed/x64-windows/include")
+    target_include_directories(tim2tox_ffi PRIVATE "C:/vcpkg/installed/${_vcpkg_triplet}/include")
 endif()
 
 # Link dependencies
@@ -164,12 +251,19 @@ elseif(UNIX AND NOT APPLE)
     endif()
 elseif(WIN32)
     # Windows - support vcpkg and standard paths
+    set(_vcpkg_triplet "x64-windows")
+    if(DEFINED CMAKE_VS_PLATFORM_NAME AND (CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64"))
+        set(_vcpkg_triplet "arm64-windows")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|aarch64")
+        set(_vcpkg_triplet "arm64-windows")
+    endif()
+
     if(DEFINED ENV{VCPKG_ROOT})
         find_library(SODIUM_LIB
             NAMES libsodium sodium
             PATHS
-                $ENV{VCPKG_ROOT}/installed/x64-windows/lib
-                $ENV{VCPKG_ROOT}/installed/x64-windows/debug/lib
+                $ENV{VCPKG_ROOT}/installed/${_vcpkg_triplet}/lib
+                $ENV{VCPKG_ROOT}/installed/${_vcpkg_triplet}/debug/lib
         )
         if(SODIUM_LIB)
             target_link_libraries(tim2tox_ffi ${SODIUM_LIB})
@@ -179,8 +273,8 @@ elseif(WIN32)
     find_library(SODIUM_LIB_WIN
         NAMES libsodium sodium
         PATHS
-            C:/vcpkg/installed/x64-windows/lib
-            C:/vcpkg/installed/x64-windows/debug/lib
+            C:/vcpkg/installed/${_vcpkg_triplet}/lib
+            C:/vcpkg/installed/${_vcpkg_triplet}/debug/lib
     )
     if(SODIUM_LIB_WIN)
         target_link_libraries(tim2tox_ffi ${SODIUM_LIB_WIN})

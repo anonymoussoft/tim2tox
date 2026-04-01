@@ -1,7 +1,42 @@
 // Callback bridge for Dart ReceivePort communication
 #pragma once
 
-#include <dart_api_dl.h>
+#if defined(_WIN32) || defined(_WIN64)
+  // MSVC: the Dart SDK headers may not be present in some CI environments.
+  // Keep this header compilable by falling back to minimal stubs.
+#endif
+
+#if defined(__has_include)
+#  if __has_include(<dart_api_dl.h>)
+#    include <dart_api_dl.h>
+#    define TIM2TOX_HAS_DART_API_DL 1
+#  else
+#    define TIM2TOX_HAS_DART_API_DL 0
+#  endif
+#else
+#  define TIM2TOX_HAS_DART_API_DL 0
+#endif
+
+#if !TIM2TOX_HAS_DART_API_DL
+// Minimal Dart API DL stubs for builds where <dart_api_dl.h> isn't available.
+// These are sufficient for compilation; runtime Dart messaging won't work.
+#include <cstdint>
+using Dart_Port = int64_t;
+static constexpr Dart_Port ILLEGAL_PORT = -1;
+
+enum Dart_CObject_Type { Dart_CObject_kString = 0 };
+
+struct Dart_CObject {
+    Dart_CObject_Type type;
+    union {
+        const char* as_string;
+    } value;
+};
+
+static inline bool Dart_InitializeApiDL(void* /*data*/) { return false; }
+static inline bool Dart_PostCObject_DL(Dart_Port /*port*/, Dart_CObject* /*obj*/) { return false; }
+#endif
+
 #include <string>
 #include <mutex>
 

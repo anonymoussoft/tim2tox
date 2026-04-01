@@ -13,6 +13,8 @@ extern "C" {
     // ============================================================================
     // Note: BuildFullConversationID is now in dart_compat_utils.cpp
     
+} // extern "C"
+
     // Helper: Parse JSON string array
     static std::vector<std::string> ParseJsonStringArray(const std::string& json_str) {
         std::vector<std::string> result;
@@ -116,6 +118,7 @@ extern "C" {
         }
     };
     
+    extern "C" {
     // DartGetConversationList: Get conversation list
     // Signature: int DartGetConversationList(Pointer<Void> user_data)
     // Note: This function doesn't take nextSeq and count parameters, so we use defaults (0, 100)

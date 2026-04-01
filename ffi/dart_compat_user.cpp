@@ -10,6 +10,8 @@ extern "C" {
     // User Functions
     // ============================================================================
     
+} // extern "C"
+
     // Helper: Parse JSON array of strings (reused from message module)
     static std::vector<std::string> ParseJsonStringArray(const std::string& json_str) {
         std::vector<std::string> result;
@@ -191,6 +193,7 @@ extern "C" {
         }
     };
     
+    extern "C" {
     // DartGetUsersInfo: Get users info
     // Signature: int DartGetUsersInfo(Pointer<Char> json_get_user_profile_list_param, Pointer<Void> user_data)
     int DartGetUsersInfo(const char* json_get_user_profile_list_param, void* user_data) {

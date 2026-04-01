@@ -186,6 +186,8 @@ extern "C" {
         return 0; // TIM_SUCC (request accepted)
     }
     
+    } // extern "C"
+
     // Helper: Parse JSON array of strings (reused from message module)
     static std::vector<std::string> ParseJsonStringArray(const std::string& json_str) {
         std::vector<std::string> result;
@@ -256,6 +258,7 @@ extern "C" {
         return result;
     }
     
+    extern "C" {
     // DartAddFriend: Add friend
     // Signature: int DartAddFriend(Pointer<Char> json_add_friend_param, Pointer<Void> user_data)
     int DartAddFriend(const char* json_add_friend_param, void* user_data) {

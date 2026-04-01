@@ -23,7 +23,42 @@
 #ifdef BUILD_TOXAV
 #include "ToxAVManager.h"
 #endif
+#ifdef _WIN32
+// Windows: provide a tiny dlfcn-like shim using LoadLibrary/GetProcAddress.
+// Prevent windows.h from including winsock.h (which conflicts with winsock2.h).
+#ifndef _WINSOCKAPI_
+#define _WINSOCKAPI_
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifndef RTLD_LAZY
+#define RTLD_LAZY 0
+#endif
+static void* tim2tox_dlopen(const char* filename, int /*flags*/) {
+    if (!filename) return nullptr;
+    return reinterpret_cast<void*>(LoadLibraryA(filename));
+}
+static void* tim2tox_dlsym(void* handle, const char* symbol) {
+    if (!handle || !symbol) return nullptr;
+    return reinterpret_cast<void*>(GetProcAddress(reinterpret_cast<HMODULE>(handle), symbol));
+}
+static void tim2tox_dlclose(void* handle) {
+    if (!handle) return;
+    FreeLibrary(reinterpret_cast<HMODULE>(handle));
+}
+static const char* tim2tox_dlerror() {
+    // Best-effort: keep build-time compilation simple.
+    return "dlfcn stub: LoadLibrary/GetProcAddress failed";
+}
+#define dlopen tim2tox_dlopen
+#define dlsym tim2tox_dlsym
+#define dlclose tim2tox_dlclose
+#define dlerror tim2tox_dlerror
+#else
 #include <dlfcn.h>
+#endif
 #include <V2TIMManager.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,7 +66,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <errno.h>
 #include <cstring>
 #include <cctype>
@@ -44,9 +81,26 @@
 #include "../third_party/c-toxcore/toxcore/DHT.h"
 #include "json_parser.h"
 #include "callback_bridge.h"
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
+// mkdir wrapper: MSVC on Windows uses _mkdir and doesn't take mode.
+#ifdef _WIN32
+#include <direct.h>
+static inline int tim2tox_mkdir(const char* path, int /*mode*/) {
+    return _mkdir(path);
+}
+#else
+static inline int tim2tox_mkdir(const char* path, int mode) {
+    return mkdir(path, mode);
+}
+#endif
 
 // Forward declarations (defined later in this file)
 V2TIMManagerImpl* GetCurrentInstance();
@@ -402,7 +456,7 @@ static void RegisterToxManagerFileCallbacks(V2TIMManagerImpl* manager_impl) {
             sender_hex = "unknown";
         }
         std::string dir = G.file_recv_dir;
-        int mkdir_result = mkdir(dir.c_str(), 0755);
+        int mkdir_result = tim2tox_mkdir(dir.c_str(), 0755);
         if (mkdir_result != 0 && errno != EEXIST) {
             V2TIM_LOG(kError, "[ffi] fileRecvCallback: failed to create directory {} (errno: {})", dir, errno);
         }
@@ -864,35 +918,74 @@ int tim2tox_ffi_login(const char* user_id, const char* user_sig) {
 
 int tim2tox_ffi_login_async(int64_t instance_id, const char* user_id, const char* user_sig, tim2tox_login_callback_t callback, void* user_data) {
     int64_t id = (instance_id == 0) ? GetCurrentInstanceId() : instance_id;
+    // NOTE: keep both "instance_id" (original arg) and "id" (normalized) to debug routing issues.
+    V2TIM_LOG(kInfo,
+              "[ffi] tim2tox_ffi_login_async: ENTRY instance_id={}, resolved_id={}, callback_ptr={}, user_data_ptr={}, user_id={}",
+              (long long)instance_id,
+              (long long)id,
+              (void*)callback,
+              user_data,
+              user_id ? user_id : "(null)");
+
     V2TIMManagerImpl* manager = GetInstanceFromId(instance_id);
     if (!manager) {
+        V2TIM_LOG(kError,
+                  "[ffi] tim2tox_ffi_login_async: ERROR manager not found for instance_id={}. callback_ptr={}",
+                  (long long)instance_id,
+                  (void*)callback);
         if (callback) callback(0, -1, "instance not found", user_data);
         return 0;
     }
     if (!IsInstanceInited(id)) {
+        V2TIM_LOG(kError,
+                  "[ffi] tim2tox_ffi_login_async: ERROR instance not inited for resolved_id={}. callback_ptr={}",
+                  (long long)id,
+                  (void*)callback);
         if (callback) callback(0, -2, "instance not inited", user_data);
         return 0;
     }
     if (!user_id || !user_id[0]) {
+        V2TIM_LOG(kError,
+                  "[ffi] tim2tox_ffi_login_async: ERROR user_id empty. callback_ptr={}",
+                  (void*)callback);
         if (callback) callback(0, -3, "user_id empty", user_data);
         return 0;
     }
     struct LoginCb : public V2TIMCallback {
-        tim2tox_login_callback_t cb;
-        void* ud;
+        tim2tox_login_callback_t cb = nullptr;
+        void* ud = nullptr;
+
+        explicit LoginCb(tim2tox_login_callback_t callback, void* user_data)
+            : cb(callback), ud(user_data) {}
+
         void OnSuccess() override {
+            V2TIM_LOG(kInfo,
+                      "[ffi] tim2tox_ffi_login_async: OnSuccess called. cb_ptr={}, ud_ptr={}",
+                      (void*)cb,
+                      ud);
             if (cb) cb(1, 0, "", ud);
+            delete this;
         }
         void OnError(int code, const V2TIMString& msg) override {
+            V2TIM_LOG(kError,
+                      "[ffi] tim2tox_ffi_login_async: OnError called. code={}, cb_ptr={}, ud_ptr={}, msg={}",
+                      code,
+                      (void*)cb,
+                      ud,
+                      msg.CString());
             if (cb) {
                 std::string msg_copy(msg.CString());
                 cb(0, code, msg_copy.c_str(), ud);
             }
+            delete this;
         }
-    } login_cb;
-    login_cb.cb = callback;
-    login_cb.ud = user_data;
-    manager->Login(user_id ? user_id : "", user_sig ? user_sig : "", &login_cb);
+    };
+    auto* login_cb = new LoginCb(callback, user_data);
+    manager->Login(user_id ? user_id : "", user_sig ? user_sig : "", login_cb);
+    V2TIM_LOG(kInfo,
+              "[ffi] tim2tox_ffi_login_async: EXIT (Login invoked). instance_id={}, resolved_id={}",
+              (long long)instance_id,
+              (long long)id);
     return 1;
 }
 
@@ -1953,7 +2046,7 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
             if (it != instance_it->second.end() && it->second.fp == nullptr) {
                 // Ensure directory exists before opening file (use configured directory)
                 std::string dir = G.file_recv_dir;
-                int mkdir_result = mkdir(dir.c_str(), 0755);
+                int mkdir_result = tim2tox_mkdir(dir.c_str(), 0755);
                 if (mkdir_result != 0 && errno != EEXIST) {
                     V2TIM_LOG(kError, "[ffi] file_control: failed to create directory {} (errno: {})", dir, errno);
                 }
@@ -1969,7 +2062,7 @@ int tim2tox_ffi_file_control(int64_t instance_id, const char* user_id, uint32_t 
                     if (last_slash != std::string::npos) {
                         std::string parent_dir = it->second.path.substr(0, last_slash);
                         if (!parent_dir.empty()) {
-                            mkdir_result = mkdir(parent_dir.c_str(), 0755);
+                            mkdir_result = tim2tox_mkdir(parent_dir.c_str(), 0755);
                             if (mkdir_result == 0 || errno == EEXIST) {
                                 // Retry opening file after creating parent directory
                                 fp = fopen(it->second.path.c_str(), "wb");
@@ -2014,7 +2107,7 @@ int tim2tox_ffi_set_file_recv_dir(const char* dir_path) {
     if (!dir_path) return 0;
     G.file_recv_dir = std::string(dir_path);
     // Ensure directory exists
-    int mkdir_result = mkdir(G.file_recv_dir.c_str(), 0755);
+    int mkdir_result = tim2tox_mkdir(G.file_recv_dir.c_str(), 0755);
     if (mkdir_result != 0 && errno != EEXIST) {
         V2TIM_LOG(kError, "[ffi] set_file_recv_dir: failed to create directory {} (errno: {})", G.file_recv_dir.c_str(), errno);
         return 0;
