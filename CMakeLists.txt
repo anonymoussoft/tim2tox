@@ -86,6 +86,11 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+if(DEFINED TIM2TOX_DEP_PREFIX AND EXISTS "${TIM2TOX_DEP_PREFIX}")
+    include_directories("${TIM2TOX_DEP_PREFIX}/include")
+    link_directories("${TIM2TOX_DEP_PREFIX}/lib")
+endif()
+
 # Platform-specific include and library directories
 if(APPLE)
     # macOS - check for both Intel and Apple Silicon homebrew paths
@@ -121,6 +126,7 @@ if(APPLE OR WIN32)
         find_library(SODIUM_LIB
             NAMES sodium libsodium
             PATHS
+                ${TIM2TOX_DEP_PREFIX}/lib
                 /opt/homebrew/lib
                 /usr/local/lib
                 /usr/lib

@@ -172,8 +172,10 @@ endif()
 
 # Platform-specific include directories
 if(APPLE)
+    if(DEFINED TIM2TOX_DEP_PREFIX AND EXISTS "${TIM2TOX_DEP_PREFIX}/include")
+        target_include_directories(tim2tox_ffi PRIVATE "${TIM2TOX_DEP_PREFIX}/include")
     # macOS - check for both Intel and Apple Silicon homebrew paths
-    if(EXISTS "/opt/homebrew/include")
+    elseif(EXISTS "/opt/homebrew/include")
         target_include_directories(tim2tox_ffi PRIVATE /opt/homebrew/include)
     elseif(EXISTS "/usr/local/include")
         target_include_directories(tim2tox_ffi PRIVATE /usr/local/include)
@@ -210,8 +212,18 @@ target_link_libraries(tim2tox_ffi
 
 # Platform-specific library linking
 if(APPLE)
+    if(DEFINED TIM2TOX_DEP_PREFIX AND EXISTS "${TIM2TOX_DEP_PREFIX}/lib")
+        find_library(SODIUM_LIB
+            NAMES sodium libsodium
+            PATHS "${TIM2TOX_DEP_PREFIX}/lib"
+            NO_DEFAULT_PATH)
+        if(SODIUM_LIB)
+            target_link_libraries(tim2tox_ffi ${SODIUM_LIB})
+        else()
+            message(WARNING "libsodium not found under TIM2TOX_DEP_PREFIX=${TIM2TOX_DEP_PREFIX}")
+        endif()
     # macOS - check for both Intel and Apple Silicon homebrew paths
-    if(EXISTS "/opt/homebrew/lib/libsodium.dylib")
+    elseif(EXISTS "/opt/homebrew/lib/libsodium.dylib")
         target_link_libraries(tim2tox_ffi /opt/homebrew/lib/libsodium.dylib)
     elseif(EXISTS "/usr/local/lib/libsodium.dylib")
         target_link_libraries(tim2tox_ffi /usr/local/lib/libsodium.dylib)
@@ -331,4 +343,3 @@ install(TARGETS tim2tox_ffi
 install(FILES tim2tox_ffi.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tim2tox
 )
-

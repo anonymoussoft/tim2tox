@@ -22,6 +22,15 @@ if (NOT Sodium_FOUND)
             endif()
         endif()
     endif()
+    if (NOT SODIUM_INCLUDE_DIR AND DEFINED TIM2TOX_DEP_PREFIX AND EXISTS "${TIM2TOX_DEP_PREFIX}/include")
+        set(SODIUM_INCLUDE_DIR "${TIM2TOX_DEP_PREFIX}/include")
+    endif()
+    if (NOT SODIUM_LIBRARY AND DEFINED TIM2TOX_DEP_PREFIX AND EXISTS "${TIM2TOX_DEP_PREFIX}/lib")
+        find_library(SODIUM_LIBRARY
+            NAMES sodium libsodium
+            PATHS "${TIM2TOX_DEP_PREFIX}/lib"
+            NO_DEFAULT_PATH)
+    endif()
     if (NOT SODIUM_INCLUDE_DIR)
         set(SODIUM_INCLUDE_DIR "/opt/homebrew/include")
     endif()
