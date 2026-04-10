@@ -69,7 +69,7 @@ V2TIMCommunityManagerImpl::V2TIMCommunityManagerImpl(V2TIMManagerImpl* owner) : 
         instance_id = GetInstanceIdFromManager(owner);
     }
     std::string db_path = (instance_id == 0) ? "community_data.db" : ("community_data_" + std::to_string(instance_id) + ".db");
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(TIM2TOX_DISABLE_SQLITE)
     if (sqlite3_open(db_path.c_str(), &db_) == SQLITE_OK && db_) {
         sqlite3_exec(db_, "CREATE TABLE IF NOT EXISTS communities (id TEXT PRIMARY KEY, name TEXT, topic_count INTEGER)", nullptr, nullptr, nullptr);
     }
@@ -77,7 +77,7 @@ V2TIMCommunityManagerImpl::V2TIMCommunityManagerImpl(V2TIMManagerImpl* owner) : 
 }
 
 V2TIMCommunityManagerImpl::~V2TIMCommunityManagerImpl() {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(TIM2TOX_DISABLE_SQLITE)
     if (db_) {
         sqlite3_close(db_);
         db_ = nullptr;

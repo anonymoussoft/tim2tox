@@ -7,8 +7,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(TIM2TOX_DISABLE_SQLITE)
 #include <sqlite3.h>
+#else
+struct sqlite3;
 #endif
 #include <string>
 
