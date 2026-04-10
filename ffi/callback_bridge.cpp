@@ -4,7 +4,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <csignal>
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__ANDROID__) && !defined(TIM2TOX_DISABLE_BACKTRACE)
 #include <execinfo.h>
 #include <unistd.h>
 #endif
@@ -16,7 +16,7 @@ static std::mutex g_dart_port_mutex;
 static bool g_dart_api_initialized = false;
 
 static void PrintBacktraceOnSignal(int sig) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__ANDROID__) || defined(TIM2TOX_DISABLE_BACKTRACE)
     fprintf(stderr, "\n[callback_bridge] FATAL: received signal %d\n", sig);
     fflush(stderr);
     std::exit(128 + sig);
@@ -128,4 +128,3 @@ void SendCallbackToDart(const char* callback_type, const std::string& json_data,
         free(message_cstr);
     }
 }
-
