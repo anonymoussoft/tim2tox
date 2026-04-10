@@ -1,6 +1,3 @@
-#ifndef _WIN32
-#include <uuid/uuid.h> // Requires linking libuuid
-#endif
 #include <string>
 #include "V2TIMUtils.h"
 #include <vector>
@@ -32,9 +29,8 @@ static inline uint32_t tim2tox_ntohl(uint32_t net) { return ntohl(net); }
 #endif
 
 std::string GenerateUniqueID() {
-#ifdef _WIN32
-    // Windows build: generate UUID-like string without external uuid library.
-    // Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    // Generate a UUID-like string without relying on platform-specific uuid
+    // libraries so mobile/embedded targets do not need extra system headers.
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<uint32_t> dist(0, 255);
@@ -55,13 +51,6 @@ std::string GenerateUniqueID() {
         if (i == 3 || i == 5 || i == 7 || i == 9) oss << '-';
     }
     return oss.str();
-#else
-    uuid_t uuid;
-    uuid_generate_random(uuid);
-    char uuid_str[37];
-    uuid_unparse(uuid, uuid_str);
-    return std::string(uuid_str);
-#endif
 }
 
 /**
