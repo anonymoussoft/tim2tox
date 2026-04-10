@@ -12,21 +12,17 @@
 // Network byte order helpers.
 // MSVC on Windows may not provide htonl/ntohl without Winsock headers, so we keep
 // a tiny implementation local to this translation unit.
-#ifdef _WIN32
 static inline uint32_t tim2tox_htonl(uint32_t host) {
     return ((host & 0x000000FFu) << 24) |
            ((host & 0x0000FF00u) << 8) |
            ((host & 0x00FF0000u) >> 8) |
            ((host & 0xFF000000u) >> 24);
 }
+
 static inline uint32_t tim2tox_ntohl(uint32_t net) {
-    // For 32-bit, htonl and ntohl are the same byte swap.
+    // For 32-bit values, ntohl and htonl are the same byte swap.
     return tim2tox_htonl(net);
 }
-#else
-static inline uint32_t tim2tox_htonl(uint32_t host) { return htonl(host); }
-static inline uint32_t tim2tox_ntohl(uint32_t net) { return ntohl(net); }
-#endif
 
 std::string GenerateUniqueID() {
     // Generate a UUID-like string without relying on platform-specific uuid
