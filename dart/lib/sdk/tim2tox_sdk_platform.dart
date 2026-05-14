@@ -1394,52 +1394,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                   '[Tim2ToxSdkPlatform] Message existence check result in else branch: $messageExists');
 
             if (messageExists) {
-              // Message exists, notify as modified
               if (_debugLog)
                 print(
                     '[Tim2ToxSdkPlatform] Notifying as modified in else branch');
 
-              // CRITICAL: Ensure updated message is saved to persistence
-              final existingHistory = ffiService.getHistory(conversationID);
-              final existingMsg = existingHistory.firstWhere(
-                (msg) {
-                  if (chatMsg.msgID != null && msg.msgID == chatMsg.msgID)
-                    return true;
-                  if (chatMsg.text.isNotEmpty && msg.text == chatMsg.text) {
-                    final timeDiff =
-                        chatMsg.timestamp.difference(msg.timestamp).abs();
-                    if (timeDiff.inSeconds <= 5 &&
-                        chatMsg.isSelf == msg.isSelf) {
-                      return true;
-                    }
-                  }
-                  return false;
-                },
-                orElse: () => ChatMessage(
-                  text: '',
-                  fromUserId: '',
-                  isSelf: false,
-                  timestamp: DateTime.now(),
-                ),
-              );
-
-              if (existingMsg.text.isNotEmpty) {
-                final msgIndex = existingHistory.indexOf(existingMsg);
-                if (msgIndex >= 0) {
-                  existingHistory[msgIndex] = chatMsg;
-                  unawaited(ffiService.messageHistoryPersistence
-                      .saveHistory(conversationID, existingHistory));
-                  if (_debugLog)
-                    print(
-                        '[Tim2ToxSdkPlatform] Updated message in persistence (else branch): conversationId=$conversationID, msgID=${chatMsg.msgID}');
-                }
-              } else {
-                unawaited(ffiService.messageHistoryPersistence
-                    .appendHistory(conversationID, chatMsg));
-                if (_debugLog)
-                  print(
-                      '[Tim2ToxSdkPlatform] Added message to persistence (else branch): conversationId=$conversationID, msgID=${chatMsg.msgID}');
-              }
+              // Same hand-off as block 1: appendHistory handles
+              // msgID/content dedup and merging via _mergeMessages.
+              unawaited(ffiService.messageHistoryPersistence
+                  .appendHistory(conversationID, chatMsg));
+              if (_debugLog)
+                print(
+                    '[Tim2ToxSdkPlatform] Persisted modified message (else branch): conversationId=$conversationID, msgID=${chatMsg.msgID}');
 
               await _setFaceUrlForMsg(v2Msg);
               _notifyAdvancedMsgListeners((listener) {
