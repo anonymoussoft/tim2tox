@@ -356,6 +356,13 @@ class FfiChatService {
   final _connectionStatus = StreamController<bool>.broadcast();
   Timer? _poller;
 
+  /// Guards [startPolling] against being run twice in the same session.
+  /// [Tim2ToxSdkPlatform.login] and toxee's [AppBootstrapCoordinator.boot]
+  /// both end with `startPolling()`; without this guard the second call
+  /// re-emits the current connection status (causing UI flicker) and
+  /// re-creates the profile-save timer (leaking one Timer per call).
+  bool _pollingStarted = false;
+
   /// Periodic save of tox_profile.tox to reduce data loss on crash (every 60s when running).
   Timer? _profileSaveTimer;
   // Keep _historyById for backward compatibility and direct access
@@ -1069,6 +1076,12 @@ class FfiChatService {
   }
 
   Future<void> startPolling() async {
+    if (_pollingStarted) {
+      _logger?.log(
+          '[FfiChatService] startPolling: already started, ignoring duplicate call');
+      return;
+    }
+    _pollingStarted = true;
     _logger?.log('[FfiChatService] ========== startPolling called ==========');
     _logger?.log(
         '[FfiChatService] startPolling: Service instance type: ${runtimeType}');
@@ -5527,6 +5540,7 @@ class FfiChatService {
     await _cancelPendingFileTransfers();
     _poller?.cancel();
     _poller = null;
+    _pollingStarted = false;
     _profileSaveTimer?.cancel();
     _profileSaveTimer = null;
     _ffi.uninit();
