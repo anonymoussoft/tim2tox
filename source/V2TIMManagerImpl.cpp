@@ -248,6 +248,45 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
         loaded = f.good();
         V2TIM_LOG(kInfo, "[InitSDK] Profile loaded check: {}", loaded ? "true" : "false");
     }
+    // Test-instance reload fallback: when auto_tests do unInitSDK/initSDK in
+    // sequence, the new test instance gets a fresh instance_id, so the
+    // BuildProfilePath above yields a `tox_profile_<new_id>.tox` path that
+    // doesn't exist on disk. The previous instance saved its profile under
+    // `tox_profile_<old_id>.tox` in the same directory. Tests use one
+    // instance per init_path (per-userId subdir), so we can safely fall back
+    // to *any* `tox_profile_*.tox` in the directory. Production (instance_id
+    // 0 with the stable `tox_profile.tox` name) never enters this branch.
+    if (!loaded && instance_id != 0) {
+        try {
+            std::filesystem::path dir(save_dir);
+            std::error_code ec;
+            std::filesystem::path fallback;
+            std::filesystem::directory_iterator it(dir, ec);
+            if (!ec) {
+                for (const auto& entry : it) {
+                    const auto& p = entry.path();
+                    const auto fn = p.filename().string();
+                    if (fn.rfind("tox_profile", 0) == 0 &&
+                        p.extension() == ".tox" &&
+                        fn.find(".corrupted") == std::string::npos) {
+                        fallback = p;
+                        break;
+                    }
+                }
+            }
+            if (!fallback.empty()) {
+                V2TIM_LOG(kInfo,
+                    "[InitSDK] Reload fallback: instance-id-keyed profile missing; loading sibling {}",
+                    fallback.string());
+                save_path = fallback.string();
+                save_path_ = save_path;
+                std::ifstream f2(save_path, std::ios::binary);
+                loaded = f2.good();
+            }
+        } catch (const std::exception& e) {
+            V2TIM_LOG(kWarning, "[InitSDK] Reload fallback failed: {}", e.what());
+        }
+    }
     V2TIM_LOG(kInfo, "[InitSDK] Step 5: Getting test instance options...");
     V2TIM_LOG(kInfo, "[InitSDK] About to call GetTestInstanceOptions with instance_id={}", (long long)this_instance_id);
     int local_discovery = 1;

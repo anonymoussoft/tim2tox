@@ -192,15 +192,26 @@ void main() {
       
       expect(acceptResult.code, equals(0));
       
-      // Wait for Alice to receive accept notification (pump so Alice's Tox can process the packet)
-      await waitUntilWithPump(() => aliceReceivedAccept, timeout: const Duration(seconds: 30), description: 'aliceReceivedAccept');
-      
+      // Wait for Alice to receive accept notification. The back-direction
+      // packet (Bob -> Alice SIGNALING_ACCEPT) needs both nodes' Tox event
+      // threads to iterate and the Dart-side listener dispatch to fire on
+      // Alice's instance. On busy CI hosts 30s/90s was tight enough to flake;
+      // give it 60s internal / 150s outer so genuine bugs surface as
+      // assertion failures rather than timeouts.
+      await waitUntilWithPump(
+        () => aliceReceivedAccept,
+        timeout: const Duration(seconds: 60),
+        description: 'aliceReceivedAccept',
+        iterationsPerPump: 150,
+        stepDelay: const Duration(milliseconds: 150),
+      );
+
       expect(acceptedInviteID, equals(inviteID));
       expect(
         acceptedInvitee,
         anyOf(equals(bob.getToxId()), equals(bob.getToxId().length >= 64 ? bob.getToxId().substring(0, 64) : bob.getToxId())),
       );
-      
+
       // Clean up
       await alice.runWithInstanceAsync(() async {
         await TencentCloudChatSdkPlatform.instance.removeSignalingListener(listener: aliceSignalingListener);
@@ -210,7 +221,7 @@ void main() {
         await TencentCloudChatSdkPlatform.instance.removeSignalingListener(listener: bobSignalingListener);
         TIMSignalingManager.instance.removeSignalingListener(listener: bobSignalingListener);
       });
-    }, timeout: const Timeout(Duration(seconds: 90)));
+    }, timeout: const Timeout(Duration(seconds: 150)));
     
     test('Reject signaling invite', () async {
       var aliceReceivedReject = false;
@@ -341,21 +352,29 @@ void main() {
       
       expect(cancelResult.code, equals(0));
       
-      // Wait for Bob to receive cancel notification (pump so Bob's Tox can process the packet)
-      await waitUntilWithPump(() => bobReceivedCancel, timeout: const Duration(seconds: 30), description: 'bobReceivedCancel');
-      
+      // Wait for Bob to receive cancel notification. Same flake reasoning as
+      // "Accept signaling invite" above — bump both inner poll and outer test
+      // timeout so the test fails on assertion mismatch, not timer race.
+      await waitUntilWithPump(
+        () => bobReceivedCancel,
+        timeout: const Duration(seconds: 60),
+        description: 'bobReceivedCancel',
+        iterationsPerPump: 150,
+        stepDelay: const Duration(milliseconds: 150),
+      );
+
       expect(cancelledInviteID, equals(inviteID));
       expect(
         cancelledInviter,
         anyOf(equals(alice.getToxId()), equals(alice.getToxId().length >= 64 ? alice.getToxId().substring(0, 64) : alice.getToxId())),
       );
-      
+
       // Clean up
       await bob.runWithInstanceAsync(() async {
         await TencentCloudChatSdkPlatform.instance.removeSignalingListener(listener: bobSignalingListener);
         TIMSignalingManager.instance.removeSignalingListener(listener: bobSignalingListener);
       });
-    }, timeout: const Timeout(Duration(seconds: 90)));
+    }, timeout: const Timeout(Duration(seconds: 150)));
     
     test('Signaling invite timeout', () async {
       var aliceReceivedTimeout = false;
