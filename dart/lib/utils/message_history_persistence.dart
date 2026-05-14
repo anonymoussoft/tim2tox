@@ -434,64 +434,64 @@ class MessageHistoryPersistence {
     return result;
   }
   
-  /// Append a message to the history for a conversation
-  /// 
-  /// Adds the message to the in-memory cache and asynchronously saves to disk.
-  /// Limits memory usage by keeping only the most recent _maxMessagesInMemory messages in memory;
-  /// the full history is always persisted to disk so no messages are lost.
-  /// CRITICAL: If a message with the same msgID already exists, intelligently merge it instead of adding a duplicate.
-  /// This prevents duplicate messages when the same message is processed multiple times (e.g., file_request and file_done).
-  /// 
-  /// [conversationId] - Will be normalized before use
-  void appendHistory(String conversationId, ChatMessage message) {
-    // Normalize conversation ID
+  /// Append a message to the history for a conversation.
+  ///
+  /// Updates the in-memory cache synchronously and returns a Future that
+  /// completes when the on-disk save has finished (or errored). Callers that
+  /// want to detect disk failures should `await` the result; callers that are
+  /// happy with fire-and-forget should wrap with `unawaited(...)`.
+  ///
+  /// Limits memory usage by keeping only the most recent _maxMessagesInMemory
+  /// messages in memory; the full history is always persisted to disk before
+  /// truncating, so no messages are lost.
+  ///
+  /// Deduplication, in priority order:
+  ///   1. msgID match → merge via [_mergeMessages] (handles file_request /
+  ///      file_done multi-event sequences for the same message).
+  ///   2. Content fallback when msgID is null → match on
+  ///      (fromUserId, text, isSelf, timestamp within 2s). The sender check
+  ///      is critical: in a group chat, two members sending identical short
+  ///      text within the window would otherwise be collapsed into one. The
+  ///      2s window is narrow enough that a real user can't legitimately
+  ///      send two identical messages inside it.
+  ///
+  /// [conversationId] - Will be normalized before use.
+  Future<void> appendHistory(String conversationId, ChatMessage message) {
     final normalizedId = ConversationIdUtils.normalize(conversationId);
     final list = _historyById.putIfAbsent(normalizedId, () => <ChatMessage>[]);
-    
-    // CRITICAL: Check if message with same msgID already exists
-    // If it exists, intelligently merge instead of replacing
+
     if (message.msgID != null) {
-      final existingIndex = list.indexWhere((msg) => msg.msgID == message.msgID);
+      final existingIndex =
+          list.indexWhere((msg) => msg.msgID == message.msgID);
       if (existingIndex >= 0) {
-        // Message already exists, merge intelligently
         final existing = list[existingIndex];
-        final merged = _mergeMessages(existing, message);
-        list[existingIndex] = merged;
-        // Save updated history asynchronously
-        unawaited(saveHistory(normalizedId, list));
-        return;
+        list[existingIndex] = _mergeMessages(existing, message);
+        return saveHistory(normalizedId, list);
       }
-    }
-    
-    // Content-based deduplication (fallback for messages without msgID only).
-    // When message has a msgID, do not merge by content — distinct messages with same text must stay separate.
-    if (message.msgID == null && message.text.isNotEmpty) {
+    } else if (message.text.isNotEmpty) {
+      const dedupWindow = Duration(seconds: 2);
       final contentMatch = list.indexWhere((msg) =>
-        msg.text == message.text &&
-        msg.timestamp.difference(message.timestamp).abs().inSeconds <= 5 &&
-        msg.isSelf == message.isSelf
-      );
+          msg.text == message.text &&
+          msg.fromUserId == message.fromUserId &&
+          msg.isSelf == message.isSelf &&
+          msg.timestamp.difference(message.timestamp).abs() <= dedupWindow);
       if (contentMatch >= 0) {
-        // Merge with existing message
-        final merged = _mergeMessages(list[contentMatch], message);
-        list[contentMatch] = merged;
-        unawaited(saveHistory(normalizedId, list));
-        return;
+        list[contentMatch] = _mergeMessages(list[contentMatch], message);
+        return saveHistory(normalizedId, list);
       }
     }
-    
-    // Message doesn't exist, add it
+
     list.add(message);
-    
-    // Limit memory usage: keep only the most recent messages in memory.
-    // CRITICAL: Persist the FULL history to disk before truncating, so we never lose old messages.
+
+    // Persist the FULL list to disk before truncating in-memory cache, so we
+    // never lose old messages when memory is trimmed.
     if (list.length > _maxMessagesInMemory) {
       final fullList = List<ChatMessage>.from(list);
-      unawaited(saveHistory(normalizedId, fullList));
+      final saveFuture = saveHistory(normalizedId, fullList);
       list.removeRange(0, list.length - _maxMessagesInMemory);
-    } else {
-      unawaited(saveHistory(normalizedId, list));
+      return saveFuture;
     }
+    return saveHistory(normalizedId, list);
   }
   
   /// Intelligently merge two messages with the same msgID

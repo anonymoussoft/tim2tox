@@ -539,6 +539,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     });
   }
 
+  // TODO(tim2tox-refactor): This method is ~1300 lines and contains four
+  // inline message-existence checks (search for `final existingHistory =`).
+  // Each block does "look up by msgID-or-content; if found, saveHistory(full
+  // list); else appendHistory". MessageHistoryPersistence.appendHistory now
+  // performs that same dedup-and-merge centrally with a safer 2s + fromUserId
+  // content-fallback, so each block could collapse to a single
+  // `appendHistory(conversationId, chatMsg)` call. Doing this safely needs
+  // manual receive/file_done/forward verification per block; track as a
+  // separate follow-up commit rather than rolling into the audit pass.
   void _setupMessageListener() {
     _messagesSubscription?.cancel();
     _messagesSubscription = ffiService.messages.listen((chatMsg) async {
@@ -1133,6 +1142,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // Message exists, notify as modified
           // CRITICAL: Ensure updated message is saved to persistence
           // The message status might have changed (e.g., from SENDING to SEND_SUCC)
+          // NOTE: The inline "exists → saveHistory ; missing → appendHistory"
+          // logic below duplicates the dedup-and-merge that
+          // [MessageHistoryPersistence.appendHistory] now performs centrally
+          // (msgID match → _mergeMessages; otherwise a 2s content+sender
+          // fallback). A future cleanup should replace the inline block with a
+          // single appendHistory call. Left in place for now to minimize
+          // behavioural change in this pass.
           final conversationId = finalConversationID;
           final existingHistory = ffiService.getHistory(conversationId);
           final existingMsg = existingHistory.firstWhere(
@@ -1164,17 +1180,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             final msgIndex = existingHistory.indexOf(existingMsg);
             if (msgIndex >= 0) {
               existingHistory[msgIndex] = chatMsg;
-              // Save updated history
-              ffiService.messageHistoryPersistence
-                  .saveHistory(conversationId, existingHistory);
+              // Save updated history (fire-and-forget — listener can't propagate disk errors).
+              unawaited(ffiService.messageHistoryPersistence
+                  .saveHistory(conversationId, existingHistory));
               if (_debugLog)
                 print(
                     '[Tim2ToxSdkPlatform] Updated message in persistence: conversationId=$conversationId, msgID=${chatMsg.msgID}');
             }
           } else {
             // Message not in history, add it
-            ffiService.messageHistoryPersistence
-                .appendHistory(conversationId, chatMsg);
+            unawaited(ffiService.messageHistoryPersistence
+                .appendHistory(conversationId, chatMsg));
             if (_debugLog)
               print(
                   '[Tim2ToxSdkPlatform] Added message to persistence: conversationId=$conversationId, msgID=${chatMsg.msgID}');
@@ -1436,15 +1452,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 final msgIndex = existingHistory.indexOf(existingMsg);
                 if (msgIndex >= 0) {
                   existingHistory[msgIndex] = chatMsg;
-                  ffiService.messageHistoryPersistence
-                      .saveHistory(conversationID, existingHistory);
+                  unawaited(ffiService.messageHistoryPersistence
+                      .saveHistory(conversationID, existingHistory));
                   if (_debugLog)
                     print(
                         '[Tim2ToxSdkPlatform] Updated message in persistence (else branch): conversationId=$conversationID, msgID=${chatMsg.msgID}');
                 }
               } else {
-                ffiService.messageHistoryPersistence
-                    .appendHistory(conversationID, chatMsg);
+                unawaited(ffiService.messageHistoryPersistence
+                    .appendHistory(conversationID, chatMsg));
                 if (_debugLog)
                   print(
                       '[Tim2ToxSdkPlatform] Added message to persistence (else branch): conversationId=$conversationID, msgID=${chatMsg.msgID}');
@@ -1635,15 +1651,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 final msgIndex = existingHistory.indexOf(existingMsg);
                 if (msgIndex >= 0) {
                   existingHistory[msgIndex] = chatMsg;
-                  ffiService.messageHistoryPersistence
-                      .saveHistory(targetConversationID, existingHistory);
+                  unawaited(ffiService.messageHistoryPersistence
+                      .saveHistory(targetConversationID, existingHistory));
                   if (_debugLog)
                     print(
                         '[Tim2ToxSdkPlatform] Updated pending message in persistence: conversationId=$targetConversationID, msgID=${chatMsg.msgID}');
                 }
               } else {
-                ffiService.messageHistoryPersistence
-                    .appendHistory(targetConversationID, chatMsg);
+                unawaited(ffiService.messageHistoryPersistence
+                    .appendHistory(targetConversationID, chatMsg));
                 if (_debugLog)
                   print(
                       '[Tim2ToxSdkPlatform] Added pending message to persistence: conversationId=$targetConversationID, msgID=${chatMsg.msgID}');
@@ -1762,8 +1778,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           if (_debugLog)
             print(
                 '[Tim2ToxSdkPlatform] Message not found in history, saving to persistence: conversationId=$conversationId, msgID=${chatMsg.msgID}');
-          ffiService.messageHistoryPersistence
-              .appendHistory(conversationId, chatMsg);
+          unawaited(ffiService.messageHistoryPersistence
+              .appendHistory(conversationId, chatMsg));
         } else {
           if (_debugLog)
             print(

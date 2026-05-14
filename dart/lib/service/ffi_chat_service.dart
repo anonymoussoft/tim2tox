@@ -3494,8 +3494,10 @@ class FfiChatService {
     if (list.length > 1000) {
       list.removeRange(0, list.length - 1000);
     }
-    // Use persistence service to append history (which will save asynchronously)
-    _messageHistoryPersistence.appendHistory(id, msg);
+    // Use persistence service to append history. Fire-and-forget by design:
+    // callers of _appendHistory expect a synchronous void; on-disk save races
+    // continue in the background. Wrap explicitly to silence unawaited_futures.
+    unawaited(_messageHistoryPersistence.appendHistory(id, msg));
     // Also update lastByPeer for immediate access
     _lastByPeer[id] = msg;
   }

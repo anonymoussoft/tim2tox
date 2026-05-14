@@ -63,23 +63,28 @@ class BinaryReplacementHistoryHook {
       // For binary replacement scheme, FfiChatService already saves messages when receiving/sending
       // This hook should only save messages that are NOT already saved by FfiChatService
       final existingHistory = _persistence!.getHistory(conversationId);
-      
-      // Check if message already exists by msgID or by content (text + timestamp within 5 seconds)
+
+      // Identity check, in priority order:
+      //   1. msgID match  — exact, used whenever both messages carry an msgID.
+      //   2. Content fallback when msgID is unreliable — match (fromUserId,
+      //      text, timestamp within 2s). This is the path that catches
+      //      "same logical message arrived via two callbacks with different
+      //      IDs"; we *must* include fromUserId or two senders in a group
+      //      chat typing identical short replies ("ok") within the window
+      //      would collapse into one. We also shorten the window from 5s
+      //      to 2s — the original 5s window was wide enough to swallow
+      //      a real user sending two distinct messages quickly.
+      const dedupWindow = Duration(seconds: 2);
       final chatMsgID = chatMsg.msgID;
       final messageExists = existingHistory.any((msg) {
-        // Check by msgID first (most reliable)
         if (chatMsgID != null && msg.msgID == chatMsgID) return true;
-        
-        // Check by content (text + timestamp) as fallback
-        // This handles cases where msgID might differ between UIKit and FFI layer
-        if (chatMsg.text.isNotEmpty && msg.text == chatMsg.text) {
-          final timeDiff = chatMsg.timestamp.difference(msg.timestamp).abs();
-          if (timeDiff.inSeconds <= 5 && chatMsg.isSelf == msg.isSelf) {
-            return true;
-          }
-        }
-        
-        return false;
+
+        if (chatMsg.text.isEmpty) return false;
+        if (msg.text != chatMsg.text) return false;
+        if (msg.fromUserId != chatMsg.fromUserId) return false;
+        if (msg.isSelf != chatMsg.isSelf) return false;
+        final timeDiff = chatMsg.timestamp.difference(msg.timestamp).abs();
+        return timeDiff <= dedupWindow;
       });
       
       if (messageExists) {
@@ -87,8 +92,10 @@ class BinaryReplacementHistoryHook {
         return;
       }
       
-      // Save to persistence only if message doesn't exist
-      _persistence!.appendHistory(conversationId, chatMsg);
+      // Save to persistence only if message doesn't exist. Await the on-disk
+      // save inside the try block so disk-quota / permission failures land in
+      // the catch path instead of becoming silent uncaught Future errors.
+      await _persistence!.appendHistory(conversationId, chatMsg);
     } catch (e) {
       // Silently handle errors to avoid breaking the app
     }
