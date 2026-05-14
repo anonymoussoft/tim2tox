@@ -340,7 +340,16 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         if (groupId != null) {
           try {
             await ffiService.cleanupGroupState(groupId);
-          } catch (_) {}
+          } catch (e, st) {
+            // Binary-replacement-only callback: if cleanupGroupState fails,
+            // toxee's group state stays out of sync with C++ until next
+            // restart. Surface through the host logger so it's visible,
+            // but don't rethrow — the C++ side has already moved on.
+            ffiService.logger?.logError(
+                '[Tim2ToxSdkPlatform] _handleCustomCallback groupQuitNotification failed for groupId=$groupId',
+                e,
+                st);
+          }
         }
         break;
       case "groupChatIdStored":
@@ -351,8 +360,18 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             final prefs = _prefs;
             if (prefs != null) {
               await prefs.setGroupChatId(groupId, chatId);
+            } else {
+              ffiService.logger?.log(
+                  '[Tim2ToxSdkPlatform] _handleCustomCallback groupChatIdStored skipped: _prefs is null (groupId=$groupId)');
             }
-          } catch (_) {}
+          } catch (e, st) {
+            // Losing this means the group can't auto-rejoin after restart.
+            // Same reasoning as above: log loudly, do not rethrow.
+            ffiService.logger?.logError(
+                '[Tim2ToxSdkPlatform] _handleCustomCallback groupChatIdStored failed for groupId=$groupId',
+                e,
+                st);
+          }
         }
         break;
     }

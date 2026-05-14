@@ -338,6 +338,12 @@ class FfiChatService {
   /// Get the preferences service (for use by SDK Platform)
   ExtendedPreferencesService? get preferencesService => _prefs;
 
+  /// Public accessor for the injected logger. Surfaces the same
+  /// [LoggerService] used internally so collaborators like
+  /// [Tim2ToxSdkPlatform] can route their errors through the host app's
+  /// logging pipeline instead of plain print().
+  LoggerService? get logger => _logger;
+
   /// Get the message history persistence service
   MessageHistoryPersistence get messageHistoryPersistence =>
       _messageHistoryPersistence;
