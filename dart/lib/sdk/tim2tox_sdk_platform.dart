@@ -103,7 +103,28 @@ import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_imsdk_bindings_
 import 'package:tencent_cloud_chat_sdk/native_im/tools.dart';
 import 'package:tim2tox_dart/service/toxav_service.dart';
 
-/// Custom SDK Platform implementation that routes calls to tim2tox
+/// Custom SDK Platform implementation that routes calls to tim2tox.
+///
+/// TODO(tim2tox-refactor): this class is ~8000 lines (~70 @override methods
+/// plus their helpers). Dart does not allow a single class body to be split
+/// across multiple files via `part`/`part of`, so a clean mechanical split is
+/// not possible. Two viable shrinkage paths, neither attempted in the audit
+/// pass:
+///   1. Mixin-based: declare `mixin _MessagingMethods on TencentCloudChatSdkPlatform`
+///      etc. in part files and apply them via `with _MessagingMethods,
+///      _ConversationMethods, _LifecycleMethods`. Mixins can `@override` base
+///      methods. The constraint is that every private field a mixin touches
+///      has to be exposed somehow (parts share library scope, so private `_`
+///      access works across parts — declaring mixins in `.part.dart` files
+///      sidesteps the getter explosion).
+///   2. Composition: extract standalone helper classes
+///      (`Tim2ToxMessagePipeline`, `Tim2ToxConversationPipeline`,
+///      `Tim2ToxLifecycleController`) that the Platform holds as fields, and
+///      delegate from the @override methods. Cleaner architecturally but
+///      touches behaviour at every call site.
+/// Either path needs manual smoke (login/send/receive/forward/file_done/
+/// logout) since the submodule has no Dart tests. Do it as a focused commit
+/// of its own.
 class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// Set to true to enable verbose message/flow logging (off by default to reduce log noise).
   static const bool _debugLog = false;
