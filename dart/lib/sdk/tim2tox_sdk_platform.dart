@@ -111,6 +111,33 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   final FfiChatService ffiService;
   final EventBusProvider? eventBusProvider;
 
+  /// Always-on logging hook. Routes through the host-injected
+  /// [LoggerService] when one is available (so the app's own log file /
+  /// console formatting catches it), and falls back to plain `print` so
+  /// unit tests without a logger still surface output.
+  void _log(String message) {
+    final l = ffiService.logger;
+    if (l != null) {
+      l.log(message);
+    } else {
+      // ignore: avoid_print
+      print(message);
+    }
+  }
+
+  /// Verbose tracing — only fires when [_debugLog] is true. Use for
+  /// per-message / per-event chatter so release builds stay quiet.
+  void _debug(String message) {
+    if (!_debugLog) return;
+    final l = ffiService.logger;
+    if (l != null) {
+      l.logDebug(message);
+    } else {
+      // ignore: avoid_print
+      print(message);
+    }
+  }
+
   /// Called when a group message is received via native path (not from self).
   /// The app should increment unread for [groupId] and refresh unread total so
   /// sidebar and conversation list show the new unread count.
@@ -405,7 +432,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     bool? showImLog,
     List<dynamic>? plugins,
   }) async {
-    print(
+    _log(
         '[Tim2ToxSdkPlatform] initSDK called - sdkAppID=$sdkAppID, loglevel=$loglevel, uiPlatform=$uiPlatform');
     _sdkAppID = sdkAppID;
     if (!_sdkListeners.contains(listener)) {
@@ -417,13 +444,11 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
     // Initialize tim2tox via FFI
     try {
-      // Call FfiChatService.init() to initialize tim2tox
-      if (_debugLog)
-        print('[Tim2ToxSdkPlatform] initSDK - Calling ffiService.init()');
+      _debug('[Tim2ToxSdkPlatform] initSDK - Calling ffiService.init()');
       await ffiService.init();
 
       _isInitialized = true;
-      print(
+      _log(
           '[Tim2ToxSdkPlatform] initSDK - Initialization successful, _isInitialized=true');
 
       // Notify listener of successful initialization
@@ -435,7 +460,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         data: true,
       );
     } catch (e) {
-      print('[Tim2ToxSdkPlatform] initSDK - Initialization failed: $e');
+      _log('[Tim2ToxSdkPlatform] initSDK - Initialization failed: $e');
       return V2TimValueCallback<bool>(
         code: -1,
         desc: 'initSDK failed: $e',
