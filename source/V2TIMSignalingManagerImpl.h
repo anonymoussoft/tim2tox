@@ -24,6 +24,10 @@ struct SignalingInviteInfo {
     uint32_t timeout;
     bool isOnlineOnly;
     uint32_t sender_friend_number;
+    // Monotonic-time deadline (ms). Set when Invite() is sent; 0 means no timeout.
+    // Wall mode: steady_clock-derived. Test mode: virtual clock (g_virtual_time_ms).
+    // See CheckTimeouts() / NowMonoMs() in V2TIMSignalingManagerImpl.cpp.
+    uint64_t deadline_mono_ms;
 };
 
 class V2TIMSignalingManagerImpl : public V2TIMSignalingManager {
@@ -57,6 +61,23 @@ public:
     std::string GetUserIDFromFriendNumber(uint32_t friend_number);
     uint32_t GetFriendNumber(const V2TIMString& userID);
 
+    /**
+     * Iterate-driven timeout dispatcher.
+     *
+     * Called from the V2TIMManagerImpl event-thread loop (wall mode) and from
+     * the FFI iterate hook (test mode / virtual clock). Walks active_invites_,
+     * fires OnInvitationTimeout for any whose deadline has passed, then erases
+     * them. Uses the monotonic clock (virtual when test_mode is on) so the
+     * timer advances with the simulator instead of wall time. Safe to call
+     * frequently; no-op when there are no active invites.
+     *
+     * Replaces the previous per-invite std::thread + std::this_thread::sleep_for
+     * scheme, which blocked the event thread inside Invite() when a previous
+     * timer was still sleeping (the join() of the prior 30s timer made the new
+     * 5s timer fire 30+ seconds late — the source of the flake).
+     */
+    void CheckTimeouts();
+
 private:
     // Helper methods
     std::string GenerateUniqueID();
@@ -82,9 +103,6 @@ private:
     
     // Per-instance counter for unique ID generation (replaces static counter for multi-instance support)
     int unique_id_counter_;
-
-    // Joinable thread for invite timeout (no detach to avoid UAF). At most one active; new invite waits for previous.
-    std::thread invite_timeout_thread_;
 };
 
 #endif  // __V2TIM_SIGNALING_MANAGER_IMPL_H__

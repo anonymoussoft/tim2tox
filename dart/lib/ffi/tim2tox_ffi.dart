@@ -281,6 +281,18 @@ typedef _extract_tox_id_from_profile_c = ffi.Int32 Function(
 // Test-only: inject a raw JSON callback string into the Dart ReceivePort
 typedef _inject_callback_c = ffi.Int32 Function(ffi.Pointer<pkgffi.Utf8>);
 
+// ============================================================================
+// Test-only: virtual clock + manual iteration FFI bindings.
+// These map to tim2tox_ffi_set_test_mode / tim2tox_ffi_set_virtual_time_ms /
+// tim2tox_ffi_iterate_instance. The C side suspends per-instance event_thread
+// pumping when test mode is enabled, so the Dart harness can drive iteration
+// against a shared virtual clock instead of wall time.
+// ============================================================================
+typedef _set_test_mode_c = ffi.Int32 Function(ffi.Int64, ffi.Int32);
+typedef _set_virtual_time_ms_c = ffi.Int32 Function(ffi.Uint64);
+typedef _iterate_instance_c = ffi.Int32 Function(ffi.Int64);
+typedef _set_default_test_mode_c = ffi.Int32 Function(ffi.Int32);
+
 /// Low-level FFI bindings to tim2tox C library
 class Tim2ToxFfi {
   Tim2ToxFfi._(this._lib);
@@ -540,6 +552,59 @@ class Tim2ToxFfi {
   /// Returns 1 on success, 0 on failure.
   late final int Function(ffi.Pointer<pkgffi.Utf8>) injectCallbackNative =
       _lib.lookupFunction<_inject_callback_c, int Function(ffi.Pointer<pkgffi.Utf8>)>('tim2tox_ffi_inject_callback');
+
+  // ============================================================================
+  // Test-only: virtual clock + manual iteration.
+  //
+  // [setTestMode] enables/disables test mode for a specific instance. While
+  // enabled, the C++ side suspends the instance's per-instance event_thread so
+  // the test harness can drive iteration directly via [iterateInstance].
+  //
+  // [setVirtualTimeMs] sets the process-global virtual clock value consulted
+  // by the C++ layer instead of wall time. Always pass a monotonically
+  // non-decreasing value.
+  //
+  // [iterateInstance] runs one iteration of the given Tox instance under the
+  // current virtual clock value.
+  //
+  // All three return 0 on success, non-zero on failure (e.g. unknown
+  // instance_id).
+  // ============================================================================
+  late final int Function(int, int) setTestModeNative =
+      _lib.lookupFunction<_set_test_mode_c, int Function(int, int)>('tim2tox_ffi_set_test_mode');
+  late final int Function(int) setVirtualTimeMsNative =
+      _lib.lookupFunction<_set_virtual_time_ms_c, int Function(int)>('tim2tox_ffi_set_virtual_time_ms');
+  late final int Function(int) iterateInstanceNative =
+      _lib.lookupFunction<_iterate_instance_c, int Function(int)>('tim2tox_ffi_iterate_instance');
+  late final int Function(int) setDefaultTestModeNative =
+      _lib.lookupFunction<_set_default_test_mode_c, int Function(int)>('tim2tox_ffi_set_default_test_mode');
+
+  /// Enable or disable test mode for [instanceId]. When enabled, the C++ side
+  /// suspends that instance's event_thread; the test harness must drive
+  /// iteration manually via [iterateInstance] and advance the virtual clock
+  /// via [setVirtualTimeMs]. Returns 0 on success.
+  int setTestMode(int instanceId, bool enabled) =>
+      setTestModeNative(instanceId, enabled ? 1 : 0);
+
+  /// Set the process-global virtual clock value (milliseconds). Must be
+  /// monotonically non-decreasing across calls. Returns 0 on success.
+  ///
+  /// Note: the C export takes a uint64. Dart [int] is 64-bit signed on the VM
+  /// but the FFI marshalling treats this slot as unsigned, so callers can pass
+  /// any non-negative value safely without manual bigint handling.
+  int setVirtualTimeMs(int timeMs) => setVirtualTimeMsNative(timeMs);
+
+  /// Run one iteration of [instanceId] under the current virtual clock value.
+  /// Returns 0 on success.
+  int iterateInstance(int instanceId) => iterateInstanceNative(instanceId);
+
+  /// Set the process-global default test_mode flag. New instances created
+  /// AFTER this call inherit the flag, so InitSDK never spawns event_thread.
+  /// Required for tests whose flows depend on event_thread's task_queue
+  /// (signaling, etc.) — they must be driven entirely from Dart.
+  /// Returns 0 on success.
+  int setDefaultTestMode(bool enabled) =>
+      setDefaultTestModeNative(enabled ? 1 : 0);
 
   /// Convenience wrapper for injectCallbackNative that handles string conversion.
   int injectCallback(String jsonCallback) {

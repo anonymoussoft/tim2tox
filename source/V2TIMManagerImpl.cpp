@@ -6,6 +6,7 @@
 #include "ToxManager.h"
 #include "tox.h"
 #include "tox_options.h"
+#include "toxcore/mono_time.h"
 #include "ToxUtil.h"
 #include <cstdlib>
 #include <ctime>
@@ -29,6 +30,12 @@ static std::atomic<uint64_t> g_next_group_id_global{0};
 
 // Forward declaration for GetTestInstanceOptions (defined in tim2tox_ffi.cpp with extern "C" linkage)
 extern "C" bool GetTestInstanceOptions(int64_t instance_id, int* out_local_discovery, int* out_ipv6);
+
+// Forward declaration for the process-global virtual-clock callback
+// (defined in tim2tox_ffi.cpp). Used when test_mode_ is enabled to make
+// mono_time read from the auto_tests harness's virtual clock instead of
+// the wall clock.
+extern "C" uint64_t tim2tox_virtual_time_cb(void* user_data);
 
 // Forward declarations for instance management functions (defined in tim2tox_ffi.cpp as C++ functions)
 // Note: These are NOT extern "C" because they are defined as regular C++ functions in tim2tox_ffi.cpp
@@ -151,6 +158,12 @@ V2TIMManagerImpl* V2TIMManagerImpl::GetInstance() {
     return g_default_instance;
 }
 
+// Process-global default test_mode flag. New V2TIMManagerImpl instances
+// inherit this in their constructor, so tim2tox_ffi_set_default_test_mode(1)
+// can be called BEFORE the test creates any instance to ensure event_thread
+// is never spawned by InitSDK.
+std::atomic<bool> g_default_test_mode{false};
+
 // Constructor (now public for multi-instance support)
 V2TIMManagerImpl::V2TIMManagerImpl()
 #ifdef BUILD_TOXAV
@@ -161,6 +174,9 @@ V2TIMManagerImpl::V2TIMManagerImpl()
 {
     // running_ is initialized to true via member initializer list (atomic)
     // tox_manager_ will be created in InitSDK
+    // Inherit process-global default test_mode (set by FFI before instance creation).
+    test_mode_.store(g_default_test_mode.load(std::memory_order_acquire),
+                     std::memory_order_release);
 }
 
 V2TIMManagerImpl::~V2TIMManagerImpl() {
@@ -379,6 +395,19 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     if (!tox) {
         V2TIM_LOG(kError, "InitSDK: tox is null");
         return false;
+    }
+
+    // Test-mode hook: route mono_time off the virtual clock owned by tim2tox_ffi.cpp.
+    // No-op for production callers (test_mode_ defaults to false).
+    if (test_mode_.load(std::memory_order_acquire)) {
+        if (tox->mono_time) {
+            mono_time_set_current_time_callback(tox->mono_time, &tim2tox_virtual_time_cb, nullptr);
+            fprintf(stdout, "InitSDK: test mode mono_time callback installed\n");
+            fflush(stdout);
+        } else {
+            fprintf(stdout, "InitSDK: test mode requested but tox->mono_time is null; skipping\n");
+            fflush(stdout);
+        }
     }
 
     tox_manager_->setGroupMessageGroupCallback(
@@ -1409,47 +1438,63 @@ bool V2TIMManagerImpl::InitSDK(uint32_t sdkAppID, const V2TIMSDKConfig& config) 
     fprintf(stdout, "[InitSDK] Callbacks registered, running_=%d (already set before initialize)\n", running_.load() ? 1 : 0);
     fflush(stdout);
     
-    // Start the Tox event loop thread
-    fprintf(stdout, "InitSDK: starting event thread\n");
-    event_thread_ = std::thread([this] {
-        event_thread_id_ = std::this_thread::get_id();
-        while (running_.load(std::memory_order_acquire)) {
-            try {
-                // Process pending tasks first (Invite/signaling etc. run on this thread to avoid tox lock deadlock)
-                {
-                    std::unique_lock<std::mutex> lock(task_mutex_);
-                    task_cv_.wait_for(lock, std::chrono::milliseconds(50),
-                        [this] { return !task_queue_.empty() || !running_.load(std::memory_order_relaxed); });
-                    while (!task_queue_.empty()) {
-                        auto task = std::move(task_queue_.front());
-                        task_queue_.pop();
-                        lock.unlock();
-                        task();
-                        lock.lock();
+    // Start the Tox event loop thread.
+    // In test mode, the auto_tests harness drives iteration manually via
+    // tim2tox_ffi_iterate_instance() with a shared virtual clock, so we skip
+    // starting the per-instance event_thread entirely.
+    if (!test_mode_.load(std::memory_order_acquire)) {
+        fprintf(stdout, "InitSDK: starting event thread\n");
+        event_thread_ = std::thread([this] {
+            event_thread_id_ = std::this_thread::get_id();
+            while (running_.load(std::memory_order_acquire)) {
+                try {
+                    // Process pending tasks first (Invite/signaling etc. run on this thread to avoid tox lock deadlock)
+                    {
+                        std::unique_lock<std::mutex> lock(task_mutex_);
+                        task_cv_.wait_for(lock, std::chrono::milliseconds(50),
+                            [this] { return !task_queue_.empty() || !running_.load(std::memory_order_relaxed); });
+                        while (!task_queue_.empty()) {
+                            auto task = std::move(task_queue_.front());
+                            task_queue_.pop();
+                            lock.unlock();
+                            task();
+                            lock.lock();
+                        }
                     }
+                    if (!running_.load(std::memory_order_acquire)) break;
+                    if (!tox_manager_ || tox_manager_->isShuttingDown()) break;
+                    // Centralized iterate through ToxManager to ensure correct user_data
+                    int64_t current_instance_id = GetCurrentInstanceId();
+                    static int event_thread_iterate_count = 0;
+                    event_thread_iterate_count++;
+                    if (event_thread_iterate_count % 500 == 0) {
+                        fprintf(stdout, "[V2TIMManagerImpl] event_thread: instance_id=%lld, iterate #%d\n",
+                                (long long)current_instance_id, event_thread_iterate_count);
+                        fflush(stdout);
+                    }
+                    tox_manager_->iterate();
+                    if (!running_.load(std::memory_order_acquire)) break;
+                    if (!tox_manager_ || tox_manager_->isShuttingDown()) break;
+                    // Dispatch any expired signaling invite timeouts. Iterate-driven
+                    // (replaces the per-invite std::thread that used to back
+                    // OnInvitationTimeout) so virtual-clock tests work and a
+                    // long-timeout invite no longer blocks a subsequent short-
+                    // timeout Invite() from firing on schedule.
+                    if (signaling_manager_) {
+                        signaling_manager_->CheckTimeouts();
+                    }
+                    Tox* t = tox_manager_->getTox();
+                    uint32_t interval = t ? tox_iteration_interval(t) : 50;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+                } catch (...) {
+                    break;
                 }
-                if (!running_.load(std::memory_order_acquire)) break;
-                if (!tox_manager_ || tox_manager_->isShuttingDown()) break;
-                // Centralized iterate through ToxManager to ensure correct user_data
-                int64_t current_instance_id = GetCurrentInstanceId();
-                static int event_thread_iterate_count = 0;
-                event_thread_iterate_count++;
-                if (event_thread_iterate_count % 500 == 0) {
-                    fprintf(stdout, "[V2TIMManagerImpl] event_thread: instance_id=%lld, iterate #%d\n",
-                            (long long)current_instance_id, event_thread_iterate_count);
-                    fflush(stdout);
-                }
-                tox_manager_->iterate();
-                if (!running_.load(std::memory_order_acquire)) break;
-                if (!tox_manager_ || tox_manager_->isShuttingDown()) break;
-                Tox* t = tox_manager_->getTox();
-                uint32_t interval = t ? tox_iteration_interval(t) : 50;
-                std::this_thread::sleep_for(std::chrono::milliseconds(interval));
-            } catch (...) {
-                break;
             }
-        }
-    });
+        });
+    } else {
+        fprintf(stdout, "InitSDK: SKIP event thread (test mode)\n");
+        fflush(stdout);
+    }
 
     fprintf(stdout, "InitSDK: returning true\n");
     return true;
@@ -3107,24 +3152,43 @@ void V2TIMManagerImpl::CreateGroup(const V2TIMString& groupType, const V2TIMStri
         group_number_to_group_id_[group_number] = finalGroupID;
         V2TIM_LOG(kInfo, "CreateGroup: Step 9 - Stored group_number_to_group_id_ mapping");
         
-        // Store group type mapping
+        // Store group type mapping.
+        // Preserve the original group_type_str supplied by the caller (e.g. 'Meeting',
+        // 'Public', 'Private', 'Work', 'AVChatRoom', 'Community') so that
+        // GetGroupsInfo/JSON-serialization round-trips return the same label the
+        // caller created the group with. Old API (Tox conference) is always tagged
+        // as "conference"; new API groups fall back to "group" only when the
+        // caller did not supply a more specific label.
+        std::string type_for_map;
         if (is_conference) {
-            group_id_to_type_[finalGroupID] = "conference";
+            type_for_map = "conference";
+        } else if (!group_type_str.empty()) {
+            type_for_map = group_type_str;
         } else {
-            group_id_to_type_[finalGroupID] = "group";
+            type_for_map = "group";
         }
-        V2TIM_LOG(kInfo, "CreateGroup: Step 9 - Stored group type: {}", is_conference ? "conference" : "group");
-        
+        group_id_to_type_[finalGroupID] = type_for_map;
+        V2TIM_LOG(kInfo, "CreateGroup: Step 9 - Stored group type: {}", type_for_map);
+
         V2TIM_LOG(kInfo, "CreateGroup: Step 9 - Mapping storage completed");
     }
     V2TIM_LOG(kInfo, "CreateGroup: Step 9 - Released mutex");
 
-    // Step 9.5: Store group type to persistent storage
+    // Step 9.5: Store group type to persistent storage. Mirrors the in-memory
+    // mapping above so that joiner instances and post-restart lookups can recover
+    // the original label.
     if (!finalGroupID.Empty()) {
         const char* group_id_cstr = finalGroupID.CString();
         if (group_id_cstr) {
-            std::string type_to_store = is_conference ? "conference" : "group";
-            V2TIM_LOG(kInfo, "CreateGroup: Step 9.5 - Storing group type to persistent storage: group_id={}, type={}", 
+            std::string type_to_store;
+            if (is_conference) {
+                type_to_store = "conference";
+            } else if (!group_type_str.empty()) {
+                type_to_store = group_type_str;
+            } else {
+                type_to_store = "group";
+            }
+            V2TIM_LOG(kInfo, "CreateGroup: Step 9.5 - Storing group type to persistent storage: group_id={}, type={}",
                      group_id_cstr, type_to_store);
             try {
                 SetGroupTypeInStorage(group_id_cstr, type_to_store);

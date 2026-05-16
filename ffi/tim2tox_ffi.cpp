@@ -20,6 +20,7 @@
 #include "V2TIMLog.h"
 #include "irc_client_api.h"
 #include "V2TIMSignalingManager.h"
+#include "V2TIMSignalingManagerImpl.h"  // For CheckTimeouts() in iterate hook
 #ifdef BUILD_TOXAV
 #include "ToxAVManager.h"
 #endif
@@ -1845,6 +1846,74 @@ int tim2tox_ffi_iterate_current_instance(int count) {
     return 1;
 }
 
+// --- Test-mode virtual clock + manual iterate ---------------------------------
+// Process-global virtual clock shared by all instances currently in test mode.
+// Production callers never touch this; test_mode_ on V2TIMManagerImpl is the
+// gate that decides whether mono_time reads from this value.
+static std::atomic<uint64_t> g_virtual_time_ms{0};
+
+extern "C" uint64_t tim2tox_virtual_time_cb(void* /*user_data*/) {
+    return g_virtual_time_ms.load(std::memory_order_acquire);
+}
+
+int tim2tox_ffi_set_virtual_time_ms(uint64_t time_ms) {
+    g_virtual_time_ms.store(time_ms, std::memory_order_release);
+    return 1;
+}
+
+// Defined in V2TIMManagerImpl.cpp.
+extern std::atomic<bool> g_default_test_mode;
+
+int tim2tox_ffi_set_default_test_mode(int enabled) {
+    g_default_test_mode.store(enabled != 0, std::memory_order_release);
+    V2TIM_LOG(kInfo, "[ffi] set_default_test_mode: enabled={}", enabled);
+    return 1;
+}
+
+int tim2tox_ffi_set_test_mode(int64_t instance_id, int enabled) {
+    V2TIMManagerImpl* impl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_test_instances_mutex);
+        auto it = g_test_instances.find(instance_id);
+        if (it == g_test_instances.end()) {
+            V2TIM_LOG(kError, "[ffi] set_test_mode: instance {} not found", (long long)instance_id);
+            return 0;
+        }
+        impl = it->second;
+    }
+    if (!impl) return 0;
+    impl->setTestMode(enabled != 0);
+    V2TIM_LOG(kInfo, "[ffi] set_test_mode: instance_id={}, enabled={}", (long long)instance_id, enabled);
+    return 1;
+}
+
+int tim2tox_ffi_iterate_instance(int64_t instance_id) {
+    V2TIMManagerImpl* impl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_test_instances_mutex);
+        auto it = g_test_instances.find(instance_id);
+        if (it != g_test_instances.end()) impl = it->second;
+    }
+    if (!impl) return 0;
+    // Drain task_queue first: in test mode there is no event_thread, so
+    // PostToEventThread tasks (signaling dispatch etc.) only run when the
+    // Dart-side tick loop pumps them through here.
+    impl->DrainTaskQueue();
+    ToxManager* tm = impl->GetToxManager();
+    if (!tm || tm->isShuttingDown()) return 0;
+    tm->iterate(0);
+    // Iterate-driven signaling timeout dispatch. In test mode the deadline is
+    // measured against the virtual clock, so OnInvitationTimeout fires when
+    // pumpTestTick has advanced enough virtual ms — no wall-clock dependency.
+    {
+        V2TIMSignalingManager* sig = impl->GetSignalingManager();
+        if (sig) {
+            static_cast<V2TIMSignalingManagerImpl*>(sig)->CheckTimeouts();
+        }
+    }
+    return 1;
+}
+
 int tim2tox_ffi_iterate_all_instances(int count) {
     if (!IsCurrentInstanceInited() || count <= 0) return 0;
     std::vector<V2TIMManagerImpl*> copy;
@@ -3277,20 +3346,34 @@ static void on_dht_nodes_response_internal(Tox* tox, const uint8_t* public_key, 
         }
     }
     
-    // Call FFI callback outside the lock to avoid deadlock
-    // Note: This callback may call into Dart, which should handle thread safety
-    // The callback is called from Tox's background thread, so Dart layer must be thread-safe
+    // Call FFI callback outside the lock to avoid deadlock.
+    //
+    // IMPORTANT: This handler runs on Tox's event_thread (background, no Dart
+    // isolate). The Dart side now binds via NativeCallable.listener, which
+    // posts the call to the registering isolate. Marshalling copies argument
+    // values (pointers, ints) but NOT what pointers refer to. Stack-allocated
+    // strings would be freed before Dart reads them. So we allocate heap copies
+    // and the Dart trampoline frees them via package:ffi's calloc/malloc.free.
     if (callback) {
+        char* public_key_dup = strdup(public_key_hex);
+        char* ip_dup = strdup(ip_str.c_str());
+        if (!public_key_dup || !ip_dup) {
+            // Out of memory — clean up partial allocation and skip this callback.
+            if (public_key_dup) free(public_key_dup);
+            if (ip_dup) free(ip_dup);
+            V2TIM_LOG(kError, "[ffi] on_dht_nodes_response_internal: strdup failed, dropping callback");
+            return;
+        }
         // Wrap callback invocation in try-catch to prevent crashes if Dart isolate is closed
-        // or if the callback pointer is invalid
+        // or if the callback pointer is invalid.
         try {
-            callback(public_key_hex, ip_str.c_str(), port, callback_user_data);
+            callback(public_key_dup, ip_dup, port, callback_user_data);
+            // Ownership of public_key_dup and ip_dup is now transferred to the
+            // Dart-side trampoline, which must free() them after copying.
         } catch (...) {
-            // Silently ignore exceptions from callback invocation
-            // This can happen if:
-            // 1. Dart isolate has been closed
-            // 2. Callback pointer is invalid or stale
-            // 3. Dart runtime cannot access the callback metadata
+            // If the post itself throws, we own the buffers — free here to avoid leak.
+            free(public_key_dup);
+            free(ip_dup);
             V2TIM_LOG(kError, "[ffi] on_dht_nodes_response_internal: Exception caught while calling callback, ignoring");
         }
     }

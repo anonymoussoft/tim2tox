@@ -371,7 +371,37 @@ void V2TIMGroupManagerImpl::GetGroupsInfo(const V2TIMStringVector& groupIDList,
                 result.resultCode = 0;
                 result.resultMsg = "";
                 result.info = it->second; // Copy group info
-                
+
+                // Reconcile the in-memory cached groupType against persistent storage.
+                // The cached entry may have been initialised by EnsureGroupInfoExists()
+                // with the generic placeholder "group" before the original label
+                // (e.g. "Meeting", "Public", "Work") was propagated to this instance's
+                // type storage via the cross-instance DartStringCallback handler.
+                // Without this reconciliation, getGroupsInfo would return "group" and
+                // the JSON serializer's int-mapping would fall back to 0 (Public),
+                // losing the caller-supplied label end-to-end.
+                if (manager_impl_) {
+                    std::string cached_type = result.info.groupType.Empty()
+                                                  ? std::string()
+                                                  : std::string(result.info.groupType.CString());
+                    // Treat "group" as a generic placeholder; any specific label in
+                    // storage should win over it. "conference" is a real, specific
+                    // type (old Tox conference API) and must not be overwritten.
+                    bool is_placeholder = cached_type.empty() || cached_type == "group";
+                    if (is_placeholder) {
+                        char stored_type[64];
+                        if (manager_impl_->GetGroupTypeFromStorage(groupID, stored_type, sizeof(stored_type))) {
+                            std::string st(stored_type);
+                            if (!st.empty() && st != "group") {
+                                result.info.groupType = V2TIMString(stored_type);
+                                V2TIM_LOG(kInfo,
+                                          "GetGroupsInfo: overriding cached groupType '{}' with stored '{}' for group {}",
+                                          cached_type, st, groupID);
+                            }
+                        }
+                    }
+                }
+
                 // Try to get group topic from Tox if notification is empty and group type is "group"
                 if (result.info.notification.Empty()) {
                     // Get group_number to query topic

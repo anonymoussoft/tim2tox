@@ -138,29 +138,60 @@ final Map<int, FfiChatService> _instanceServices = {};
 final Object _instanceServicesLock = Object(); // Simple lock for thread safety
 // Instance IDs that have registered (for multi-instance poll: single shared FfiChatService must poll all)
 final Set<int> _knownInstanceIds = {};
+
+// Single shared NativeCallable.listener for DHT nodes response. The C side is
+// called on Tox's background event_thread, which has no Dart isolate; a
+// synchronous Pointer.fromFunction would crash with "Cannot invoke native
+// callback outside an isolate". A listener marshals the call to the isolate
+// that created it. One instance is enough because the trampoline routes to
+// the per-instance FfiChatService via the userData (instance_id) pointer.
+ffi.NativeCallable<_dht_nodes_response_callback_native>?
+    _dhtNodesResponseCallable;
+ffi.Pointer<ffi.NativeFunction<_dht_nodes_response_callback_native>>
+    _dhtNodesResponseNativeFunction() {
+  _dhtNodesResponseCallable ??=
+      ffi.NativeCallable<_dht_nodes_response_callback_native>.listener(
+    _dhtNodesResponseTrampoline,
+  );
+  return _dhtNodesResponseCallable!.nativeFunction;
+}
 // Product decision: sync avatar between friends, but never expose it as chat messages.
 const bool _avatarBroadcastAsChatFileEnabled = true;
 
-// Static trampoline for DHT nodes response callback
-// userData is cast to int64_t (instance_id) for routing to the correct service instance
+// Trampoline for DHT nodes response callback.
+//
+// Invoked by NativeCallable.listener — runs on the registering isolate's event
+// loop, NOT on Tox's background event_thread. Because of the async hop, the
+// C-side allocates heap copies of the hex public_key and IP strings via
+// strdup() and transfers ownership here; we must free() them after reading.
+// userData is cast to int64_t (instance_id) for routing to the correct service
+// instance.
 @pragma('vm:entry-point')
 void _dhtNodesResponseTrampoline(ffi.Pointer<pkgffi.Utf8> publicKeyPtr,
     ffi.Pointer<pkgffi.Utf8> ipPtr, int port, ffi.Pointer<ffi.Void> userData) {
+  String? publicKey;
+  String? ip;
   try {
-    if (publicKeyPtr.address == 0 || ipPtr.address == 0) {
-      return; // Invalid pointers
+    if (publicKeyPtr.address != 0) {
+      publicKey = publicKeyPtr.cast<pkgffi.Utf8>().toDartString();
     }
-    final publicKey = publicKeyPtr.cast<pkgffi.Utf8>().toDartString();
-    final ip = ipPtr.cast<pkgffi.Utf8>().toDartString();
+    if (ipPtr.address != 0) {
+      ip = ipPtr.cast<pkgffi.Utf8>().toDartString();
+    }
+    if (publicKey == null || ip == null) {
+      return;
+    }
 
-    // Extract instance ID from userData (cast void* to int64_t)
+    // Extract instance ID from userData (cast void* to int64_t).
     int instanceId = 0;
     if (userData.address != 0) {
-      // userData points to an int64_t value (instance_id)
+      // userData points to an int64_t value (instance_id) allocated by Dart in
+      // setDhtNodesResponseCallback; this pointer is heap-stable for the
+      // lifetime of the callback registration.
       instanceId = userData.cast<ffi.Int64>().value;
     }
 
-    // Route to the correct service instance based on instance ID
+    // Route to the correct service instance based on instance ID.
     FfiChatService? targetService;
     synchronized(_instanceServicesLock, () {
       targetService = _instanceServices[instanceId];
@@ -169,13 +200,25 @@ void _dhtNodesResponseTrampoline(ffi.Pointer<pkgffi.Utf8> publicKeyPtr,
     if (targetService != null) {
       targetService!._onDhtNodesResponse(publicKey, ip, port);
     } else if (instanceId == 0) {
-      // Fallback to global service for default instance (backward compatibility)
+      // Fallback to global service for default instance (backward compatibility).
       _globalService?._onDhtNodesResponse(publicKey, ip, port);
     }
-    // If instanceId != 0 and no service found, silently ignore (service may have been disposed)
-  } catch (e) {
-    // Silently ignore errors in callback to prevent crashes
-    // This can happen if the service was disposed or if there's a race condition
+    // If instanceId != 0 and no service found, silently ignore (service may
+    // have been disposed).
+  } catch (_) {
+    // Silently ignore errors in callback to prevent crashes. This can happen
+    // if the service was disposed or if there's a race condition.
+  } finally {
+    // C side strdup'd these buffers; ownership was transferred to us. Free
+    // with the matching libc free() to avoid leaks. package:ffi's calloc.free
+    // dispatches to free() under the hood, which is the correct counterpart
+    // of strdup().
+    if (publicKeyPtr.address != 0) {
+      pkgffi.calloc.free(publicKeyPtr);
+    }
+    if (ipPtr.address != 0) {
+      pkgffi.calloc.free(ipPtr);
+    }
   }
 }
 
@@ -4808,31 +4851,26 @@ class FfiChatService {
         _knownInstanceIds.add(currentInstanceId!);
       });
 
-      // Create user_data pointer containing the instance ID
+      // Create user_data pointer containing the instance ID. Heap-allocated
+      // so it remains valid across thread hops when the listener posts the
+      // call to the isolate.
       final instanceIdPtr = pkgffi.malloc<ffi.Int64>();
       instanceIdPtr.value = currentInstanceId;
 
-      // Create native callback wrapper using static function
-      // Pass instance ID as user_data for routing
-      final nativeCallback =
-          ffi.Pointer.fromFunction<_dht_nodes_response_callback_native>(
-        _dhtNodesResponseTrampoline,
-      );
-      _ffi.setDhtNodesResponseCallbackNative(
-          currentInstanceId!, nativeCallback, instanceIdPtr.cast());
+      // Bind via NativeCallable.listener so the trampoline is invoked on this
+      // isolate's event loop instead of Tox's background event_thread. The
+      // shared listener routes by instance_id (userData) to the right service.
+      _ffi.setDhtNodesResponseCallbackNative(currentInstanceId!,
+          _dhtNodesResponseNativeFunction(), instanceIdPtr.cast());
 
-      // Note: We don't free instanceIdPtr here because it needs to persist for the callback lifetime
-      // It will be freed when the callback is unregistered or the service is disposed
+      // Note: We don't free instanceIdPtr here because it needs to persist
+      // for the callback lifetime. It will be freed when the callback is
+      // unregistered or the service is disposed.
     } else {
       // Fallback to global service for default instance (backward compatibility)
       _globalService = this;
-
-      // Create native callback wrapper using static function
-      final nativeCallback =
-          ffi.Pointer.fromFunction<_dht_nodes_response_callback_native>(
-        _dhtNodesResponseTrampoline,
-      );
-      _ffi.setDhtNodesResponseCallbackNative(0, nativeCallback, ffi.nullptr);
+      _ffi.setDhtNodesResponseCallbackNative(
+          0, _dhtNodesResponseNativeFunction(), ffi.nullptr);
     }
   }
 

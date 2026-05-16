@@ -74,18 +74,50 @@ extern "C" {
     class DartStringCallback : public V2TIMValueCallback<V2TIMString> {
     private:
         void* user_data_;
-        
+        // Optional original group_type string the caller created the group with
+        // (e.g. "Meeting", "Public", "Private"). When non-empty and OnSuccess
+        // fires, the callback propagates this label to every other instance's
+        // group-type storage so joiner-side getGroupsInfo can recover it.
+        std::string group_type_;
+
     public:
         DartStringCallback(void* user_data) : user_data_(user_data) {}
-        
+        DartStringCallback(void* user_data, const std::string& group_type)
+            : user_data_(user_data), group_type_(group_type) {}
+
         void OnSuccess(const V2TIMString& value) override {
             std::string group_id = value.CString();
+
+            // Propagate the original group_type label to all other instances'
+            // in-memory storage. This is needed because Tox's group protocol
+            // does not carry the tim2tox-specific "Meeting"/"Public"/"Private"
+            // semantic across the wire — joiners would otherwise fall back to
+            // a generic default and lose the original label on getGroupsInfo.
+            // The auto_tests share a single process and rely on cross-instance
+            // pushes (mirrors NotifyOtherInstancesMemberJoined for member events).
+            if (!group_type_.empty()) {
+                V2TIM_LOG(kInfo, "[DartStringCallback] Propagating group_type='{}' for group_id='{}' to all instances",
+                          group_type_, group_id);
+                struct Ctx { std::string group_id; std::string group_type; };
+                Ctx ctx = { group_id, group_type_ };
+                Tim2ToxFfiForEachInstanceManager([](int64_t id, void* manager, void* user) {
+                    Ctx* p = static_cast<Ctx*>(user);
+                    V2TIMManagerImpl* impl = static_cast<V2TIMManagerImpl*>(manager);
+                    if (!impl) return;
+                    impl->SetGroupTypeInStorage(p->group_id, p->group_type);
+                    V2TIM_LOG(kInfo, "[DartStringCallback] SetGroupTypeInStorage on instance_id={}, group_id='{}', group_type='{}'",
+                              id, p->group_id, p->group_type);
+                }, &ctx);
+            } else {
+                V2TIM_LOG(kInfo, "[DartStringCallback] group_type_ is empty, not propagating (group_id='{}')", group_id);
+            }
+
             std::map<std::string, std::string> result_fields;
             result_fields["create_group_result_groupid"] = group_id;
             std::string data_json = BuildJsonObject(result_fields);
             SendApiCallbackResult(user_data_, 0, "", data_json);
         }
-        
+
         void OnError(int error_code, const V2TIMString& error_message) override {
             std::string error_msg = error_message.CString();
             SendApiCallbackResult(user_data_, error_code, error_msg);
@@ -199,11 +231,13 @@ extern "C" {
         // Create empty member list (for now)
         V2TIMCreateGroupMemberInfoVector member_list;
         
-        // Call V2TIM CreateGroup (async)
+        // Call V2TIM CreateGroup (async). Pass the original group_type label so
+        // the callback can propagate it to other instances' storage on success
+        // (see DartStringCallback::OnSuccess for rationale).
         SafeGetV2TIMManager()->GetGroupManager()->CreateGroup(
             group_info,
             member_list,
-            new DartStringCallback(user_data)
+            new DartStringCallback(user_data, group_type)
         );
         
         return 0; // TIM_SUCC (request accepted)
@@ -806,9 +840,20 @@ extern "C" {
                         std::string group_type_str = result.info.groupType.CString();
                         // Convert groupType string to integer enum value
                         // CGroupType: groupPublic=0, groupPrivate=1, groupChatRoom=2, groupAVChatRoom=4, groupCommunity=5
+                        // Note: the Dart side decodes the int back to a label via
+                        // GroupType.convertGroupTypeEnum, so the int we emit must be
+                        // the inverse of GroupType.convertGroupType for the round-trip
+                        // assertion (groupType in == groupType out) to hold for
+                        // Meeting/Work/Public/AVChatRoom/Community.
                         int group_type_enum = 0; // Default to Public
                         if (group_type_str == "Work") {
-                            group_type_enum = 1; // groupPrivate
+                            group_type_enum = 1; // groupPrivate -> "Work"
+                        } else if (group_type_str == "Private") {
+                            // Raw "Private" coming from internal createGroup paths
+                            // (V2TIMManagerImpl) maps to kTIMGroup_Private, which the
+                            // Dart layer surfaces as "Work" — keep this consistent so
+                            // joiner-side queries never collapse to the Public default.
+                            group_type_enum = 1; // groupPrivate -> "Work"
                         } else if (group_type_str == "Public") {
                             group_type_enum = 0; // groupPublic
                         } else if (group_type_str == "Meeting") {

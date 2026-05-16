@@ -22,6 +22,25 @@
 // Our signaling type (SIGNALING_INVITE=0x01 etc.) is used inside the payload; we use a fixed packet_id here.
 static const uint8_t kToxSignalingPacketId = 160;  // PACKET_ID_RANGE_LOSSLESS_CUSTOM_START
 
+// Defined in ffi/tim2tox_ffi.cpp; returns the process-global virtual clock in ms.
+// V2TIMManagerImpl.cpp also uses this for mono_time injection.
+extern "C" uint64_t tim2tox_virtual_time_cb(void* user_data);
+
+// Monotonic-time helper for signaling timeouts.
+//
+// - Test mode (auto_tests with VirtualClock): returns the shared virtual clock.
+//   Timers advance with pumpTestTick() — no real-time sleep required.
+// - Production: returns std::chrono::steady_clock::now() in ms. Independent of
+//   wall-clock changes (NTP/DST), so a 5s invite timeout is exactly 5 real
+//   seconds even if the system clock is adjusted.
+static uint64_t NowMonoMs(V2TIMManagerImpl* manager_impl) {
+    if (manager_impl && manager_impl->isTestMode()) {
+        return tim2tox_virtual_time_cb(nullptr);
+    }
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 // Helper function to get ToxManager from current V2TIMManagerImpl instance
 ToxManager* V2TIMSignalingManagerImpl::GetToxManager() {
     // Use manager_impl_ instead of V2TIMManagerImpl::GetInstance() for multi-instance support
@@ -201,11 +220,9 @@ void V2TIMSignalingManagerImpl::SetManagerImpl(V2TIMManagerImpl* manager_impl) {
 }
 
 V2TIMSignalingManagerImpl::~V2TIMSignalingManagerImpl() {
-    if (invite_timeout_thread_.joinable()) {
-        try {
-            invite_timeout_thread_.join();
-        } catch (...) {}
-    }
+    // Nothing to clean up: timeouts are now iterate-driven (see CheckTimeouts)
+    // rather than backed by per-invite std::thread instances. Active invites
+    // are dropped along with the map when this manager is destroyed.
 }
 
 void V2TIMSignalingManagerImpl::AddSignalingListener(V2TIMSignalingListener* listener) {
@@ -239,7 +256,8 @@ V2TIMString V2TIMSignalingManagerImpl::Invite(const V2TIMString& invitee, const 
     V2TIMString invitee_copy = invitee;
     V2TIMString data_copy = data;
     return manager_impl->RunOnEventThread<V2TIMString>([this, inviteID, invitee_copy, data_copy,
-                                                        onlineUserOnly, timeout, callback]() -> V2TIMString {
+                                                        onlineUserOnly, timeout, callback,
+                                                        manager_impl]() -> V2TIMString {
         uint32_t friend_number = this->GetFriendNumber(invitee_copy);
         if (friend_number == UINT32_MAX) {
             if (callback) callback->OnError(ERR_USER_OFFLINE, "Invitee not in friend list (GetFriendNumber failed)");
@@ -280,6 +298,15 @@ V2TIMString V2TIMSignalingManagerImpl::Invite(const V2TIMString& invitee, const 
             return V2TIMString("");
         }
         tox_friend_send_lossless_packet(tox, friend_number, payload.data(), payload.size(), nullptr);
+        // Record the invite with a monotonic-time deadline so CheckTimeouts()
+        // (called from the event-thread / iterate loop) can fire
+        // OnInvitationTimeout when the deadline passes. This avoids the
+        // previous implementation's per-invite std::thread, which both leaked
+        // wall-clock semantics into virtual-mode tests (5s sleep_for vs. ~1s
+        // of real time inside a 10s virtual budget) and serialised invites
+        // through a join() that blocked the event thread inside the next
+        // Invite() call.
+        const uint64_t now_ms = NowMonoMs(manager_impl);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             SignalingInviteInfo info;
@@ -289,34 +316,53 @@ V2TIMString V2TIMSignalingManagerImpl::Invite(const V2TIMString& invitee, const 
             info.timeout = timeout;
             info.isOnlineOnly = onlineUserOnly;
             info.sender_friend_number = friend_number;
+            info.deadline_mono_ms = (timeout > 0)
+                ? (now_ms + static_cast<uint64_t>(timeout) * 1000ULL)
+                : 0;
             active_invites_[inviteID] = info;
         }
         if (callback) callback->OnSuccess();
-        // Schedule timeout: use joinable thread so destructor can join (no detach/UAF).
-        if (timeout > 0) {
-            if (invite_timeout_thread_.joinable()) {
-                invite_timeout_thread_.join();
-            }
-            invite_timeout_thread_ = std::thread([this, inviteID, timeout]() {
-                std::this_thread::sleep_for(std::chrono::seconds(timeout));
-                V2TIMManagerImpl* current = nullptr;
-                { std::lock_guard<std::mutex> lock(manager_impl_mutex_); current = manager_impl_; }
-                if (!current) return;
-                current->PostToEventThread([this, inviteID]() {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    auto it = active_invites_.find(inviteID);
-                    if (it == active_invites_.end()) return;
-                    V2TIMString info_inviteID(inviteID.c_str());
-                    V2TIMStringVector empty_vec;
-                    for (auto* listener : listeners_) {
-                        listener->OnInvitationTimeout(info_inviteID, empty_vec);
-                    }
-                    active_invites_.erase(it);
-                });
-            });
-        }
         return V2TIMString(inviteID.c_str());
     });
+}
+
+void V2TIMSignalingManagerImpl::CheckTimeouts() {
+    // Snapshot under lock, then dispatch outside the lock so listener
+    // callbacks (and any re-entrant signaling API they make) cannot deadlock
+    // on mutex_. Same pattern as the rest of the dispatchers above.
+    V2TIMManagerImpl* manager_impl = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(manager_impl_mutex_);
+        manager_impl = manager_impl_;
+    }
+    const uint64_t now_ms = NowMonoMs(manager_impl);
+    std::vector<std::string> expired_ids;
+    std::vector<V2TIMSignalingListener*> listeners_copy;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (active_invites_.empty()) return;
+        for (auto& kv : active_invites_) {
+            const SignalingInviteInfo& info = kv.second;
+            if (info.deadline_mono_ms == 0) continue;  // no timeout requested
+            if (now_ms >= info.deadline_mono_ms) {
+                expired_ids.push_back(kv.first);
+            }
+        }
+        if (expired_ids.empty()) return;
+        // Erase before dispatching so a re-entrant Cancel/Accept from the
+        // listener can't double-erase or hit a stale entry.
+        for (const auto& id : expired_ids) {
+            active_invites_.erase(id);
+        }
+        listeners_copy = listeners_;
+    }
+    for (const auto& id : expired_ids) {
+        V2TIMString info_inviteID(id.c_str());
+        V2TIMStringVector empty_vec;
+        for (auto* listener : listeners_copy) {
+            if (listener) listener->OnInvitationTimeout(info_inviteID, empty_vec);
+        }
+    }
 }
 
 V2TIMString V2TIMSignalingManagerImpl::InviteInGroup(const V2TIMString& groupID,

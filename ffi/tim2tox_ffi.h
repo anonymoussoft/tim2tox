@@ -56,6 +56,36 @@ int tim2tox_ffi_iterate_current_instance(int count);
 // Returns number of instances iterated (>= 1 on success), or 0 if none.
 int tim2tox_ffi_iterate_all_instances(int count);
 
+// Test-only: Enable/disable test mode for a single instance.
+// Must be called AFTER tim2tox_ffi_create_test_instance(...) and BEFORE tim2tox_ffi_login*.
+// When enabled=1:
+//   1. The instance's event_thread will NOT auto-start in InitSDK.
+//   2. The underlying Tox's mono_time will read from a process-global virtual clock.
+// Returns 1 on success, 0 if instance not found or mode change rejected.
+int tim2tox_ffi_set_test_mode(int64_t instance_id, int enabled);
+
+// Test-only: Set the process-global virtual clock value (milliseconds).
+// All instances currently in test mode share this clock.
+// Caller must ensure monotonic increase.
+// Returns 1 always (no failure mode).
+int tim2tox_ffi_set_virtual_time_ms(uint64_t time_ms);
+
+// Test-only: Set the process-global default test_mode flag. New
+// V2TIMManagerImpl instances created AFTER this call (via
+// tim2tox_ffi_create_test_instance_ex) will inherit this flag in their
+// constructor, so InitSDK skips spawning event_thread. Required for tests
+// that need task_queue-based flows (signaling, etc.) to be driven by the
+// Dart-side tick loop instead of the wall-clock event thread.
+// Returns 1 always.
+int tim2tox_ffi_set_default_test_mode(int enabled);
+
+// Test-only: Iterate exactly once for the given instance.
+// Equivalent to one round of the event_thread "ToxManager::iterate()" body,
+// minus the sleep. Use with tim2tox_ffi_set_virtual_time_ms() to drive Tox
+// from a virtual clock under the auto_tests harness.
+// Returns 1 on success, 0 if instance not found or shutting down.
+int tim2tox_ffi_iterate_instance(int64_t instance_id);
+
 // Set file receive directory (should be called before receiving files)
 // dir_path: path to directory for storing received files
 // Returns 1 on success, 0 on failure

@@ -150,6 +150,13 @@ public:
     // Helper method to get ToxManager instance (for internal use)
     ToxManager* GetToxManager() { return tox_manager_.get(); }
 
+    // Test-mode controls (auto_tests harness only). When enabled, InitSDK skips
+    // starting the per-instance event_thread and installs a process-global
+    // virtual-clock callback on the underlying Tox's mono_time.
+    // Must be set after construction and BEFORE InitSDK is called.
+    void setTestMode(bool enabled) { test_mode_.store(enabled, std::memory_order_release); }
+    bool isTestMode() const { return test_mode_.load(std::memory_order_acquire); }
+
     /** Generate a unique message ID (instance + time + seq). Safe for multi-instance. */
     std::string MakeMessageId();
     /** Generate a unique group/send ID (instance + seq). Safe for multi-instance. */
@@ -159,10 +166,15 @@ public:
     void SaveToxProfile();
     
     /** Run a function on the event thread (tox iterate loop). Use to avoid deadlock when calling tox API from another thread.
-     *  If already on the event thread, runs f() inline to avoid self-deadlock. */
+     *  If already on the event thread, runs f() inline to avoid self-deadlock.
+     *  In test_mode there is no event thread; we execute inline so the caller
+     *  doesn't deadlock waiting on a future no one will fulfil. */
     template<typename R>
     R RunOnEventThread(std::function<R()> f) {
         if (std::this_thread::get_id() == event_thread_id_) {
+            return f();
+        }
+        if (test_mode_.load(std::memory_order_acquire)) {
             return f();
         }
         auto promise = std::make_shared<std::promise<R>>();
@@ -182,11 +194,28 @@ public:
         return future.get();
     }
 
-    /** Post a void task to the event thread without waiting. Safe to call from within event thread (e.g. Tox callbacks). */
+    /** Post a void task to the event thread without waiting. Safe to call from within event thread (e.g. Tox callbacks).
+     *  In test_mode the task is still queued — the Dart-side tick loop drains it via drainTaskQueue(). */
     void PostToEventThread(std::function<void()> task) {
         std::lock_guard<std::mutex> lock(task_mutex_);
         task_queue_.push(std::move(task));
         task_cv_.notify_one();
+    }
+
+    /** Drain all currently-queued tasks synchronously on the calling thread.
+     *  Test-mode helper: pumpTestTick invokes this through the FFI iterate hook
+     *  so PostToEventThread tasks (signaling dispatch etc.) still execute. */
+    void DrainTaskQueue() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(task_mutex_);
+                if (task_queue_.empty()) return;
+                task = std::move(task_queue_.front());
+                task_queue_.pop();
+            }
+            try { task(); } catch (...) { /* swallow; mirror event_thread */ }
+        }
     }
     
 #ifdef BUILD_TOXAV
@@ -224,6 +253,9 @@ private:
     std::thread event_thread_;
     std::thread::id event_thread_id_;  // Set by event thread at start; used to avoid deadlock when RunOnEventThread is called from event thread
     std::atomic<bool> running_{true};  // Use atomic to prevent compiler optimization issues
+    // Test mode: when true, InitSDK skips event_thread start and installs the
+    // virtual-clock callback on tox->mono_time. Auto_tests harness only.
+    std::atomic<bool> test_mode_{false};
     // Joinable background tasks (no detach) to avoid UAF when instance is destroyed.
     // Use std::thread + atomic stop flag for compatibility (std::jthread is C++20 and not on all toolchains).
     std::thread refresh_task_;
