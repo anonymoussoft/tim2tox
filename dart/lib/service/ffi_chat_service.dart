@@ -3293,6 +3293,57 @@ class FfiChatService {
     return out;
   }
 
+  /// Preferences key for the set of friend-application user IDs the local
+  /// user has explicitly dismissed (refused or deleted). The C++ layer has no
+  /// native "drop application" call, so we filter dismissed IDs out of
+  /// [getFriendApplications] here. Stored via `getStringList`/`setStringList`
+  /// on the injected [ExtendedPreferencesService]; the host's adapter is
+  /// responsible for any per-account scoping it needs.
+  ///
+  /// Visible-for-testing: exposed via [dismissedFriendApplicationsKey].
+  static const String _kDismissedFriendApplicationsKey =
+      'dismissed_friend_applications';
+
+  /// Visible-for-testing accessor for [_kDismissedFriendApplicationsKey].
+  static String get dismissedFriendApplicationsKey =>
+      _kDismissedFriendApplicationsKey;
+
+  /// Visible-for-testing: applies the dismissed-application filter to a raw
+  /// list (the FFI-derived list, in the production path). Static and pure so
+  /// it can be unit-tested without an FFI library or a running service.
+  static List<({String userId, String wording})> filterDismissedApplications(
+    List<({String userId, String wording})> raw,
+    Set<String> dismissed,
+  ) {
+    if (dismissed.isEmpty) return raw;
+    String normalize(String userID) =>
+        userID.length > 64 ? userID.substring(0, 64) : userID;
+    return raw.where((app) => !dismissed.contains(normalize(app.userId))).toList();
+  }
+
+  /// Load the persisted set of dismissed friend-application user IDs. Returns
+  /// an empty set when no preferences service is attached or no entries exist.
+  Future<Set<String>> _getDismissedFriendApplications() async {
+    final prefs = _prefs;
+    if (prefs == null) return <String>{};
+    final list = await prefs.getStringList(_kDismissedFriendApplicationsKey);
+    return list?.toSet() ?? <String>{};
+  }
+
+  Future<void> _saveDismissedFriendApplications(Set<String> ids) async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    await prefs.setStringList(
+      _kDismissedFriendApplicationsKey,
+      ids.toList(),
+    );
+  }
+
+  /// Normalize a friend-application user ID to its 64-char public key for
+  /// stable comparison with native data (which always emits a 64-char key).
+  String _normalizeApplicationUserId(String userID) =>
+      userID.length > 64 ? userID.substring(0, 64) : userID;
+
   Future<List<({String userId, String wording})>>
       getFriendApplications() async {
     final buf = pkgffi.malloc.allocate<ffi.Int8>(32 * 1024);
@@ -3311,13 +3362,43 @@ class FfiChatService {
       }
     }
     pkgffi.malloc.free(buf);
-    return out;
+
+    // Filter out applications the user has explicitly refused/deleted. Without
+    // this, the C++ application queue keeps returning the same entries every
+    // 5s poll because there is no native "dismiss" call.
+    final dismissed = await _getDismissedFriendApplications();
+    return filterDismissedApplications(out, dismissed);
+  }
+
+  /// Mark a friend application as dismissed (refused). Persists the ID so the
+  /// application no longer reappears in [getFriendApplications] across polls
+  /// or restarts. Idempotent.
+  Future<void> refuseFriendApplication(String userID) async {
+    final normalized = _normalizeApplicationUserId(userID);
+    final dismissed = await _getDismissedFriendApplications();
+    if (dismissed.add(normalized)) {
+      await _saveDismissedFriendApplications(dismissed);
+    }
+  }
+
+  /// Mark a friend application as dismissed (deleted). Same semantics as
+  /// [refuseFriendApplication] from Tim2Tox's perspective: both simply drop
+  /// the entry from the local application queue.
+  Future<void> deleteFriendApplication(String userID) async {
+    await refuseFriendApplication(userID);
   }
 
   Future<void> acceptFriendRequest(String userId) async {
     final p = userId.toNativeUtf8();
     _ffi.acceptFriend(p);
     pkgffi.malloc.free(p);
+    // If this user was previously dismissed and is now being accepted, clear
+    // them from the dismissed set so a future re-request would surface.
+    final normalized = _normalizeApplicationUserId(userId);
+    final dismissed = await _getDismissedFriendApplications();
+    if (dismissed.remove(normalized)) {
+      await _saveDismissedFriendApplications(dismissed);
+    }
   }
 
   Future<void> removeFriend(String userId) async {
@@ -3878,42 +3959,63 @@ class FfiChatService {
     }
   }
 
-  /// Delete messages by their IDs
-  /// Returns the number of messages deleted
+  /// Delete messages by their IDs.
+  ///
+  /// Matches by the message's stored [ChatMessage.msgID] (the value written by
+  /// `_appendHistory` of the form `'${timestamp}_${sequence}_${from}'`, or by
+  /// `MessageIdGenerator` for outbound sends). Falls back to the legacy
+  /// two-component reconstruction `'${timestamp}_${fromUserId}'` only for
+  /// records persisted before msgID was attached, so old data is still
+  /// deletable. Updates `MessageHistoryPersistence`'s in-memory cache for
+  /// every modified conversation so reads do not repopulate stale data.
+  ///
+  /// Returns the number of messages deleted.
   Future<int> deleteMessages(List<String> msgIDs) async {
+    if (msgIDs.isEmpty) return 0;
+    final msgIDSet = msgIDs.toSet();
     int deletedCount = 0;
-    // Iterate through all conversation histories to find and delete messages
-    for (final entry in _historyById.entries) {
+    final modifiedConversations = <String>{};
+
+    bool matches(ChatMessage msg) {
+      final id = msg.msgID;
+      if (id != null && id.isNotEmpty) {
+        return msgIDSet.contains(id);
+      }
+      // Legacy fallback: pre-msgID records used (timestamp, fromUserId).
+      final legacy =
+          '${msg.timestamp.millisecondsSinceEpoch}_${msg.fromUserId}';
+      return msgIDSet.contains(legacy);
+    }
+
+    // Iterate through all conversation histories to find and delete messages.
+    for (final entry in _historyById.entries.toList()) {
       final conversationId = entry.key;
       final messages = entry.value;
       final originalLength = messages.length;
-      // Remove messages that match any of the provided msgIDs
-      // msgID format in our system is: "${timestamp}_${fromUserId}"
-      // Also check if msgID matches directly (in case UIKit uses a different format)
       messages.removeWhere((msg) {
-        final msgID =
-            '${msg.timestamp.millisecondsSinceEpoch}_${msg.fromUserId}';
-        if (msgIDs.contains(msgID)) {
+        if (matches(msg)) {
           deletedCount++;
           return true;
         }
         return false;
       });
-      // If messages were deleted, save the updated history
       if (messages.length < originalLength) {
+        modifiedConversations.add(conversationId);
+        // Persist the truncated list to disk.
         await _saveHistory(conversationId);
+        // Keep MessageHistoryPersistence's in-memory cache in sync with the
+        // internal list. Without this, `getHistory` reads stale data because
+        // `_appendHistory` writes to two separate list instances (this
+        // service's `_historyByIdInternal` and the persistence service's
+        // own `_historyById` map).
+        _messageHistoryPersistence.setCachedHistory(conversationId, messages);
       }
     }
-    // Also remove from _messages list (if it's a List)
-    if (_messages is List) {
-      final messagesList = _messages as List;
-      final beforeCount = messagesList.length;
-      messagesList.removeWhere((msg) {
-        final msgID =
-            '${msg.timestamp.millisecondsSinceEpoch}_${msg.fromUserId}';
-        return msgIDs.contains(msgID);
-      });
-    }
+
+    // `_messages` is a broadcast StreamController, not a List — there is no
+    // historical buffer to clean. The previous `_messages is List` block was
+    // a no-op left from an earlier shape. Intentionally drop it: the new
+    // msgID-aware match above is also what would have been needed here.
     return deletedCount;
   }
 

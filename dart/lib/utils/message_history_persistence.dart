@@ -835,11 +835,28 @@ class MessageHistoryPersistence {
   
   /// Get the in-memory cache (for direct access if needed)
   Map<String, List<ChatMessage>> get cache => Map.unmodifiable(_historyById);
-  
+
   /// Set the in-memory cache (for initialization)
   void setCache(Map<String, List<ChatMessage>> cache) {
     _historyById.clear();
     _historyById.addAll(cache);
+  }
+
+  /// Replace the in-memory cached history for a single conversation.
+  ///
+  /// Used by mutating operations (e.g. message deletion) whose owner keeps a
+  /// parallel list and wants the persistence cache to stay in sync so that
+  /// subsequent `getHistory(id)` reads do not return stale data. Does not
+  /// touch disk; pair with `saveHistory` when persistence is also required.
+  ///
+  /// [conversationId] - Will be normalized before use.
+  void setCachedHistory(String conversationId, List<ChatMessage> messages) {
+    final normalizedId = ConversationIdUtils.normalize(conversationId);
+    if (messages.isEmpty) {
+      _historyById.remove(normalizedId);
+    } else {
+      _historyById[normalizedId] = List<ChatMessage>.from(messages);
+    }
   }
   
   /// Update the last view timestamp for a conversation

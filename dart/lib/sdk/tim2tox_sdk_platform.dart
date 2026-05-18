@@ -6255,9 +6255,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required int type,
   }) async {
     try {
-      // Refuse friend application - in Tox, we just don't accept it
-      // There's no explicit refuse, so we'll just return success
-      // The application will remain in the list until manually deleted
+      // Tox has no native "refuse" RPC; persist the dismissal locally so the
+      // entry stops reappearing on every 5s poll and across restarts.
+      await ffiService.refuseFriendApplication(userID);
       return V2TimValueCallback<V2TimFriendOperationResult>(
         code: 0,
         desc: 'success',
@@ -6284,12 +6284,31 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     String? friendRemark,
     Map<String, String>? friendCustomInfo,
   }) async {
-    // Friend info is stored locally, not in FfiChatService
-    // For now, just return success
-    return V2TimCallback(
-      code: 0,
-      desc: 'success',
-    );
+    try {
+      final prefs = _prefs;
+      if (prefs != null && friendRemark != null) {
+        // Persist alias via the generic key/value surface. There is no
+        // `setFriendRemark` on `ExtendedPreferencesService` yet, and adding
+        // a typed method for one call site would over-widen the interface.
+        // Per-account scoping, if needed, is the host app's responsibility
+        // (toxee's UI-side `Prefs.setFriendRemark` does its own scoping
+        // independently). What this guarantees: a subsequent `getString`
+        // on the same prefs with the same key returns this value.
+        await prefs.setString('friend_remark_$userID', friendRemark);
+      }
+      // TODO(tim2tox): `friendCustomInfo` requires a structured per-friend
+      // map in `ExtendedPreferencesService`. Drop on the floor for now —
+      // UIKit's profile page does not call this with custom info today.
+      return V2TimCallback(
+        code: 0,
+        desc: 'success',
+      );
+    } catch (e) {
+      return V2TimCallback(
+        code: -1,
+        desc: 'setFriendInfo failed: $e',
+      );
+    }
   }
 
   @override
@@ -6298,9 +6317,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String userID,
   }) async {
     try {
-      // Delete friend application - in Tox, we just remove it from the list
-      // For now, just return success
-      // The application will be removed from the list when it's accepted or refused
+      // Same path as refuse — the V2TIM API distinguishes the two for IM
+      // analytics, but for Tox both mean "drop it from the local queue".
+      await ffiService.deleteFriendApplication(userID);
       return V2TimCallback(
         code: 0,
         desc: 'success',
