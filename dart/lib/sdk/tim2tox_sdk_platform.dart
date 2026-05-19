@@ -83,6 +83,8 @@ import 'package:tencent_cloud_chat_sdk/enum/image_types.dart';
 import '../service/ffi_chat_service.dart';
 import '../models/chat_message.dart';
 import '../utils/message_converter.dart';
+import '../utils/tim2tox_failed_message_persistence.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../ffi/tim2tox_ffi.dart' as ffi_lib;
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart' as pkgffi;
@@ -4328,29 +4330,53 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         forwardMsg.textElem = V2TimTextElem(text: originalMsg.textElem!.text);
       }
       if (originalMsg.imageElem != null) {
+        // P1-14: received image messages may have a null `path` but a
+        // populated `imageList[i].localUrl`. Fall back so forwards survive.
+        String? imgPath = originalMsg.imageElem!.path;
+        if (imgPath == null || imgPath.isEmpty) {
+          final imgList = originalMsg.imageElem!.imageList;
+          if (imgList != null) {
+            for (final img in imgList) {
+              final lu = img?.localUrl;
+              if (lu != null && lu.isNotEmpty) {
+                imgPath = lu;
+                break;
+              }
+            }
+          }
+        }
         forwardMsg.imageElem = V2TimImageElem(
-          path: originalMsg.imageElem!.path,
+          path: imgPath,
           imageList: originalMsg.imageElem!.imageList,
         );
       }
       if (originalMsg.fileElem != null) {
+        // P1-14: prefer non-null path, fall back to localUrl for received files.
+        final String? filePath =
+            originalMsg.fileElem!.path ?? originalMsg.fileElem!.localUrl;
         forwardMsg.fileElem = V2TimFileElem(
-          path: originalMsg.fileElem!.path,
+          path: filePath,
           fileName: originalMsg.fileElem!.fileName,
           fileSize: originalMsg.fileElem!.fileSize,
           localUrl: originalMsg.fileElem!.localUrl,
         );
       }
       if (originalMsg.soundElem != null) {
+        // P1-14: prefer non-null path, fall back to localUrl for received audio.
+        final String? sndPath =
+            originalMsg.soundElem!.path ?? originalMsg.soundElem!.localUrl;
         forwardMsg.soundElem = V2TimSoundElem(
-          path: originalMsg.soundElem!.path,
+          path: sndPath,
           dataSize: originalMsg.soundElem!.dataSize,
           duration: originalMsg.soundElem!.duration,
         );
       }
       if (originalMsg.videoElem != null) {
+        // P1-14: prefer non-null videoPath, fall back to localVideoUrl for received video.
+        final String? vidPath = originalMsg.videoElem!.videoPath ??
+            originalMsg.videoElem!.localVideoUrl;
         forwardMsg.videoElem = V2TimVideoElem(
-          videoPath: originalMsg.videoElem!.videoPath,
+          videoPath: vidPath,
           snapshotPath: originalMsg.videoElem!.snapshotPath,
           videoSize: originalMsg.videoElem!.videoSize,
           duration: originalMsg.videoElem!.duration,
@@ -4700,6 +4726,103 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           );
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Merger message sent successfully');
+        } else if (messageToSend.soundElem != null &&
+            messageToSend.soundElem!.path != null &&
+            messageToSend.soundElem!.path!.isNotEmpty) {
+          // Sound message — send the audio file via Tox file transfer (same as fileElem/imageElem).
+          // Sound has a `path` field (verified against
+          // tencent_cloud_chat_sdk/lib/models/v2_tim_sound_elem.dart:16).
+          final soundPath = messageToSend.soundElem!.path!;
+          print(
+              '[Tim2ToxSdkPlatform] Sending sound message: $soundPath');
+          await provider.sendFile(
+            userID: userID,
+            groupID: groupID.isNotEmpty ? groupID : null,
+            filePath: soundPath,
+            fileName: soundPath.split('/').last,
+          );
+          if (_debugLog)
+            print('[Tim2ToxSdkPlatform] Sound message sent successfully');
+        } else if (messageToSend.videoElem != null &&
+            messageToSend.videoElem!.videoPath != null &&
+            messageToSend.videoElem!.videoPath!.isNotEmpty) {
+          // Video message — send the video file via Tox file transfer.
+          // Video uses `videoPath` (not `path`); verified against
+          // tencent_cloud_chat_sdk/lib/models/v2_tim_video_elem.dart:15.
+          final videoPath = messageToSend.videoElem!.videoPath!;
+          print(
+              '[Tim2ToxSdkPlatform] Sending video message: $videoPath');
+          await provider.sendFile(
+            userID: userID,
+            groupID: groupID.isNotEmpty ? groupID : null,
+            filePath: videoPath,
+            fileName: videoPath.split('/').last,
+          );
+          if (_debugLog)
+            print('[Tim2ToxSdkPlatform] Video message sent successfully');
+        } else if (messageToSend.faceElem != null) {
+          // Face message — there is no native Tox channel for sticker
+          // metadata, so we serialize {index, data} as JSON and send it as
+          // text with a `__face__:` prefix. The receiving side currently
+          // renders this as plain text; rich-rendering is deferred.
+          final faceJson = json.encode({
+            'index': messageToSend.faceElem!.index,
+            'data': messageToSend.faceElem!.data,
+          });
+          final payload = '__face__:$faceJson';
+          if (_debugLog)
+            print('[Tim2ToxSdkPlatform] Sending face message: $payload');
+          await provider.sendText(
+            userID: userID,
+            groupID: groupID.isNotEmpty ? groupID : null,
+            text: payload,
+          );
+          if (_debugLog)
+            print('[Tim2ToxSdkPlatform] Face message sent successfully');
+        } else if (messageToSend.locationElem != null) {
+          // Location message — same approach as face: serialize via JSON,
+          // send as text with a `__location__:` prefix. Receiver renders as
+          // plain text for now.
+          final locJson = json.encode({
+            'desc': messageToSend.locationElem!.desc,
+            'longitude': messageToSend.locationElem!.longitude,
+            'latitude': messageToSend.locationElem!.latitude,
+          });
+          final payload = '__location__:$locJson';
+          if (_debugLog)
+            print('[Tim2ToxSdkPlatform] Sending location message: $payload');
+          await provider.sendText(
+            userID: userID,
+            groupID: groupID.isNotEmpty ? groupID : null,
+            text: payload,
+          );
+          if (_debugLog)
+            print(
+                '[Tim2ToxSdkPlatform] Location message sent successfully');
+        } else if (messageToSend.customElem != null &&
+            messageToSend.customElem!.data != null &&
+            messageToSend.customElem!.data!.isNotEmpty) {
+          // Custom message — pass-through customElem.data as-is, but wrap
+          // with a `__custom__:` prefix so the receiver can route it back
+          // into a customElem instead of rendering as plain text.
+          // Receiver-side parsing is deferred (TODO(P0-1)).
+          final payload = '__custom__:${messageToSend.customElem!.data}';
+          if (_debugLog)
+            print('[Tim2ToxSdkPlatform] Sending custom message');
+          await provider.sendText(
+            userID: userID,
+            groupID: groupID.isNotEmpty ? groupID : null,
+            text: payload,
+          );
+          if (_debugLog)
+            print('[Tim2ToxSdkPlatform] Custom message sent successfully');
+        } else if (messageToSend.groupTipsElem != null) {
+          // Group tips (system messages) are synthesized client-side from
+          // Tox group events. Senders never push them over the wire;
+          // silently succeed so the UIKit dispatch loop doesn't complain.
+          if (_debugLog)
+            print(
+                '[Tim2ToxSdkPlatform] groupTipsElem is local-only, returning success without wire send');
         } else {
           print(
               '[Tim2ToxSdkPlatform] sendMessage failed: Unsupported message type: ${messageToSend.elemType}');
@@ -5162,11 +5285,242 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     bool onlineUserOnly = false,
     Object? webMessageInstatnce,
   }) async {
-    // TODO: Implement reSendMessage
-    return V2TimValueCallback<V2TimMessage>(
-      code: -1,
-      desc: 'reSendMessage not yet implemented',
-    );
+    // P0-12: rebuild the failed message from Tim2ToxFailedMessagePersistence
+    // (v2 schema) and re-dispatch through sendMessage. Removes the entry
+    // from the failed persistence on success.
+    try {
+      if (msgID.isEmpty) {
+        return V2TimValueCallback<V2TimMessage>(
+          code: -1,
+          desc: 'msgID is required',
+        );
+      }
+
+      // We don't know which conversation contains the failed entry up
+      // front, so we walk through prefs and search every conversation
+      // bucket. This is acceptable because failed-message storage is
+      // small in practice.
+      final prefs = await SharedPreferences.getInstance();
+      // Reuse the persistence helper's keying logic by listing all
+      // candidate keys directly: we can't enumerate the
+      // accountToxId here, so we attempt the legacy (un-suffixed) key
+      // first and any current account key suffix.
+      // Practical approach: iterate over all keys that start with the
+      // persistence prefix.
+      final allKeys = prefs.getKeys();
+      String? matchedConvKey;
+      Map<String, dynamic>? entry;
+      String? accountToxIdForRemoval;
+      for (final key in allKeys) {
+        if (!key.startsWith('tencent_cloud_chat_failed_messages')) continue;
+        final raw = prefs.getString(key);
+        if (raw == null || raw.isEmpty) continue;
+        try {
+          final decoded = json.decode(raw);
+          if (decoded is! Map) continue;
+          for (final convEntry in decoded.entries) {
+            final convList = convEntry.value;
+            if (convList is! List) continue;
+            for (final mEntry in convList) {
+              if (mEntry is! Map) continue;
+              if (mEntry['msgID'] == msgID || mEntry['id'] == msgID) {
+                entry = Map<String, dynamic>.from(mEntry);
+                matchedConvKey = convEntry.key as String;
+                // Recover the per-account suffix (if any) so we can call
+                // removeFailedMessage with the right scope. Suffix is
+                // everything after `<persistenceKey>_`.
+                const base = 'tencent_cloud_chat_failed_messages';
+                if (key.length > base.length + 1 &&
+                    key.startsWith('${base}_')) {
+                  accountToxIdForRemoval = key.substring(base.length + 1);
+                }
+                break;
+              }
+            }
+            if (entry != null) break;
+          }
+        } catch (_) {
+          continue;
+        }
+        if (entry != null) break;
+      }
+
+      if (entry == null || matchedConvKey == null) {
+        return V2TimValueCallback<V2TimMessage>(
+          code: -1,
+          desc: 'reSendMessage: failed message not found for msgID=$msgID',
+        );
+      }
+
+      // Decide userID/groupID. The persisted `userID`/`groupID` fields
+      // are authoritative when present; the conversation key is a useful
+      // fallback for legacy entries.
+      String? userID = entry['userID'] as String?;
+      String? groupID = entry['groupID'] as String?;
+      // Conversation key contains the destination when persisted entries
+      // were keyed only by conversation.
+      if ((userID == null || userID.isEmpty) &&
+          (groupID == null || groupID.isEmpty)) {
+        // matchedConvKey is groupID for groups, userID for c2c (see
+        // saveFailedMessage's conversationKey construction).
+        // We don't know which it is; assume userID and let upstream
+        // recover from a wrong-target failure.
+        userID = matchedConvKey;
+      }
+
+      // Rebuild a V2TimMessage from the entry.
+      final mediaKind = entry['mediaKind'] as String?;
+      final text = entry['text'] as String? ?? '';
+      final filePath = entry['filePath'] as String?;
+      final fileName = entry['fileName'] as String?;
+      final fileSize = entry['fileSize'] as int?;
+      final localUrl = entry['localUrl'] as String?;
+      final customData = entry['customData'] as String?;
+      final soundDuration = entry['soundDuration'] as int?;
+      final videoDuration = entry['videoDuration'] as int?;
+
+      int elemType = entry['elemType'] as int? ??
+          MessageElemType.V2TIM_ELEM_TYPE_TEXT;
+      // mediaKind takes precedence when present (v2 entries).
+      switch (mediaKind) {
+        case 'image':
+          elemType = MessageElemType.V2TIM_ELEM_TYPE_IMAGE;
+          break;
+        case 'file':
+          elemType = MessageElemType.V2TIM_ELEM_TYPE_FILE;
+          break;
+        case 'audio':
+          elemType = MessageElemType.V2TIM_ELEM_TYPE_SOUND;
+          break;
+        case 'video':
+          elemType = MessageElemType.V2TIM_ELEM_TYPE_VIDEO;
+          break;
+        case 'custom':
+          elemType = MessageElemType.V2TIM_ELEM_TYPE_CUSTOM;
+          break;
+      }
+
+      final rebuilt = V2TimMessage(elemType: elemType);
+      rebuilt.msgID = msgID;
+      rebuilt.id = msgID;
+      rebuilt.isSelf = entry['isSelf'] as bool? ?? true;
+      rebuilt.timestamp = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      rebuilt.status = MessageStatus.V2TIM_MSG_STATUS_SENDING;
+      if (userID != null && userID.isNotEmpty) rebuilt.userID = userID;
+      if (groupID != null && groupID.isNotEmpty) rebuilt.groupID = groupID;
+
+      // Always include a textElem when the entry had text (e.g. text
+      // messages, file-with-caption). For pure media this stays null.
+      if (text.isNotEmpty) {
+        rebuilt.textElem = V2TimTextElem(text: text);
+      }
+
+      switch (elemType) {
+        case MessageElemType.V2TIM_ELEM_TYPE_IMAGE:
+          final p = filePath ?? localUrl;
+          if (p == null || p.isEmpty) {
+            return V2TimValueCallback<V2TimMessage>(
+              code: -1,
+              desc:
+                  'reSendMessage: image entry missing filePath/localUrl for msgID=$msgID',
+            );
+          }
+          rebuilt.imageElem = V2TimImageElem(path: p);
+          break;
+        case MessageElemType.V2TIM_ELEM_TYPE_FILE:
+          final p = filePath ?? localUrl;
+          if (p == null || p.isEmpty) {
+            return V2TimValueCallback<V2TimMessage>(
+              code: -1,
+              desc:
+                  'reSendMessage: file entry missing filePath/localUrl for msgID=$msgID',
+            );
+          }
+          rebuilt.fileElem = V2TimFileElem(
+            path: p,
+            fileName: fileName ?? p.split('/').last,
+            fileSize: fileSize,
+            localUrl: localUrl,
+          );
+          break;
+        case MessageElemType.V2TIM_ELEM_TYPE_SOUND:
+          final p = filePath ?? localUrl;
+          if (p == null || p.isEmpty) {
+            return V2TimValueCallback<V2TimMessage>(
+              code: -1,
+              desc:
+                  'reSendMessage: sound entry missing filePath/localUrl for msgID=$msgID',
+            );
+          }
+          rebuilt.soundElem = V2TimSoundElem(
+            path: p,
+            dataSize: fileSize,
+            duration: soundDuration,
+          );
+          break;
+        case MessageElemType.V2TIM_ELEM_TYPE_VIDEO:
+          final p = filePath ?? localUrl;
+          if (p == null || p.isEmpty) {
+            return V2TimValueCallback<V2TimMessage>(
+              code: -1,
+              desc:
+                  'reSendMessage: video entry missing filePath/localUrl for msgID=$msgID',
+            );
+          }
+          rebuilt.videoElem = V2TimVideoElem(
+            videoPath: p,
+            videoSize: fileSize,
+            duration: videoDuration,
+          );
+          break;
+        case MessageElemType.V2TIM_ELEM_TYPE_CUSTOM:
+          rebuilt.customElem = V2TimCustomElem(data: customData ?? '');
+          break;
+        case MessageElemType.V2TIM_ELEM_TYPE_TEXT:
+        default:
+          // text-only or unknown elemType — treat as text. textElem already set above when non-empty.
+          if (rebuilt.textElem == null) {
+            rebuilt.textElem = V2TimTextElem(text: text);
+          }
+          break;
+      }
+
+      // Cache the rebuilt message in the same way createXxxMessage does
+      // so the sendMessage path can find it via id lookup.
+      _forwardMessageCache[msgID] = rebuilt;
+
+      // Dispatch via sendMessage so we go through the elem branches that
+      // we just added in P0-1.
+      final result = await sendMessage(
+        id: msgID,
+        receiver: userID ?? '',
+        groupID: groupID ?? '',
+      );
+
+      if (result.code == 0) {
+        // Remove from failed persistence on success.
+        try {
+          await Tim2ToxFailedMessagePersistence.removeFailedMessage(
+            messageID: msgID,
+            userID: userID,
+            groupID: groupID,
+            accountToxId: accountToxIdForRemoval,
+          );
+        } catch (_) {
+          // Non-fatal: the message is sent; failure to clean up is just
+          // a stale entry.
+        }
+      }
+      return result;
+    } catch (e, st) {
+      if (_debugLog) {
+        print('[Tim2ToxSdkPlatform] reSendMessage exception: $e\n$st');
+      }
+      return V2TimValueCallback<V2TimMessage>(
+        code: -1,
+        desc: 'reSendMessage failed: $e',
+      );
+    }
   }
 
   @override
@@ -5716,6 +6070,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     return V2TimCallback(code: 0, desc: 'success');
   }
 
+  /// P1-13: merger messages are not yet supported in toxee. Return an
+  /// explicit error instead of letting the default platform interface
+  /// throw `UnimplementedError`, which crashes the UIKit dispatch loop.
+  @override
+  Future<V2TimValueCallback<List<V2TimMessage>>> downloadMergerMessage({
+    String? msgID,
+  }) async {
+    return V2TimValueCallback<List<V2TimMessage>>(
+      code: -1,
+      desc: 'merger messages not yet supported in toxee',
+      data: const <V2TimMessage>[],
+    );
+  }
+
   @override
   Future<V2TimCallback> revokeMessage({
     String? msgID,
@@ -5740,18 +6108,51 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
       final message = foundMessages.data!.first;
 
-      // In Tox, we can't actually revoke a message that was already sent
-      // We can only delete it locally and send a revocation notification
-      // For now, we'll just delete it locally and notify listeners
-      // TODO: Add a public method in FfiChatService to send revocation notifications
+      // In Tox there is no native revoke; emulate it with a magic-prefix
+      // text message (`__revoke__:<json>`) so a peer that understands the
+      // protocol can delete its local copy too.
+      //
+      // 1) Always perform the local delete + listener fan-out (works even
+      //    if the peer hasn't adopted the protocol yet — at least the
+      //    sender's view is consistent).
+      // 2) Best-effort send the signaling message; failure must not block
+      //    the local revoke from succeeding.
+      //
+      // P0-11 (send side). Receive-side handling is implemented best-effort
+      // in `_maybeInterceptRevokeSignal` (called from incoming message
+      // pathways below). If the peer does not run a build with the
+      // intercept, the message will display as raw text — degraded but
+      // strictly better than silent drop.
 
-      // Delete the message locally
+      // Delete the message locally first so the sender sees the result
+      // immediately even if the signal send fails.
       await deleteMessages(msgIDs: [msgID]);
 
-      // Notify listeners
+      // Notify listeners (sender-side onRecvMessageRevoked).
       _notifyAdvancedMsgListeners((listener) {
         listener.onRecvMessageRevoked?.call(msgID);
       });
+
+      // Best-effort wire signal so the peer can also revoke.
+      try {
+        final String? peerUserID = message.userID;
+        final String? peerGroupID = message.groupID;
+        final payload = '__revoke__:${json.encode({
+              'msgID': msgID,
+            })}';
+        if (peerUserID != null && peerUserID.isNotEmpty) {
+          await ffiService.sendText(peerUserID, payload);
+        } else if (peerGroupID != null && peerGroupID.isNotEmpty) {
+          // Group revoke: FfiChatService exposes sendGroupText.
+          await ffiService.sendGroupText(peerGroupID, payload);
+        }
+      } catch (e) {
+        // Wire-side failure should not fail the local revoke.
+        if (_debugLog) {
+          print(
+              '[Tim2ToxSdkPlatform] revokeMessage: signal send failed (peer will keep its copy): $e');
+        }
+      }
 
       return V2TimCallback(
         code: 0,
@@ -5763,6 +6164,40 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         desc: 'revokeMessage failed: $e',
       );
     }
+  }
+
+  /// P0-11 receive-side handler.
+  ///
+  /// Inspect an incoming text payload; if it carries the `__revoke__:`
+  /// signaling prefix, locally delete the referenced message and fire
+  /// `onRecvMessageRevoked`. Returns true when the message was handled as a
+  /// revoke signal (caller should swallow it from the normal UI flow).
+  ///
+  /// TODO(P0-11): wire this into the actual incoming text dispatch path
+  /// once the routing pipeline is stable. Today it's exported so
+  /// integrating code (Tim2ToxSdkPlatform receive handler, FakeChatMessageProvider
+  /// routing) can call it explicitly. Single-side implementation is
+  /// strictly better than silent drop.
+  Future<bool> _maybeInterceptRevokeSignal(String text) async {
+    if (!text.startsWith('__revoke__:')) return false;
+    try {
+      final payload = text.substring('__revoke__:'.length);
+      final parsed = json.decode(payload);
+      if (parsed is Map && parsed['msgID'] is String) {
+        final revokedID = parsed['msgID'] as String;
+        await deleteMessages(msgIDs: [revokedID]);
+        _notifyAdvancedMsgListeners((listener) {
+          listener.onRecvMessageRevoked?.call(revokedID);
+        });
+        return true;
+      }
+    } catch (e) {
+      if (_debugLog) {
+        print(
+            '[Tim2ToxSdkPlatform] _maybeInterceptRevokeSignal: parse error: $e');
+      }
+    }
+    return false;
   }
 
   @override

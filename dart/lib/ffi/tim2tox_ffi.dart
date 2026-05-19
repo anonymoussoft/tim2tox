@@ -676,7 +676,6 @@ class Tim2ToxFfi {
     
     // Try absolute path from project root (for development/testing)
     final projectRootPaths = [
-      '/Users/bin.gao/chat-uikit/tim2tox/build/ffi/$libName',
       '${exeDir.path}/../../tim2tox/build/ffi/$libName',
       '${exeDir.path}/../../../tim2tox/build/ffi/$libName',
     ];

@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tim2tox-bootstrap <bootstrap@local>
+Date: Tue, 19 May 2026 07:00:00 -0700
+Subject: [PATCH 6/6] route getGroupMembersInfo to DartGetGroupMembersInfo
+
+The 8.7.x patch series included an adapter-additions patch that flipped
+`getGroupMembersInfo`'s binding call from `DartGetGroupMemberList`
+(paginated, filter-only) to the dedicated `DartGetGroupMembersInfo`
+(by-memberList lookup). That patch was dropped on the 8.9.7540+3 upgrade
+because upstream rewrote the adapters and the old hunks no longer applied,
+but the matching binding addition in 0005-models-and-bindings was kept —
+leaving the new binding as dead code while `getGroupMembersInfo` continued
+to call the wrong C entry point. Result: passing `memberList: [...]` was
+silently ignored and the call returned a paginated full-group page
+instead of the requested members.
+
+Restore just the one-line callsite fix. `getGroupMemberList` at line 397
+intentionally keeps `DartGetGroupMemberList` — only `getGroupMembersInfo`
+at line 433 changes.
+---
+ lib/native_im/adapter/tim_group_manager.dart | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/native_im/adapter/tim_group_manager.dart b/lib/native_im/adapter/tim_group_manager.dart
+--- a/lib/native_im/adapter/tim_group_manager.dart
++++ b/lib/native_im/adapter/tim_group_manager.dart
+@@ -430,7 +430,7 @@
+     GroupGetMemberInfoListParam param = GroupGetMemberInfoListParam(groupID: groupID, filter: GroupMemberFilterTypeEnum.V2TIM_GROUP_MEMBER_FILTER_ALL, memberList: memberList);
+     Pointer<Char> pJsonParam = Tools.string2PointerChar(json.encode(param.toJson()));
+     Pointer<Void> pUserData = Tools.string2PointerVoid(userData);
+-    int result = NativeLibraryManager.bindings.DartGetGroupMemberList(pJsonParam, pUserData);
++    int result = NativeLibraryManager.bindings.DartGetGroupMembersInfo(pJsonParam, pUserData);
+     if (result != TIMResult.TIM_SUCC.value) {
+       NativeLibraryManager.removeTimCallbackFromMap(userData);
+       Tools.freePointers([pJsonParam, pUserData]);
+--
+2.50.1 (Apple Git-155)

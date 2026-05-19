@@ -31,7 +31,7 @@ cmake .. \
     -DDEBUG=OFF
 
 # Build using available CPU cores
-make -j$(sysctl -n hw.ncpu)
+make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
 # Return to original directory
 cd .. 

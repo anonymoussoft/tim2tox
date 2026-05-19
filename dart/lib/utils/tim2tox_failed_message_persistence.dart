@@ -17,6 +17,15 @@ class Tim2ToxFailedMessagePersistence {
   static const String _persistenceKey = 'tencent_cloud_chat_failed_messages';
   static const int _legacyAccountPrefixLen = 16;
 
+  /// Schema version stored alongside each persisted entry.
+  /// v1: text/id/msgID/elemType/etc. only.
+  /// v2 (P0-12): adds optional media fields (filePath, fileName, fileSize,
+  ///             mediaKind, localUrl, customData, soundDuration, videoDuration)
+  ///             so file/image/sound/video/custom resends can rebuild the
+  ///             original V2TimMessage. Loaders MUST tolerate missing fields
+  ///             — v1 entries are still readable.
+  static const int _schemaVersion = 2;
+
   static String _storageKey(String? accountToxId) {
     if (accountToxId == null || accountToxId.isEmpty) return _persistenceKey;
     return '${_persistenceKey}_$accountToxId';
@@ -90,8 +99,56 @@ class Tim2ToxFailedMessagePersistence {
         );
       }
       
-      // Create message data to save
-      final messageData = {
+      // Create message data to save. v2 schema (P0-12): extra optional
+      // fields for media messages so reSendMessage can rebuild a usable
+      // V2TimMessage. All new fields are optional and absent on text-only
+      // entries (and on legacy v1 entries) — loaders must default to null.
+      String? mediaKind;
+      String? filePath;
+      String? fileName;
+      int? fileSize;
+      String? localUrl;
+      String? customData;
+      int? soundDuration;
+      int? videoDuration;
+      if (message.imageElem != null) {
+        mediaKind = 'image';
+        filePath = message.imageElem!.path;
+        // imageList[].localUrl is the fallback path on the receive side; pick the first non-empty.
+        final imgs = message.imageElem!.imageList;
+        if (imgs != null) {
+          for (final img in imgs) {
+            if (img != null && img.localUrl != null && img.localUrl!.isNotEmpty) {
+              localUrl = img.localUrl;
+              if (img.size != null && img.size! > 0) fileSize = img.size;
+              break;
+            }
+          }
+        }
+      } else if (message.fileElem != null) {
+        mediaKind = 'file';
+        filePath = message.fileElem!.path;
+        fileName = message.fileElem!.fileName;
+        fileSize = message.fileElem!.fileSize;
+        localUrl = message.fileElem!.localUrl;
+      } else if (message.soundElem != null) {
+        mediaKind = 'audio';
+        filePath = message.soundElem!.path;
+        fileSize = message.soundElem!.dataSize;
+        localUrl = message.soundElem!.localUrl;
+        soundDuration = message.soundElem!.duration;
+      } else if (message.videoElem != null) {
+        mediaKind = 'video';
+        filePath = message.videoElem!.videoPath;
+        fileSize = message.videoElem!.videoSize;
+        localUrl = message.videoElem!.localVideoUrl;
+        videoDuration = message.videoElem!.duration;
+      } else if (message.customElem != null) {
+        mediaKind = 'custom';
+        customData = message.customElem!.data;
+      }
+
+      final messageData = <String, dynamic>{
         'id': message.id,
         'msgID': message.msgID,
         'timestamp': message.timestamp,
@@ -102,6 +159,15 @@ class Tim2ToxFailedMessagePersistence {
         'isSelf': message.isSelf,
         'status': MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL,
         'savedAt': DateTime.now().millisecondsSinceEpoch,
+        'schemaVersion': _schemaVersion,
+        if (mediaKind != null) 'mediaKind': mediaKind,
+        if (filePath != null) 'filePath': filePath,
+        if (fileName != null) 'fileName': fileName,
+        if (fileSize != null) 'fileSize': fileSize,
+        if (localUrl != null) 'localUrl': localUrl,
+        if (customData != null) 'customData': customData,
+        if (soundDuration != null) 'soundDuration': soundDuration,
+        if (videoDuration != null) 'videoDuration': videoDuration,
       };
       
       // Add or update message in the list
@@ -181,7 +247,12 @@ class Tim2ToxFailedMessagePersistence {
       Map<String, dynamic> failedMessagesMap = json.decode(jsonString) as Map<String, dynamic>;
       final conversationKey = groupID ?? userID ?? '';
       if (conversationKey.isEmpty || !failedMessagesMap.containsKey(conversationKey)) return [];
-      
+
+      // P0-12: schema v1 entries have no `schemaVersion` key and no media
+      // fields; v2 entries add them. Both shapes are returned as-is here;
+      // callers that need media fields must tolerate them being missing
+      // (treat as null). No active migration: the next save will rewrite
+      // the entry under the v2 schema.
       return List<Map<String, dynamic>>.from(
         failedMessagesMap[conversationKey] as List
       );

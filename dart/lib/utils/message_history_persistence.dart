@@ -143,6 +143,76 @@ class MessageHistoryPersistence {
     return File('${file.path}.bak');
   }
   
+  /// Cached per-process storage-root lookup so we don't hit
+  /// path_provider on every load/save.
+  ({String? appSupport, String? documents})? _storageRootsCache;
+
+  /// P1-15 helper. Resolves and caches the two storage roots we
+  /// relativize against: AppSupport (where file_recv lives) and Documents
+  /// (where Downloads lives on desktop). Returns null parts when the
+  /// platform does not expose the corresponding directory.
+  Future<({String? appSupport, String? documents})> _resolveStorageRoots() async {
+    if (_storageRootsCache != null) return _storageRootsCache!;
+    String? appSupport;
+    String? documents;
+    try {
+      final dir = await getApplicationSupportDirectory();
+      appSupport = dir.path;
+    } catch (_) {
+      // Some platforms (tests) may not have AppSupport.
+    }
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      documents = dir.path;
+    } catch (_) {
+      // Best-effort.
+    }
+    final roots = (appSupport: appSupport, documents: documents);
+    _storageRootsCache = roots;
+    return roots;
+  }
+
+  /// P1-15: rewrite an absolute path under a well-known root to a
+  /// placeholder token. Unknown paths are returned unchanged so legacy
+  /// rows continue to round-trip.
+  String _relativizePath(
+      String absolutePath, ({String? appSupport, String? documents}) roots) {
+    final appSupport = roots.appSupport;
+    final documents = roots.documents;
+    if (appSupport != null && absolutePath.startsWith('$appSupport/file_recv/')) {
+      final tail = absolutePath.substring('$appSupport/file_recv/'.length);
+      return '{{fileRecv}}/$tail';
+    }
+    if (appSupport != null && absolutePath.startsWith('$appSupport/avatars/')) {
+      final tail = absolutePath.substring('$appSupport/avatars/'.length);
+      return '{{avatars}}/$tail';
+    }
+    if (documents != null && absolutePath.startsWith('$documents/Downloads/')) {
+      final tail = absolutePath.substring('$documents/Downloads/'.length);
+      return '{{downloads}}/$tail';
+    }
+    return absolutePath;
+  }
+
+  /// P1-15: inverse of [_relativizePath]. Placeholder tokens are
+  /// substituted with the current device's storage roots; absolute paths
+  /// (legacy v1 entries) are returned unchanged.
+  String _resolvePath(
+      String storedPath, ({String? appSupport, String? documents}) roots) {
+    final appSupport = roots.appSupport;
+    final documents = roots.documents;
+    if (storedPath.startsWith('{{fileRecv}}/') && appSupport != null) {
+      return '$appSupport/file_recv/${storedPath.substring('{{fileRecv}}/'.length)}';
+    }
+    if (storedPath.startsWith('{{avatars}}/') && appSupport != null) {
+      return '$appSupport/avatars/${storedPath.substring('{{avatars}}/'.length)}';
+    }
+    if (storedPath.startsWith('{{downloads}}/') && documents != null) {
+      return '$documents/Downloads/${storedPath.substring('{{downloads}}/'.length)}';
+    }
+    return storedPath;
+  }
+
   /// Get temporary file path for atomic writes
   Future<File> _getTempFile(String id) async {
     final file = await _getHistoryFile(id);
@@ -191,11 +261,28 @@ class MessageHistoryPersistence {
         }
       }
 
-      // Prepare data
-      final jsonList = messages.map((msg) => msg.toJson()).toList();
+      // Prepare data.
+      //
+      // P1-15: rewrite absolute filePaths under the well-known media-storage
+      // roots into placeholders so a profile that moves between devices (or
+      // re-installs that change the AppSupport path) doesn't end up with
+      // dangling paths in its history. Unknown / outside-root paths are
+      // left as-is to keep the change strictly additive.
+      final storageRoots = await _resolveStorageRoots();
+      final jsonList = messages.map((msg) {
+        final m = msg.toJson();
+        final fp = m['filePath'];
+        if (fp is String && fp.isNotEmpty) {
+          m['filePath'] = _relativizePath(fp, storageRoots);
+        }
+        return m;
+      }).toList();
       final data = {
         'conversationId': normalizedId,
-        'version': 1, // Format version for migration support
+        // P1-15: bump format to 2 to signal that filePath may contain
+        // placeholder tokens. v1 readers will treat them as opaque strings;
+        // v2 readers rehydrate via [_resolvePath].
+        'version': 2,
         'lastViewTimestamp': _lastViewTimestampById[normalizedId] ?? 0,
         'messages': jsonList,
       };
@@ -280,19 +367,37 @@ class MessageHistoryPersistence {
       List<ChatMessage> messages;
       String? actualId;
       
+      // P1-15: resolve storage roots once per load so we can rehydrate
+      // placeholder filePaths into absolute device paths.
+      final storageRoots = await _resolveStorageRoots();
+
       if (decoded is Map<String, dynamic>) {
         // New format with metadata
         actualId = decoded['conversationId'] as String?;
         // Load lastViewTimestamp if available (default to 0 if not present)
         final lastViewTimestamp = decoded['lastViewTimestamp'] as int? ?? 0;
         final jsonList = decoded['messages'] as List<dynamic>;
-        messages = jsonList.map((json) => ChatMessage.fromJson(json as Map<String, dynamic>)).toList();
+        messages = jsonList.map((json) {
+          final m = json as Map<String, dynamic>;
+          final fp = m['filePath'];
+          if (fp is String && fp.isNotEmpty) {
+            m['filePath'] = _resolvePath(fp, storageRoots);
+          }
+          return ChatMessage.fromJson(m);
+        }).toList();
         // Store lastViewTimestamp in memory cache
         final targetIdForTimestamp = actualId ?? id;
         _lastViewTimestampById[targetIdForTimestamp] = lastViewTimestamp;
       } else if (decoded is List<dynamic>) {
         // Old format (backward compatibility)
-        messages = decoded.map((json) => ChatMessage.fromJson(json as Map<String, dynamic>)).toList();
+        messages = decoded.map((json) {
+          final m = json as Map<String, dynamic>;
+          final fp = m['filePath'];
+          if (fp is String && fp.isNotEmpty) {
+            m['filePath'] = _resolvePath(fp, storageRoots);
+          }
+          return ChatMessage.fromJson(m);
+        }).toList();
         // Try to infer ID from messages
         if (messages.isNotEmpty) {
           final firstMsg = messages.first;
@@ -442,8 +547,17 @@ class MessageHistoryPersistence {
       if (decoded is Map<String, dynamic>) {
         final jsonList = decoded['messages'] as List<dynamic>?;
         if (jsonList == null) return [];
-        
-        final messages = jsonList.map((json) => ChatMessage.fromJson(json as Map<String, dynamic>)).toList();
+
+        // P1-15: rehydrate placeholder filePaths in the backup too.
+        final storageRoots = await _resolveStorageRoots();
+        final messages = jsonList.map((json) {
+          final m = json as Map<String, dynamic>;
+          final fp = m['filePath'];
+          if (fp is String && fp.isNotEmpty) {
+            m['filePath'] = _resolvePath(fp, storageRoots);
+          }
+          return ChatMessage.fromJson(m);
+        }).toList();
         
         // Check quit groups
         if (quitGroups != null && messages.isNotEmpty) {

@@ -427,6 +427,12 @@ class FfiChatService {
   /// Per-account file receive directory (when set, used instead of app support file_recv).
   final String? _fileRecvPath;
 
+  /// P1-2: Resolved file_recv directory once init has run (whatever path the
+  /// constructor arg, resolver, or fallback ended up with). Used to anchor the
+  /// "receiving_*" temp path on disk instead of hard-coding `/tmp`, which is
+  /// world-writable on POSIX and the wrong shape on Windows.
+  String? _fileRecvDir;
+
   /// Per-account avatars directory (when set, used instead of app support avatars).
   final String? _avatarsPath;
 
@@ -544,6 +550,14 @@ class FfiChatService {
       {}; // peerId:path -> last emit time (throttle)
   static const _progressThrottleMs =
       200; // Min interval between progress emissions per transfer
+  // P0-8: Upper bound for the "images bypass the auto-download size limit"
+  // path. Images skip the user-configured threshold (photos are the
+  // common case), but we still cap acceptance so a hostile peer can't push
+  // an unbounded payload at us by spoofing an image extension.
+  static const int _imageAutoAcceptLimitBytes = 50 * 1024 * 1024; // 50 MiB
+  // P1-7: How long a receive transfer can sit without a progress update
+  // before we treat it as dead and clean it up.
+  static const Duration _fileTransferIdleTimeout = Duration(seconds: 60);
   final Map<String, (String, int)> _progressKeyCache =
       {}; // path -> (uid, fileNumber) cache for fast lookup
   DateTime? _lastPollActivity; // Track last activity time for adaptive polling
@@ -617,9 +631,38 @@ class FfiChatService {
   final Map<(String peerId, int fileNumber), String> _fileNumberToMsgID = {};
   // Track file path to msgID mapping for send progress correlation
   final Map<String, String> _pathToMsgID = {};
+  // P1-7: per-transfer last-progress wall-clock so the poll loop can detect
+  // stalled receives (no progress for [_fileTransferIdleTimeout]) and clean
+  // them up instead of leaving them as zombie pending messages.
+  final Map<(String peerId, int fileNumber), int> _lastProgressTs = {};
+  // P1-6: set of transfers currently paused by the remote peer. Tracked so
+  // the timeout sweeper doesn't mistakenly cancel a paused-but-healthy
+  // transfer.
+  final Set<(String peerId, int fileNumber)> _pausedTransfers = {};
+  // P2-23: msgID -> outgoing file path. Replaces the previous
+  // _lastSentPathByPeer (which was keyed by peer only and so could lose
+  // track of concurrent sends to the same peer). The progress_send handler
+  // can look up the original local path by msgID directly.
+  final Map<String, String> _msgIDToSentPath = {};
+  // P1-8: previously a file-level top-level variable shared across every
+  // FfiChatService instance in the process (auto_tests run several). Moved
+  // into the class so disposing one service doesn't blow away another's
+  // mapping. Kept alongside [_msgIDToSentPath] which is the more precise
+  // replacement; [_lastSentPathByPeer] remains for legacy progress_send
+  // correlation that doesn't yet thread a msgID through.
+  final Map<String, String> _lastSentPathByPeer = {};
 
   /// Poll timer callback stored so [triggerPollOnce] can run it immediately (e.g. when file message received).
   void Function()? _pollTimerCallback;
+
+  /// P2-19: reentry guard. The poll callback awaits inside its body
+  /// (acceptFileTransfer is awaited from file_request), so a second call
+  /// arriving via [triggerPollOnce] while the first is still mid-flight
+  /// used to interleave event drains and produce duplicate handling. This
+  /// flag turns the second invocation into a no-op; the next timer tick
+  /// (or the next triggerPollOnce after this one returns) will pick up
+  /// any remaining work.
+  bool _pollBusy = false;
 
   /// Reference to local scheduleNextPoll so [ _scheduleNextPoll] can schedule next poll from async callback.
   void Function()? _scheduleNextPollRef;
@@ -656,12 +699,26 @@ class FfiChatService {
     final msgBase = p.basename(messageFilePath);
     final progressBase = p.basename(progressPath);
     if (msgBase == progressBase) return true;
-    // History uses temp path like /tmp/receiving_<filename>; progress uses actual path (may have tox prefix).
-    if (messageFilePath.startsWith('/tmp/receiving_') &&
-        msgBase.startsWith('receiving_')) {
+    // History uses temp path like <recvDir>/receiving_<msgID>_<filename>;
+    // progress uses actual path (may have tox prefix). P1-2: we used to anchor
+    // this on /tmp/receiving_; now anchor on basename so the comparison works
+    // for any parent directory (per-account file_recv, /tmp fallback, etc.).
+    if (msgBase.startsWith('receiving_')) {
       final nameAfterReceiving = msgBase.substring('receiving_'.length);
       if (progressBase == nameAfterReceiving ||
           progressBase.endsWith('_$nameAfterReceiving')) return true;
+      // Strip the embedded msgID prefix (receiving_<msgID>_<filename>) if it
+      // looks like one (digits_digits_hex...) — fall back to comparing just
+      // the original filename portion.
+      final underscoreIdx = nameAfterReceiving.indexOf('_');
+      if (underscoreIdx > 0) {
+        final afterMsgID = nameAfterReceiving.substring(underscoreIdx + 1);
+        // afterMsgID may itself contain '_<peerUid>_filename' from inbound
+        // generation, but the most precise match is filename equality at the
+        // tail.
+        if (progressBase == afterMsgID ||
+            progressBase.endsWith('_$afterMsgID')) return true;
+      }
     }
     return false;
   }
@@ -987,6 +1044,10 @@ class FfiChatService {
       if (!await recvDir.exists()) {
         await recvDir.create(recursive: true);
       }
+      // P1-2: remember the resolved dir so the pending "receiving_*" temp
+      // path lives in the same per-account location as the actual file_recv
+      // output, instead of being hard-coded to `/tmp`.
+      _fileRecvDir = recvDir.path;
       final dirPath = recvDir.path.toNativeUtf8();
       final result = _ffi.setFileRecvDir(dirPath);
       pkgffi.malloc.free(dirPath);
@@ -1223,6 +1284,12 @@ class FfiChatService {
                   ? const Duration(milliseconds: 200)
                   : const Duration(milliseconds: 1000));
       _pollTimerCallback = () async {
+        // P2-19: drop overlapping invocations. See _pollBusy doc.
+        if (_pollBusy) {
+          return;
+        }
+        _pollBusy = true;
+        try {
         // Call toxav_iterate if AV is initialized
         try {
           _ffi.avIterate(_ffi.getCurrentInstanceId());
@@ -1476,6 +1543,11 @@ class FfiChatService {
                       tempPath: progress.tempPath,
                       actualPath: path,
                     );
+                    // P1-7: stamp the last-progress epoch so the timeout
+                    // sweeper can tell a stalled transfer from a healthy
+                    // one that's mid-chunk.
+                    _lastProgressTs[cachedKey] =
+                        DateTime.now().millisecondsSinceEpoch;
                     foundMsgID = progress.msgID;
                     foundFileNumber = cachedKey.$2;
                   }
@@ -1498,6 +1570,9 @@ class FfiChatService {
                         tempPath: progress.tempPath,
                         actualPath: path,
                       );
+                      // P1-7: see cache-hit branch above.
+                      _lastProgressTs[key] =
+                          DateTime.now().millisecondsSinceEpoch;
                       foundMsgID = progress.msgID;
                       foundFileNumber = key.$2;
                       _progressKeyCache[path] =
@@ -1550,6 +1625,9 @@ class FfiChatService {
                           actualPath:
                               path, // Update actual path when we receive it
                         );
+                        // P1-7: see other progress-update sites.
+                        _lastProgressTs[key] =
+                            DateTime.now().millisecondsSinceEpoch;
                         foundMsgID = progress.msgID;
                         foundFileNumber = key.$2;
                         // Do not log every progress match - would spam logs during file transfer
@@ -1633,8 +1711,20 @@ class FfiChatService {
                     // Call _handleFileDone with the same parameters as file_done event
                     _logger?.log(
                         '[FfiChatService] progress_recv: Calling _handleFileDone with actualPath=$actualPath, fileNumber=$foundFileNumber, msgID=$foundMsgID');
+                    // P1-3: an exception inside _handleFileDone used to be
+                    // dropped on the floor by unawaited() and the message would
+                    // sit forever in pending state. Capture & log here, and
+                    // mark the in-flight transfer as failed so the UI can
+                    // recover instead of waiting.
                     unawaited(_handleFileDone(
-                        uid, 0, actualPath, foundFileNumber, foundMsgID));
+                            uid, 0, actualPath, foundFileNumber, foundMsgID)
+                        .catchError((e, StackTrace st) {
+                      _logger?.logError(
+                          '[FfiChatService] progress_recv: _handleFileDone failed',
+                          e,
+                          st);
+                      _markFileTransferFailed(uid, foundFileNumber, foundMsgID);
+                    }));
                   } else {
                     _logger?.log(
                         '[FfiChatService] progress_recv: WARNING - actualPath is invalid, cannot trigger file_done handling');
@@ -1725,8 +1815,19 @@ class FfiChatService {
                         if (path.isNotEmpty && path.startsWith('/')) {
                           _logger?.log(
                               '[FfiChatService] progress_recv: Calling _handleFileDone with extracted fileNumber=$extractedFileNumber, msgID=$foundMsgID');
+                          // P1-3: catch async failures so they don't vanish
+                          // into the void; same rationale as the sibling call
+                          // above.
                           unawaited(_handleFileDone(
-                              uid, 0, path, extractedFileNumber, foundMsgID));
+                                  uid, 0, path, extractedFileNumber, foundMsgID)
+                              .catchError((e, StackTrace st) {
+                            _logger?.logError(
+                                '[FfiChatService] progress_recv: _handleFileDone failed',
+                                e,
+                                st);
+                            _markFileTransferFailed(
+                                uid, extractedFileNumber, foundMsgID);
+                          }));
                         }
                       } else {
                         _logger?.logWarning(
@@ -1818,8 +1919,11 @@ class FfiChatService {
                   final sequence = _msgIDSequence++;
                   final msgID = '${timestamp}_${sequence}_$normalizedUid';
                   // Create a pending file message with temporary path (will be updated when file_done)
+                  // P1-2: anchor the temp path in the per-account file_recv dir
+                  // when known. Includes msgID so concurrent transfers of the
+                  // same filename from the same peer don't collide.
                   final tempPath =
-                      '/tmp/receiving_$fileName'; // Temporary path to indicate receiving
+                      '${_fileRecvDir ?? '/tmp'}/receiving_${msgID}_$fileName';
                   final kind = _detectKind(fileName);
                   final msg = ChatMessage(
                     text: '',
@@ -1844,6 +1948,11 @@ class FfiChatService {
                     tempPath: tempPath,
                     actualPath: null,
                   );
+                  // P1-7: seed the idle clock at request-time so the
+                  // timeout sweeper measures from "we saw the request"
+                  // rather than from a never-set baseline.
+                  _lastProgressTs[(normalizedUid, fileNumber)] =
+                      DateTime.now().millisecondsSinceEpoch;
                   // Store pending file transfer mapping
                   _pendingFileTransfers[(normalizedUid, fileNumber)] = msgID;
                   // Store msgID to file transfer mapping for progress updates
@@ -1887,7 +1996,14 @@ class FfiChatService {
                           Future.value(30));
                   final autoAcceptThreshold =
                       sizeLimitMB * 1024 * 1024; // Convert MB to bytes
-                  if (isImage || fileSize < autoAcceptThreshold) {
+                  // P0-8: Images bypass the user-configured size limit but are
+                  // still capped — an unbounded OR was a denial-of-service risk
+                  // because a malicious peer could push an arbitrarily large
+                  // "image" (or anything spoofed with an image extension) and
+                  // we'd auto-accept it. 50 MiB is a sane upper bound for
+                  // ordinary chat imagery (photos, screenshots).
+                  if ((isImage && fileSize < _imageAutoAcceptLimitBytes) ||
+                      fileSize < autoAcceptThreshold) {
                     if (isImage) {
                       _logger?.log(
                           '[FfiChatService] Auto-accepting image file: $fileName (${fileSize} bytes)');
@@ -2126,9 +2242,22 @@ class FfiChatService {
                       ));
                     }
                     // Regular file: call unified handler
+                    // P1-3: the bare try/catch here only caught synchronous
+                    // failures (e.g. invalid argument) — async failures inside
+                    // _handleFileDone disappeared because unawaited() doesn't
+                    // forward them. Capture both paths explicitly and surface
+                    // the failure to the transfer record so it doesn't get
+                    // stuck pending.
                     try {
                       unawaited(_handleFileDone(
-                          uid, fileKind, actualPath, fileNumber, msgID));
+                              uid, fileKind, actualPath, fileNumber, msgID)
+                          .catchError((e, StackTrace st) {
+                        _logger?.logError(
+                            '[FfiChatService] file_done: _handleFileDone failed (async)',
+                            e,
+                            st);
+                        _markFileTransferFailed(uid, fileNumber, msgID);
+                      }));
                       _logger?.log(
                           '[FfiChatService] file_done: _handleFileDone called (async)');
                     } catch (e, stackTrace) {
@@ -2136,6 +2265,7 @@ class FfiChatService {
                           '[FfiChatService] file_done: ERROR calling _handleFileDone',
                           e,
                           stackTrace);
+                      _markFileTransferFailed(uid, fileNumber, msgID);
                     }
                   } else {
                     _logger?.log(
@@ -2152,6 +2282,33 @@ class FfiChatService {
                     '[FfiChatService] file_done: ERROR - Invalid format, expected at least 4 parts, got ${parts.length}');
                 _logger?.log(
                     '[FfiChatService] file_done: Parts: ${parts.join(" | ")}');
+              }
+            } else if (s.startsWith('file_canceled:') ||
+                s.startsWith('file_cancel:') ||
+                s.startsWith('file_paused:') ||
+                s.startsWith('file_resumed:')) {
+              // P1-6: peer-initiated file control events.
+              // TODO(P1-6): wire after FFI emits file_control events — the
+              // native side does not currently publish these strings, so
+              // this branch is dead code today. The handler lives here so
+              // that once the FFI layer adds emission, no Dart change is
+              // needed beyond confirming the exact event prefix.
+              // Format: <event>:<uid>:<file_number>
+              final colonIdx = s.indexOf(':');
+              final prefix = s.substring(0, colonIdx);
+              final rest = s.substring(colonIdx + 1);
+              final parts = rest.split(':');
+              if (parts.length >= 2) {
+                final uid = parts[0];
+                final fileNumber = int.tryParse(parts[1]);
+                if (fileNumber != null) {
+                  final control = (prefix == 'file_canceled' ||
+                          prefix == 'file_cancel')
+                      ? 'cancel'
+                      : (prefix == 'file_paused' ? 'pause' : 'resume');
+                  _handleFileControl(
+                      uid: uid, fileNumber: fileNumber, control: control);
+                }
               }
             } else if (s.startsWith('nickname_changed:')) {
               // nickname_changed:<friend_id>:<nickname>
@@ -2251,8 +2408,20 @@ class FfiChatService {
           _lastCustomGroupID = null;
         }
         pkgffi.malloc.free(customBuf);
+        // P1-7: opportunistic stale-transfer sweep. Cheap when there are no
+        // in-flight transfers; only does real work if one has gone quiet.
+        try {
+          _checkFileTransferTimeouts();
+        } catch (e, st) {
+          _logger?.logError(
+              '[FfiChatService] _checkFileTransferTimeouts failed', e, st);
+        }
         // Schedule next poll with adaptive interval
         _scheduleNextPoll();
+        } finally {
+          // P2-19: release the reentry guard regardless of how we exit.
+          _pollBusy = false;
+        }
       };
       _poller = Timer(pollInterval, _pollTimerCallback!);
     }
@@ -2475,7 +2644,16 @@ class FfiChatService {
           finalPathFuture =
               _moveFileToDownloads(path, fileName ?? p.basename(path))
                   .then((movedPath) async {
-            if (movedPath != null && movedPath != path) {
+            // P1-4: a null return from _moveFileToDownloads now means the
+            // copy failed. Surface that as a failed transfer and stop the
+            // history-write chain by returning an empty string sentinel.
+            if (movedPath == null) {
+              _logger?.log(
+                  '[FfiChatService] _handleFileDone: file move to Downloads failed — marking transfer failed');
+              _markFileTransferFailed(uid, actualFileNumber, foundMsgID);
+              return '';
+            }
+            if (movedPath != path) {
               // File was successfully moved - update progress tracking with new path
               // This ensures subsequent progress updates use the correct path
               if (capturedFileNumber != null) {
@@ -2537,11 +2715,15 @@ class FfiChatService {
               return path;
             }
           }).catchError((e) {
+            // P1-4: same rationale as the null branch above — bail out and
+            // mark the transfer failed instead of pretending the source
+            // path is a final destination.
             _logger?.logError(
                 '[FfiChatService] _handleFileDone: Error moving file to Downloads',
                 e,
                 StackTrace.current);
-            return path;
+            _markFileTransferFailed(uid, actualFileNumber, foundMsgID);
+            return '';
           });
         }
 
@@ -2549,6 +2731,14 @@ class FfiChatService {
         unawaited(finalPathFuture.then((finalPath) async {
           _logger?.log(
               '[FfiChatService] _handleFileDone: Processing file with final path: $finalPath');
+          // P1-4: empty string is the sentinel _moveFileToDownloads uses to
+          // signal that we already marked the transfer failed. Don't go on
+          // to write history with an empty path.
+          if (finalPath.isEmpty) {
+            _logger?.log(
+                '[FfiChatService] _handleFileDone: finalPath is empty (transfer failed earlier), aborting history update');
+            return;
+          }
           // Verify file exists before updating message
           final file = File(finalPath);
           final exists = await file.exists();
@@ -2814,7 +3004,7 @@ class FfiChatService {
                   // it means it was already processed by progress_recv, so we should skip emitting to stream
                   final wasAlreadyCompleted = !oldMsg.isPending &&
                       oldMsg.filePath != null &&
-                      !oldMsg.filePath!.startsWith('/tmp/receiving_');
+                      !oldMsg.filePath!.contains('/receiving_');
 
                   history[index] = updatedMsg;
                   _lastByPeer[normalizedUid] = updatedMsg;
@@ -2910,7 +3100,7 @@ class FfiChatService {
                   // so we should skip it to avoid creating duplicate messages
                   if (msg.isPending == true &&
                       msg.filePath != null &&
-                      msg.filePath!.startsWith('/tmp/receiving_')) {
+                      msg.filePath!.contains('/receiving_')) {
                     // Update this message
                     final updatedMsg = ChatMessage(
                       text: msg.text,
@@ -2984,7 +3174,7 @@ class FfiChatService {
                   // Use the existing filePath if available, otherwise use finalPath even though file doesn't exist
                   String? messageFilePath = oldMsg.filePath;
                   if (messageFilePath == null ||
-                      messageFilePath.startsWith('/tmp/receiving_')) {
+                      messageFilePath.contains('/receiving_')) {
                     // Message still has temp path, try to use finalPath even though file doesn't exist
                     // This ensures the message is marked as complete
                     messageFilePath = finalPath;
@@ -3011,7 +3201,7 @@ class FfiChatService {
                   // it means it was already processed by progress_recv, so we should skip emitting to stream
                   final wasAlreadyCompleted = !oldMsg.isPending &&
                       oldMsg.filePath != null &&
-                      !oldMsg.filePath!.startsWith('/tmp/receiving_');
+                      !oldMsg.filePath!.contains('/receiving_');
 
                   final updatedMsg = ChatMessage(
                     text: oldMsg.text,
@@ -3573,9 +3763,52 @@ class FfiChatService {
   }
 
   Future<void> removeFriend(String userId) async {
-    final p = userId.toNativeUtf8();
-    _ffi.deleteFriend(p);
-    pkgffi.malloc.free(p);
+    // P2-21: tear down friend-scoped state before the native delete so we
+    // don't leak in-flight transfer tracking, presence flags, or partially
+    // received files for someone we no longer have a relationship with.
+    final normalizedUid =
+        userId.length > 64 ? _normalizeFriendId(userId) : userId;
+    bool matchesUid((String, int) key) =>
+        key.$1 == normalizedUid || key.$1 == userId;
+
+    final affectedTempPaths = <String>{};
+    final affectedActualPaths = <String>{};
+    for (final entry in _fileReceiveProgress.entries) {
+      if (matchesUid(entry.key)) {
+        final tp = entry.value.tempPath;
+        final ap = entry.value.actualPath;
+        if (tp != null && tp.isNotEmpty) affectedTempPaths.add(tp);
+        if (ap != null && ap.isNotEmpty) affectedActualPaths.add(ap);
+      }
+    }
+    _fileReceiveProgress.removeWhere((k, _) => matchesUid(k));
+    _pendingFileTransfers.removeWhere((k, _) => matchesUid(k));
+    _fileNumberToMsgID.removeWhere((k, _) => matchesUid(k));
+    _lastProgressTs.removeWhere((k, _) => matchesUid(k));
+    _pausedTransfers.removeWhere((k) => matchesUid(k));
+    _msgIDToFileTransfer
+        .removeWhere((_, v) => v.$1 == normalizedUid || v.$1 == userId);
+    _friendOnlineStatus.remove(userId);
+    _friendOnlineStatus.remove(normalizedUid);
+    _lastSentPathByPeer.remove(userId);
+    _lastSentPathByPeer.remove(normalizedUid);
+
+    // Best-effort delete of half-received files belonging to this friend.
+    for (final path in {...affectedTempPaths, ...affectedActualPaths}) {
+      try {
+        final f = File(path);
+        if (await f.exists() &&
+            p.basename(path).startsWith('receiving_')) {
+          try {
+            await f.delete();
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+
+    final pUid = userId.toNativeUtf8();
+    _ffi.deleteFriend(pUid);
+    pkgffi.malloc.free(pUid);
   }
 
   void _onNativeEvent(int type, String sender, String data) {
@@ -3932,7 +4165,7 @@ class FfiChatService {
         final foundMsg = messages.firstWhere((m) => m.msgID == msgID);
         // Check if this is a file message that's still pending
         if (foundMsg.filePath != null &&
-            foundMsg.filePath!.startsWith('/tmp/receiving_')) {
+            foundMsg.filePath!.contains('/receiving_')) {
           // This is a pending file message - try to find the file transfer from progress tracking
           for (final progressEntry in _fileReceiveProgress.entries) {
             if (progressEntry.value.msgID == msgID) {
@@ -4270,7 +4503,23 @@ class FfiChatService {
   String _detectKind(String path) {
     final p = path.toLowerCase();
     const img = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic'];
-    const vid = ['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi'];
+    // P2-1: previously missed common Windows/legacy mobile container
+    // formats; UIKit was rendering these as generic file attachments.
+    const vid = [
+      '.mp4',
+      '.mov',
+      '.m4v',
+      '.webm',
+      '.mkv',
+      '.avi',
+      '.wmv',
+      '.flv',
+      '.mpeg',
+      '.mpg',
+      '.3gp',
+      '.ts',
+      '.m2ts',
+    ];
     const aud = ['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'];
     for (final e in img) {
       if (p.endsWith(e)) return 'image';
@@ -4889,7 +5138,11 @@ class FfiChatService {
 
     // add a local outgoing message immediately
     final kind = _detectKind(filePath);
-    final msgID = '${DateTime.now().millisecondsSinceEpoch}_$_selfId';
+    // P1-1: include the same monotonic sequence used for inbound msgIDs so
+    // back-to-back outgoing file sends in the same millisecond don't collide
+    // (which would let history dedupe drop the second message).
+    final msgID =
+        '${DateTime.now().millisecondsSinceEpoch}_${_msgIDSequence++}_$_selfId';
     final out = ChatMessage(
       text: '',
       fromUserId: _selfId,
@@ -4909,6 +5162,13 @@ class FfiChatService {
     if (!_pathToMsgID.containsKey(filePath)) {
       _pathToMsgID[filePath] = msgID;
     }
+    // P2-23: precise per-message reverse lookup. _lastSentPathByPeer is a
+    // single-slot map keyed by peer, so back-to-back concurrent sends to
+    // the same peer overwrite each other and the progress_send handler
+    // can't tell which msgID a given chunk belongs to. Store
+    // (msgID -> path) so the progress handler can recover the right
+    // msgID from the path it just received a chunk for.
+    _msgIDToSentPath[msgID] = filePath;
     // Add to history FIRST, then trigger stream update
     // This ensures getHistory() returns the new message when stream listener refreshes
     _appendHistory(normalizedPeerId, out);
@@ -5615,11 +5875,14 @@ class FfiChatService {
           '[FfiChatService] _moveFileToDownloads: copy done, destination exists: $exists');
       return finalPath;
     } catch (e, stackTrace) {
+      // P1-4: previously returned [sourcePath] on failure, which let the
+      // caller persist the temp `receiving_*` path into history as if the
+      // file had landed in Downloads. The UI then surfaced a non-existent
+      // file. Return null so the caller can mark the transfer failed
+      // instead.
       _logger?.logError(
-          '[FfiChatService] _moveFileToDownloads: copy failed, returning source path',
-          e,
-          stackTrace);
-      return sourcePath; // Return original path on error
+          '[FfiChatService] _moveFileToDownloads: copy failed', e, stackTrace);
+      return null;
     }
   }
 
@@ -5819,9 +6082,186 @@ class FfiChatService {
     await _offlineQueuePersistence.clearQueueFile();
   }
 
+  /// P1-3: Mark a single in-flight file transfer as failed.
+  ///
+  /// Called from the [_handleFileDone] error paths so a thrown exception
+  /// inside the file-completion handler doesn't leave the message stuck in
+  /// "receiving" state forever. We clear it from the tracking maps and flip
+  /// the corresponding history record to non-pending so the UI can render an
+  /// error state instead of a spinning progress bar.
+  void _markFileTransferFailed(String uid, int? fileNumber, String? msgID) {
+    try {
+      final normalizedUid = uid.length > 64 ? _normalizeFriendId(uid) : uid;
+      // Locate msgID by fileNumber if not supplied directly.
+      String? resolvedMsgID = msgID;
+      if (resolvedMsgID == null && fileNumber != null) {
+        resolvedMsgID =
+            _fileNumberToMsgID[(normalizedUid, fileNumber)] ??
+                _fileNumberToMsgID[(uid, fileNumber)];
+      }
+
+      // Drop tracking entries so the next file_request with the same
+      // fileNumber isn't matched to this dead transfer.
+      if (fileNumber != null) {
+        _fileReceiveProgress.remove((normalizedUid, fileNumber));
+        _fileReceiveProgress.remove((uid, fileNumber));
+        _pendingFileTransfers.remove((normalizedUid, fileNumber));
+        _pendingFileTransfers.remove((uid, fileNumber));
+        _fileNumberToMsgID.remove((normalizedUid, fileNumber));
+        _fileNumberToMsgID.remove((uid, fileNumber));
+        _lastProgressTs.remove((normalizedUid, fileNumber));
+        _lastProgressTs.remove((uid, fileNumber));
+        _pausedTransfers.remove((normalizedUid, fileNumber));
+        _pausedTransfers.remove((uid, fileNumber));
+      }
+      if (resolvedMsgID != null) {
+        _msgIDToFileTransfer.remove(resolvedMsgID);
+      }
+
+      // Flip the corresponding history record to non-pending with an empty
+      // filePath so the UI knows it's no longer in-flight. We don't have a
+      // dedicated MessageStatus.failed enum on ChatMessage today; the
+      // combination "isPending=false + filePath==null" is the contract the
+      // UI uses for "transfer didn't complete".
+      if (resolvedMsgID != null) {
+        final history = _historyById[normalizedUid] ?? _historyById[uid];
+        if (history != null) {
+          for (int i = 0; i < history.length; i++) {
+            final m = history[i];
+            if (m.msgID == resolvedMsgID && m.isPending) {
+              final updated = m.copyWith(isPending: false, filePath: '');
+              history[i] = updated;
+              _messages.add(updated);
+              unawaited(_saveHistory(normalizedUid).catchError((_) {}));
+              break;
+            }
+          }
+        }
+      }
+    } catch (e, st) {
+      _logger?.logError(
+          '[FfiChatService] _markFileTransferFailed: error', e, st);
+    }
+  }
+
+  /// P1-6: Handle a file_control event from native (peer-initiated cancel,
+  /// pause, resume) or a Dart-side synthesized timeout.
+  ///
+  /// FFI emission of these events is still pending — wire up here is dead
+  /// code today, but is in place so that as soon as the native layer adds
+  /// the matching event strings, the Dart side already does the right thing.
+  // TODO(P1-6): wire after FFI emits file_control events ('file_canceled',
+  // 'file_paused', 'file_resumed').
+  void _handleFileControl(
+      {required String uid,
+      required int fileNumber,
+      required String control}) {
+    final normalizedUid = uid.length > 64 ? _normalizeFriendId(uid) : uid;
+    final key = (normalizedUid, fileNumber);
+    final altKey = (uid, fileNumber);
+    switch (control) {
+      case 'cancel':
+      case 'timeout':
+        final progress =
+            _fileReceiveProgress[key] ?? _fileReceiveProgress[altKey];
+        final msgID = progress?.msgID ??
+            _fileNumberToMsgID[key] ??
+            _fileNumberToMsgID[altKey];
+        // Best-effort: delete the half-received file on disk.
+        final tempPath = progress?.tempPath;
+        final actualPath = progress?.actualPath;
+        for (final candidate in [tempPath, actualPath]) {
+          if (candidate != null && candidate.isNotEmpty) {
+            try {
+              final f = File(candidate);
+              // Don't await on the poll loop; fire and forget.
+              unawaited(f.exists().then((exists) async {
+                if (exists) {
+                  try {
+                    await f.delete();
+                  } catch (_) {}
+                }
+              }).catchError((_) {}));
+            } catch (_) {}
+          }
+        }
+        _markFileTransferFailed(uid, fileNumber, msgID);
+        _logger?.log(
+            '[FfiChatService] _handleFileControl: cleaned up transfer uid=$uid fileNumber=$fileNumber control=$control');
+        break;
+      case 'pause':
+        _pausedTransfers.add(key);
+        _logger?.log(
+            '[FfiChatService] _handleFileControl: paused uid=$uid fileNumber=$fileNumber');
+        break;
+      case 'resume':
+        _pausedTransfers.remove(key);
+        _pausedTransfers.remove(altKey);
+        // Reset the idle clock so the timeout sweeper doesn't immediately
+        // kill a freshly-resumed transfer.
+        _lastProgressTs[key] = DateTime.now().millisecondsSinceEpoch;
+        _logger?.log(
+            '[FfiChatService] _handleFileControl: resumed uid=$uid fileNumber=$fileNumber');
+        break;
+      default:
+        _logger?.log(
+            '[FfiChatService] _handleFileControl: unknown control=$control uid=$uid fileNumber=$fileNumber');
+    }
+  }
+
+  /// P1-7: Walk in-flight receives and treat ones with no progress update in
+  /// [_fileTransferIdleTimeout] as dead. Called from the poll loop.
+  void _checkFileTransferTimeouts() {
+    if (_fileReceiveProgress.isEmpty) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final cutoff = now - _fileTransferIdleTimeout.inMilliseconds;
+    final stale = <(String peerId, int fileNumber)>[];
+    for (final entry in _fileReceiveProgress.entries) {
+      final key = entry.key;
+      if (_pausedTransfers.contains(key)) continue;
+      final ts = _lastProgressTs[key];
+      if (ts == null) {
+        // Seed the clock on first sight so the very first timeout window
+        // applies from when we noticed the transfer rather than epoch=0.
+        _lastProgressTs[key] = now;
+        continue;
+      }
+      if (ts < cutoff) stale.add(key);
+    }
+    for (final key in stale) {
+      _logger?.log(
+          '[FfiChatService] _checkFileTransferTimeouts: stale transfer uid=${key.$1} fileNumber=${key.$2} — cleaning up');
+      _handleFileControl(
+          uid: key.$1, fileNumber: key.$2, control: 'timeout');
+    }
+  }
+
   /// Cancel all pending file transfers (called on exit or startup)
   /// This prevents chat window from showing "receiving" status for incomplete transfers
   Future<void> _cancelPendingFileTransfers() async {
+    // P1-9: tell the remote peers we're bailing on every in-flight transfer
+    // before we wipe local state. Without this, a peer keeps sending chunks
+    // into a closed socket until tox itself times out (~minutes). Best-effort:
+    // a failed native cancel must not block dispose.
+    if (_pendingFileTransfers.isNotEmpty) {
+      final entries = List<({(String, int) key, String msgID})>.from(
+          _pendingFileTransfers.entries
+              .map((e) => (key: e.key, msgID: e.value)));
+      for (final e in entries) {
+        final (peerUid, fileNumber) = e.key;
+        try {
+          final pto = peerUid.toNativeUtf8();
+          // 2 = CANCEL (matches the constant used elsewhere in this file).
+          _ffi.fileControlNative(
+              _ffi.getCurrentInstanceId(), pto, fileNumber, 2);
+          pkgffi.malloc.free(pto);
+        } catch (_) {
+          // Swallow — we're tearing down anyway, and the native layer may
+          // already be partially uninitialised.
+        }
+      }
+    }
+
     // Iterate through all conversation histories
     for (final entry in _historyById.entries) {
       final conversationId = entry.key;
@@ -5837,7 +6277,7 @@ class FfiChatService {
         if (!msg.isSelf &&
             msg.isPending &&
             msg.filePath != null &&
-            (msg.filePath!.startsWith('/tmp/receiving_') ||
+            (msg.filePath!.contains('/receiving_') ||
                 msg.mediaKind != null)) {
           // Remove the message from history to avoid showing "receiving" status
           messages.removeAt(i);
@@ -5863,6 +6303,33 @@ class FfiChatService {
     _pendingFileTransfers.clear();
     _msgIDToFileTransfer.clear();
     _fileNumberToMsgID.clear();
+    _lastProgressTs.clear();
+    _pausedTransfers.clear();
+
+    // P1-10: clear partially-received files off disk for this account so we
+    // don't leave orphaned `receiving_*` blobs after logout. Scoped strictly
+    // to [_fileRecvDir] — the per-account dir resolved during init — so we
+    // don't touch another account's transfers.
+    final recvDir = _fileRecvDir;
+    if (recvDir != null && recvDir.isNotEmpty) {
+      try {
+        final dir = Directory(recvDir);
+        if (await dir.exists()) {
+          await for (final ent in dir.list(followLinks: false)) {
+            if (ent is File && p.basename(ent.path).startsWith('receiving_')) {
+              try {
+                await ent.delete();
+              } catch (_) {}
+            }
+          }
+        }
+      } catch (e, st) {
+        _logger?.logError(
+            '[FfiChatService] _cancelPendingFileTransfers: failed to scan/clean recvDir=$recvDir',
+            e,
+            st);
+      }
+    }
   }
 
   Future<void> dispose() async {
@@ -5942,6 +6409,29 @@ class FfiChatService {
     _observedApplicationWordings.clear();
     _activePeerId = null;
 
+    // P1-18: previously-leaked maps. Empty them so a re-init of the service
+    // (e.g. account switch) doesn't carry state over from the dead account.
+    _pathToMsgID.clear();
+    _friendOnlineStatus.clear();
+    _messageReceivers.clear();
+    _progressKeyCache.clear();
+    _lastProgressEmitTime.clear();
+    _lastProgressTs.clear();
+    _pausedTransfers.clear();
+    _msgIDToSentPath.clear();
+
+    // P1-17: release the persistent NativeCallable allocated for login and
+    // close the IRC stream controllers that were previously leaked across
+    // disposes. `close()` on these controllers is safe even if no listener
+    // was ever attached.
+    try {
+      _loginNativeCallable?.close();
+    } catch (_) {}
+    _loginNativeCallable = null;
+    await _ircConnectionStatusCtrl.close();
+    await _ircUserListCtrl.close();
+    await _ircUserJoinPartCtrl.close();
+
     _ffi.uninit();
     await _messages.close();
     await _connectionStatus.close();
@@ -5952,6 +6442,3 @@ class FfiChatService {
     await _nicknameUpdatedCtrl.close();
   }
 }
-
-// Track last sent path per peer to attach in progress events
-final Map<String, String> _lastSentPathByPeer = {};

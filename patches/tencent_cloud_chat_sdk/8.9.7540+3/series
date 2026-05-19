@@ -7,8 +7,13 @@
 # refactor stabilizes the surface enough to re-port. tim2tox depends on a
 # small set of backward-compat aliases in 0004 (timCallback2Future et al.)
 # until those callers move to the new addTimXxx2Map names.
+# 0006 re-ports the single one-line adapter fix from the old series that
+# couldn't be skipped: routing `getGroupMembersInfo` to the dedicated
+# `DartGetGroupMembersInfo` binding added by 0005 (without 0006 the new
+# binding is dead code and the call returns wrong data).
 0001-native-library-name-override.patch
 0002-platform-interface-extension-points.patch
 0003-route-managers-through-platform.patch
 0004-native-library-manager-callback-dispatch.patch
 0005-models-and-bindings.patch
+0006-group-members-info-adapter-fix.patch
