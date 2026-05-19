@@ -491,12 +491,22 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
     userProfile.nickName = fakeUser.nickName;
     userProfile.faceUrl = fakeUser.faceUrl;
     // Get avatar path from Prefs if faceUrl is null
+    final prefs = preferencesService ?? ffiService.preferencesService;
     if (userProfile.faceUrl == null || userProfile.faceUrl!.isEmpty) {
-      final prefs = preferencesService ?? ffiService.preferencesService;
       userProfile.faceUrl = await prefs?.getFriendAvatarPath(fakeUser.userID);
     }
 
     friendInfo.userProfile = userProfile;
+
+    // Backfill the user-edited alias so the contact list, search results, and
+    // chat headers all see the remark stored via setFriendInfo. Without this
+    // the alias only lives in the editing UI's local state and disappears on
+    // reload. Reads from the same per-account scope the host adapter writes
+    // to, so multi-account does not bleed remarks across accounts.
+    final remark = await prefs?.getFriendRemark(fakeUser.userID);
+    if (remark != null && remark.isNotEmpty) {
+      friendInfo.friendRemark = remark;
+    }
 
     return friendInfo;
   }

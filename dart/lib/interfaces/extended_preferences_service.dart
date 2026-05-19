@@ -27,6 +27,12 @@ abstract class ExtendedPreferencesService extends PreferencesService {
   Future<void> setFriendStatusMessage(String friendId, String statusMessage);
   Future<String?> getFriendAvatarPath(String friendId);
   Future<void> setFriendAvatarPath(String friendId, String? path);
+
+  // Friend remark (user-edited alias, distinct from the peer's nickname).
+  // Lives in the same per-account scope as nickname/avatar above so a friend
+  // remark set under account A does not bleed into account B's contact list.
+  Future<String?> getFriendRemark(String friendId);
+  Future<void> setFriendRemark(String friendId, String? remark);
   
   // Local friends
   Future<Set<String>> getLocalFriends();

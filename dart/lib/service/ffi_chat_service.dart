@@ -3326,12 +3326,19 @@ class FfiChatService {
     return out;
   }
 
-  /// Preferences key for the set of friend-application user IDs the local
-  /// user has explicitly dismissed (refused or deleted). The C++ layer has no
-  /// native "drop application" call, so we filter dismissed IDs out of
-  /// [getFriendApplications] here. Stored via `getStringList`/`setStringList`
-  /// on the injected [ExtendedPreferencesService]; the host's adapter is
-  /// responsible for any per-account scoping it needs.
+  /// Preferences key for the set of dismissed friend-application fingerprints.
+  /// The C++ layer has no native "drop application" call, so we filter
+  /// dismissed entries out of [getFriendApplications] here. Stored via
+  /// `getStringList`/`setStringList` on the injected
+  /// [ExtendedPreferencesService]; the host's adapter is responsible for any
+  /// per-account scoping it needs.
+  ///
+  /// Each entry is a fingerprint of `<userId>|<wording>` (see [_fingerprint]).
+  /// Pinning to wording — not userId alone — is what makes a *new* application
+  /// from the same peer surface again after the previous one was dismissed.
+  /// The C++ queue re-emits the original entry on every poll with identical
+  /// wording, so it still matches and stays filtered; a fresh request from
+  /// the peer will typically carry different wording and bypass the filter.
   ///
   /// Visible-for-testing: exposed via [dismissedFriendApplicationsKey].
   static const String _kDismissedFriendApplicationsKey =
@@ -3340,6 +3347,12 @@ class FfiChatService {
   /// Visible-for-testing accessor for [_kDismissedFriendApplicationsKey].
   static String get dismissedFriendApplicationsKey =>
       _kDismissedFriendApplicationsKey;
+
+  /// Build the fingerprint stored in the dismissed set. The `|` separator
+  /// cannot collide with the userId (64-char hex) and is distinct from the
+  /// `\t` used by the FFI list encoding.
+  static String _fingerprint(String userId, String wording) =>
+      '$userId|$wording';
 
   /// Visible-for-testing: applies the dismissed-application filter to a raw
   /// list (the FFI-derived list, in the production path). Static and pure so
@@ -3351,24 +3364,41 @@ class FfiChatService {
     if (dismissed.isEmpty) return raw;
     String normalize(String userID) =>
         userID.length > 64 ? userID.substring(0, 64) : userID;
-    return raw.where((app) => !dismissed.contains(normalize(app.userId))).toList();
+    return raw.where((app) {
+      final fp = _fingerprint(normalize(app.userId), app.wording);
+      return !dismissed.contains(fp);
+    }).toList();
   }
 
-  /// Load the persisted set of dismissed friend-application user IDs. Returns
-  /// an empty set when no preferences service is attached or no entries exist.
+  /// Load the persisted set of dismissed friend-application fingerprints.
+  /// Returns an empty set when no preferences service is attached or no
+  /// entries exist. Legacy entries (pre-fingerprint format: bare userIds with
+  /// no `|wording` suffix) are dropped on read — they were created with
+  /// userId-only semantics that permanently filtered every future application
+  /// from the same peer; treating them as stale once is the migration. The
+  /// dropped entries are re-persisted so the migration only happens once.
   Future<Set<String>> _getDismissedFriendApplications() async {
     final prefs = _prefs;
     if (prefs == null) return <String>{};
     final list = await prefs.getStringList(_kDismissedFriendApplicationsKey);
-    return list?.toSet() ?? <String>{};
+    if (list == null || list.isEmpty) return <String>{};
+    final fingerprints = list.where((s) => s.contains('|')).toList();
+    if (fingerprints.length != list.length) {
+      // Drop legacy bare-userId entries by re-saving the filtered list.
+      await prefs.setStringList(
+        _kDismissedFriendApplicationsKey,
+        fingerprints,
+      );
+    }
+    return fingerprints.toSet();
   }
 
-  Future<void> _saveDismissedFriendApplications(Set<String> ids) async {
+  Future<void> _saveDismissedFriendApplications(Set<String> fingerprints) async {
     final prefs = _prefs;
     if (prefs == null) return;
     await prefs.setStringList(
       _kDismissedFriendApplicationsKey,
-      ids.toList(),
+      fingerprints.toList(),
     );
   }
 
@@ -3377,8 +3407,14 @@ class FfiChatService {
   String _normalizeApplicationUserId(String userID) =>
       userID.length > 64 ? userID.substring(0, 64) : userID;
 
+  /// Read the unfiltered friend-application list from the FFI layer.
+  ///
+  /// Production callers go through [getFriendApplications], which applies the
+  /// dismissed-filter on top of this. Refuse/delete paths need the raw view
+  /// so they can capture the current wording for each entry matching the
+  /// target userId.
   Future<List<({String userId, String wording})>>
-      getFriendApplications() async {
+      _getFriendApplicationsUnfiltered() async {
     final buf = pkgffi.malloc.allocate<ffi.Int8>(32 * 1024);
     // Use current instance ID at call time so runWithInstanceAsync(Alice) gets Alice's list
     final instanceId = _ffi.getCurrentInstanceId();
@@ -3395,21 +3431,48 @@ class FfiChatService {
       }
     }
     pkgffi.malloc.free(buf);
+    return out;
+  }
+
+  Future<List<({String userId, String wording})>>
+      getFriendApplications() async {
+    final raw = await _getFriendApplicationsUnfiltered();
 
     // Filter out applications the user has explicitly refused/deleted. Without
     // this, the C++ application queue keeps returning the same entries every
     // 5s poll because there is no native "dismiss" call.
     final dismissed = await _getDismissedFriendApplications();
-    return filterDismissedApplications(out, dismissed);
+    return filterDismissedApplications(raw, dismissed);
   }
 
-  /// Mark a friend application as dismissed (refused). Persists the ID so the
-  /// application no longer reappears in [getFriendApplications] across polls
-  /// or restarts. Idempotent.
+  /// Mark all currently-pending friend applications from [userID] as dismissed
+  /// (refused). Persists the `(userId, wording)` fingerprint of every matching
+  /// entry the C++ queue is currently surfacing, so they no longer reappear in
+  /// [getFriendApplications] across polls or restarts.
+  ///
+  /// A subsequent fresh application from the same peer with different wording
+  /// surfaces again — that is the whole point of the wording-aware
+  /// fingerprint. If the peer happens to re-send with identical wording the
+  /// user can simply dismiss again.
+  ///
+  /// Idempotent. If no matching entry is currently in the C++ queue at call
+  /// time, this is a no-op (defensive: a stale UI refusal click shouldn't
+  /// poison the dismissed set with a fingerprint we never observed).
   Future<void> refuseFriendApplication(String userID) async {
     final normalized = _normalizeApplicationUserId(userID);
+    final apps = await _getFriendApplicationsUnfiltered();
+    final matched = apps.where(
+      (a) => _normalizeApplicationUserId(a.userId) == normalized,
+    );
+    if (matched.isEmpty) return;
     final dismissed = await _getDismissedFriendApplications();
-    if (dismissed.add(normalized)) {
+    bool changed = false;
+    for (final app in matched) {
+      if (dismissed.add(_fingerprint(normalized, app.wording))) {
+        changed = true;
+      }
+    }
+    if (changed) {
       await _saveDismissedFriendApplications(dismissed);
     }
   }
@@ -3426,10 +3489,14 @@ class FfiChatService {
     _ffi.acceptFriend(p);
     pkgffi.malloc.free(p);
     // If this user was previously dismissed and is now being accepted, clear
-    // them from the dismissed set so a future re-request would surface.
+    // every fingerprint for that userId so a future re-request from the same
+    // peer surfaces regardless of wording.
     final normalized = _normalizeApplicationUserId(userId);
+    final prefix = '$normalized|';
     final dismissed = await _getDismissedFriendApplications();
-    if (dismissed.remove(normalized)) {
+    final before = dismissed.length;
+    dismissed.removeWhere((fp) => fp.startsWith(prefix));
+    if (dismissed.length != before) {
       await _saveDismissedFriendApplications(dismissed);
     }
   }
@@ -4002,6 +4069,14 @@ class FfiChatService {
   /// deletable. Updates `MessageHistoryPersistence`'s in-memory cache for
   /// every modified conversation so reads do not repopulate stale data.
   ///
+  /// Also refreshes the conversation-preview state (`_lastByPeer`,
+  /// `_unreadByPeer`) for every conversation whose messages changed, because
+  /// the conversation-list builder reads `lastMessages[peerId]` and the
+  /// per-peer unread counter directly. Without this refresh, deleting the
+  /// final message of a conversation leaves the sidebar showing the deleted
+  /// message as the preview until a new message arrives or the app reloads
+  /// (the same pattern already used by `_cleanIncompleteFileTransfersOnInit`).
+  ///
   /// Returns the number of messages deleted.
   Future<int> deleteMessages(List<String> msgIDs) async {
     if (msgIDs.isEmpty) return 0;
@@ -4039,6 +4114,39 @@ class FfiChatService {
         // persistence-owned list — `_historyById` IS the persistence cache as
         // of the X4 consolidation. No separate setCachedHistory call needed.
         await _saveHistory(conversationId);
+
+        // Recompute conversation-preview state from what remains. Last
+        // message: highest-timestamp survivor, or remove the entry entirely
+        // when the conversation is now empty. Unread: recount incoming
+        // unread messages from the remaining list rather than trying to
+        // decrement against the per-message deletion (we cannot reconstruct
+        // which deleted entries were unread once they're gone, and recount
+        // is O(n) for a per-peer list that's already in memory).
+        final remaining = _historyById[conversationId];
+        if (remaining == null || remaining.isEmpty) {
+          _lastByPeer.remove(conversationId);
+          _unreadByPeer.remove(conversationId);
+        } else {
+          ChatMessage newest = remaining.first;
+          int unread = 0;
+          for (final m in remaining) {
+            if (m.timestamp.isAfter(newest.timestamp)) newest = m;
+            if (!m.isSelf && !m.isRead) unread++;
+          }
+          _lastByPeer[conversationId] = newest;
+          // Preserve the "user is currently viewing this conversation"
+          // zero-out: `setActivePeer` already drives _unreadByPeer to 0 for
+          // the active conversation, so we don't want to bump it back up
+          // here. Treat the active peer's unread as 0 regardless of the
+          // remaining-list scan.
+          if (_activePeerId == conversationId) {
+            _unreadByPeer[conversationId] = 0;
+          } else if (unread > 0) {
+            _unreadByPeer[conversationId] = unread;
+          } else {
+            _unreadByPeer.remove(conversationId);
+          }
+        }
       }
     }
 
@@ -5700,6 +5808,17 @@ class FfiChatService {
     }
     // Clear global file transfer path cache
     _lastSentPathByPeer.clear();
+
+    // Flush any pending debounced history writes before the in-memory cache
+    // is wiped. `clearAllCached()` below removes `_historyById`, which is the
+    // source the debounce timer reads from — without this flush, the last
+    // ~200ms window of appended messages gets stranded in a not-yet-fired
+    // timer and silently dropped on exit / account switch.
+    try {
+      await _messageHistoryPersistence.flushPendingSaves();
+    } catch (_) {
+      // Best-effort: don't block dispose on a single conversation's save error.
+    }
 
     // Clear per-account in-memory caches to prevent data leakage between accounts
     _messageHistoryPersistence.clearAllCached();

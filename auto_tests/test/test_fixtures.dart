@@ -159,6 +159,19 @@ class MockPreferencesService implements ExtendedPreferencesService {
   }
 
   @override
+  Future<String?> getFriendRemark(String friendId) async =>
+      await getString('friend_remark_$friendId');
+
+  @override
+  Future<void> setFriendRemark(String friendId, String? remark) async {
+    if (remark == null || remark.isEmpty) {
+      await remove('friend_remark_$friendId');
+    } else {
+      await setString('friend_remark_$friendId', remark);
+    }
+  }
+
+  @override
   Future<Set<String>> getLocalFriends() async =>
       await getStringSet('local_friends');
 

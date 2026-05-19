@@ -6298,14 +6298,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     try {
       final prefs = _prefs;
       if (prefs != null && friendRemark != null) {
-        // Persist alias via the generic key/value surface. There is no
-        // `setFriendRemark` on `ExtendedPreferencesService` yet, and adding
-        // a typed method for one call site would over-widen the interface.
-        // Per-account scoping, if needed, is the host app's responsibility
-        // (toxee's UI-side `Prefs.setFriendRemark` does its own scoping
-        // independently). What this guarantees: a subsequent `getString`
-        // on the same prefs with the same key returns this value.
-        await prefs.setString('friend_remark_$userID', friendRemark);
+        // Persist via the typed [ExtendedPreferencesService.setFriendRemark]
+        // so the host adapter applies its per-account scoping (toxee scopes
+        // by the current Tox-ID prefix). The matching read in
+        // `fakeUserToV2TimFriendInfo` calls `getFriendRemark` against the
+        // same scope, which is how the alias becomes visible across the
+        // contact list, search, and chat headers — not just the editing UI's
+        // ephemeral state.
+        await prefs.setFriendRemark(userID, friendRemark);
       }
       // TODO(tim2tox): `friendCustomInfo` requires a structured per-friend
       // map in `ExtendedPreferencesService`. Drop on the floor for now —
