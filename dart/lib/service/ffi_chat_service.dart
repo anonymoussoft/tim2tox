@@ -5471,28 +5471,18 @@ class FfiChatService {
           }
         }
       } else if (Platform.isAndroid) {
-        // Android: use external storage Download via path_provider (avoid hardcoded paths)
-        try {
-          final extDir = await getExternalStorageDirectory();
-          if (extDir != null) {
-            // extDir is <appExternalDir>/files; navigate up to shared storage Download
-            final downloadDir = Directory(
-                p.join(extDir.parent.parent.parent.parent.path, 'Download'));
-            if (await downloadDir.exists()) {
-              return downloadDir.path;
-            }
-          }
-        } catch (e) {
-          // Fall back to app documents if external storage not available
-        }
-        // Fallback to app documents directory
+        // Android 10+ scoped storage: writes to /storage/emulated/0/Download
+        // are denied without MANAGE_EXTERNAL_STORAGE. The previous 4-level
+        // parent-traversal from getExternalStorageDirectory() reached that
+        // shared path and silently failed under scoped storage. Use the
+        // app-private documents directory + a Downloads subfolder instead;
+        // files saved here are visible to the app and survive backups.
         final appDir = await getApplicationDocumentsDirectory();
-        final fallbackDownloadsDir =
-            Directory(p.join(appDir.path, 'Downloads'));
-        if (!await fallbackDownloadsDir.exists()) {
-          await fallbackDownloadsDir.create(recursive: true);
+        final downloadsDir = Directory(p.join(appDir.path, 'Downloads'));
+        if (!await downloadsDir.exists()) {
+          await downloadsDir.create(recursive: true);
         }
-        return fallbackDownloadsDir.path;
+        return downloadsDir.path;
       } else if (Platform.isIOS) {
         // iOS: use app documents directory (can't access system Downloads)
         // Files saved here will be accessible via Files app if UIFileSharingEnabled is set in Info.plist
@@ -5880,11 +5870,16 @@ class FfiChatService {
     // tick or in-flight callback could `appendHistory` between
     // `flushPendingSaves()` and `clearAllCached()`, resurrecting the
     // just-cleared cache and then losing the message when the debounce timer
-    // fired against an empty service. To close that window:
+    // fired against an empty service. M5 additionally moves the offline queue
+    // save earlier so it runs while the queue cache and persistence are still
+    // live — not after `_ffi.uninit()` and stream-close (where the queue
+    // could be empty or unreachable). To close those windows:
     //
     //   1. Stop every source of new `appendHistory` calls (route, poller,
     //      profile timer, instance-map registration, in-flight file callbacks).
-    //   2. Only then flush pending writes to disk.
+    //   2. Flush pending writes to disk: history flushPendingSaves AND
+    //      offline-queue save, run adjacent so they share the "no new work"
+    //      window.
     //   3. Switch the persistence layer into its "disposed" mode so any
     //      defensive late call falls through to a synchronous save instead of
     //      scheduling a timer that will never fire.
@@ -5915,10 +5910,18 @@ class FfiChatService {
 
     // 2. Flush pending debounced history writes. By this point no new
     // appendHistory should arrive, so the snapshot the flush takes is final.
+    // M5: save the offline queue here too — it must run BEFORE `_ffi.uninit()`
+    // and BEFORE stream controllers close, while the queue persistence is
+    // still in a usable state.
     try {
       await _messageHistoryPersistence.flushPendingSaves();
     } catch (_) {
       // Best-effort: don't block dispose on a single conversation's save error.
+    }
+    try {
+      await _saveOfflineQueue();
+    } catch (_) {
+      // Best-effort: don't block dispose if the queue save fails.
     }
 
     // 3. Switch persistence into disposed mode. After this, any late call
@@ -5947,8 +5950,6 @@ class FfiChatService {
     await _reactionCtrl.close();
     await _avatarUpdatedCtrl.close();
     await _nicknameUpdatedCtrl.close();
-    // Save offline queue before disposing
-    await _saveOfflineQueue();
   }
 }
 

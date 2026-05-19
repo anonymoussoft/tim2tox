@@ -5,6 +5,7 @@
 /// 2. Intercepting history message queries to load from persistence service
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimAdvancedMsgListener.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
 import 'message_history_persistence.dart';
 import 'message_converter.dart';
 
@@ -30,11 +31,53 @@ class BinaryReplacementHistoryHook {
   /// single skipped message rather than a cross-account write.
   static int _generation = 0;
 
+  /// Tracks the standalone listener (if installed via [installStandalone])
+  /// so it can be unregistered on teardown. Only one standalone listener is
+  /// installed per session — repeated calls are idempotent.
+  static V2TimAdvancedMsgListener? _standaloneListener;
+
   /// Initialize the hook with persistence service and self ID
   static void initialize(MessageHistoryPersistence persistence, String selfId) {
     _persistence = persistence;
     _selfId = selfId;
     _generation++;
+  }
+
+  /// Update the captured selfId without bumping [_generation].
+  ///
+  /// Used by the M6 deferred-install pattern: the standalone listener is
+  /// registered immediately (with a placeholder empty selfId) so no
+  /// binary-replacement event can arrive before persistence coverage is in
+  /// place. Once the connection event delivers a real selfId, the coordinator
+  /// calls [updateSelfId] to plug it in. We deliberately do NOT bump the
+  /// generation here because no session boundary was crossed.
+  static void updateSelfId(String selfId) {
+    _selfId = selfId;
+  }
+
+  /// Install a standalone V2TimAdvancedMsgListener that persists messages
+  /// without wrapping or replacing any existing listener.
+  ///
+  /// This is the preferred install mode for toxee's hybrid runtime: every
+  /// UIKit listener continues to receive callbacks unmolested, and persistence
+  /// happens exactly once via this dedicated listener. Idempotent — calling
+  /// twice in the same session is a no-op after the first.
+  static void installStandalone(
+      MessageHistoryPersistence persistence, String selfId) {
+    initialize(persistence, selfId);
+    if (_standaloneListener != null) return;
+    final listener = V2TimAdvancedMsgListener(
+      onRecvNewMessage: (V2TimMessage message) {
+        saveMessage(message);
+      },
+      onRecvMessageModified: (V2TimMessage message) {
+        // Modified messages (e.g. pending → sent) must also be persisted so
+        // the sent-state transition isn't lost.
+        saveMessage(message);
+      },
+    );
+    TIMMessageManager.instance.addAdvancedMsgListener(listener);
+    _standaloneListener = listener;
   }
 
   /// Visible-for-tests: the current generation counter. Used by the X8

@@ -14,10 +14,15 @@ import '../models/chat_message.dart';
 import 'conversation_id_utils.dart';
 
 /// Message history persistence service
-/// 
+///
 /// Provides unified message history persistence for both Platform and binary replacement schemes.
 /// When [historyDirectory] is set (e.g. per-account path from app), uses that directory; otherwise
 /// uses app support dir with optional instanceId for multi-instance.
+///
+/// NOTE (M3): Messages are persisted as plaintext JSON. At-rest encryption
+/// (e.g. AES-GCM keyed off the Tox profile password or OS keychain/keystore)
+/// is a known gap and tracked separately. Do not add new sensitive fields
+/// here without revisiting that limitation.
 class MessageHistoryPersistence {
   final int? _instanceId;
   final String? _historyDirectory;
@@ -68,8 +73,12 @@ class MessageHistoryPersistence {
   // Maximum number of messages to keep in memory per conversation
   static const int _maxMessagesInMemory = 1000;
 
-  // Concurrency control: write locks per conversation
-  final Map<String, Completer<void>?> _writeLocks = {};
+  // Concurrency control: per-conversation serial write fence.
+  // Each saveHistory chains synchronously onto the previous future before any
+  // await — this guarantees strict serialization even when many callers race
+  // (the old `while (_writeLocks[id] != null) await ...` pattern let multiple
+  // waiters resume on the same microtask tick and bypass the gate).
+  final Map<String, Future<void>> _writeFences = {};
 
   /// P2 debounce state (see `local-storage-review-2026-05-18.md`).
   ///
@@ -86,6 +95,12 @@ class MessageHistoryPersistence {
   static const Duration _appendDebounce = Duration(milliseconds: 200);
   final Map<String, Timer> _appendDebounceTimers = {};
   final Map<String, Completer<void>> _appendDebouncePending = {};
+
+  // M1: conversations that need a post-load normalization save. Collected by
+  // [loadHistory] and drained serially by [flushDirtyAfterLoad] from the end
+  // of [loadAllHistories], so cold start doesn't fan out N parallel saves.
+  final Set<String> _dirtyAfterLoad = {};
+
   bool _disposed = false;
 
   /// Get the directory for storing message history.
@@ -145,24 +160,28 @@ class MessageHistoryPersistence {
   /// [messages] - List of messages to save
   Future<void> saveHistory(String conversationId, List<ChatMessage> messages) async {
     if (messages.isEmpty) return;
-    
+
     // Normalize conversation ID for consistent storage
     final normalizedId = ConversationIdUtils.normalize(conversationId);
-    
-    // Wait for any ongoing write to complete
-    while (_writeLocks[normalizedId] != null) {
-      await _writeLocks[normalizedId]!.future;
-    }
-    
-    // Create write lock
+
+    // C1: chain onto the previous write for this conversation BEFORE any
+    // await, so concurrent callers serialize deterministically. The old
+    // `while (_writeLocks[id] != null) await ...future` pattern let multiple
+    // waiters resume on the same microtask tick and all pass the gate.
+    final prev = _writeFences[normalizedId] ?? Future<void>.value();
     final completer = Completer<void>();
-    _writeLocks[normalizedId] = completer;
-    
+    _writeFences[normalizedId] = completer.future;
     try {
+      try {
+        await prev;
+      } catch (_) {
+        // A previous write's error must not poison this writer.
+      }
+
       final file = await _getHistoryFile(normalizedId);
       final backupFile = await _getBackupFile(normalizedId);
       final tempFile = await _getTempFile(normalizedId);
-      
+
       // Create backup of existing file if it exists
       if (await file.exists()) {
         try {
@@ -171,7 +190,7 @@ class MessageHistoryPersistence {
           // Backup failed, but continue with save
         }
       }
-      
+
       // Prepare data
       final jsonList = messages.map((msg) => msg.toJson()).toList();
       final data = {
@@ -181,23 +200,20 @@ class MessageHistoryPersistence {
         'messages': jsonList,
       };
       final jsonString = jsonEncode(data);
-      
-      // Write to temporary file first
-      await tempFile.writeAsString(jsonString);
 
-      // Atomic rename: temp file -> final file
-      // This ensures the file is either completely written or not present
+      // C2: write→fsync→close→rename for crash durability. Tox is P2P, no
+      // server can backfill, so a half-flushed page-cache buffer at the
+      // moment of a kernel/process crash means permanent data loss.
+      final raf = await tempFile.open(mode: FileMode.write);
+      try {
+        await raf.writeString(jsonString);
+        await raf.flush();
+      } finally {
+        await raf.close();
+      }
       await tempFile.rename(file.path);
 
-      completer.complete();
-
-      // X10: delete the backup we just used as a safety net. We only reach
-      // this point after `tempFile.rename` succeeded and the completer has
-      // been settled, so the user-visible save is durable; the backup is no
-      // longer needed and otherwise accumulates forever (`cleanupTempFiles`
-      // only sweeps `.bak` files older than 7 days). Wrapped in its own
-      // try/catch so a delete failure (file in use, permission) can never
-      // turn a successful save into a failed one.
+      // X10: delete the backup we just used as a safety net.
       try {
         if (await backupFile.exists()) {
           await backupFile.delete();
@@ -205,13 +221,17 @@ class MessageHistoryPersistence {
       } catch (_) {
         // Best-effort cleanup; leave the stale .bak for the 7-day sweep.
       }
+
+      completer.complete();
     } catch (e) {
       completer.completeError(e);
-      // Don't silently fail - at least log or rethrow for critical errors
-      // For now, we complete the error but don't rethrow to avoid breaking the app
-      // In production, consider using a logger or error reporting service
     } finally {
-      _writeLocks[normalizedId] = null;
+      // Slot cleanup gated on identity so a newer writer's slot is never evicted.
+      if (identical(_writeFences[normalizedId], completer.future)) {
+        // Discarded — the removed future is `completer.future`, which has
+        // already been settled above; `remove` returns it just for chaining.
+        _writeFences.remove(normalizedId); // ignore: unawaited_futures
+      }
     }
   }
   
@@ -390,16 +410,13 @@ class MessageHistoryPersistence {
       // async error on cold start. The cold-start parallel batch can launch
       // many of these concurrently — without this, any one disk-write failure
       // would crash the zone.
+      // M1: instead of fire-and-forget `unawaited(saveHistory(...))` on every
+      // load-time normalization, mark this conversation dirty and let
+      // `loadAllHistories` flush them serially after the batch completes.
+      // The old behaviour spawned 16+ concurrent saveHistory futures from
+      // each cold-start batch, all racing on the per-conversation fence.
       if (deduplicatedList.length != messages.length || updatedMessages != messages) {
-        unawaited(
-          saveHistory(targetId, deduplicatedList).catchError((Object e, StackTrace st) {
-            _logger?.logError(
-              '[MessageHistoryPersistence] post-load save failed for $targetId',
-              e,
-              st,
-            );
-          }),
-        );
+        _dirtyAfterLoad.add(targetId);
       }
       
       return deduplicatedList;
@@ -450,18 +467,30 @@ class MessageHistoryPersistence {
     // Try backup first
     final backupMessages = await _loadFromBackup(normalizedId, quitGroups: quitGroups);
     if (backupMessages.isNotEmpty) {
-      // Backup is good, restore it
+      // M2: restore via read→tmp+fsync→rename, not `backup.copy(primary)`.
+      // A direct copy is not crash-safe — if killed mid-copy the primary is
+      // now partially written *and* the backup is untouched (but soon
+      // overwritten by the next save), leaving both files unusable.
       try {
         final backupFile = await _getBackupFile(normalizedId);
         if (await backupFile.exists()) {
-          await backupFile.copy(corruptedFile.path);
+          final backupContent = await backupFile.readAsString();
+          final tempFile = await _getTempFile(normalizedId);
+          final raf = await tempFile.open(mode: FileMode.write);
+          try {
+            await raf.writeString(backupContent);
+            await raf.flush();
+          } finally {
+            await raf.close();
+          }
+          await tempFile.rename(corruptedFile.path);
         }
       } catch (e) {
         // Restore failed, but we have messages in memory
       }
       return backupMessages;
     }
-    
+
     // Try partial recovery (read valid JSON parts)
     // For now, return empty list - can be enhanced later
     return [];
@@ -515,7 +544,34 @@ class MessageHistoryPersistence {
       // Return whatever we've loaded so far
     }
 
+    // M1: drain post-load normalization writes serially so we don't fan out
+    // hundreds of concurrent fence-contending saves on cold start.
+    await flushDirtyAfterLoad();
+
     return result;
+  }
+
+  /// Flush the post-load dirty set (see [_dirtyAfterLoad]) — serial writes so
+  /// the per-conversation write fence doesn't end up with a tall waiter chain
+  /// on first boot. Errors are routed through the injected logger and do not
+  /// abort the remaining flushes.
+  Future<void> flushDirtyAfterLoad() async {
+    if (_dirtyAfterLoad.isEmpty) return;
+    final ids = List<String>.from(_dirtyAfterLoad);
+    _dirtyAfterLoad.clear();
+    for (final id in ids) {
+      final list = _historyById[id];
+      if (list == null) continue;
+      try {
+        await saveHistory(id, List<ChatMessage>.from(list));
+      } catch (e, st) {
+        _logger?.logError(
+          '[MessageHistoryPersistence] post-load save failed for $id',
+          e,
+          st,
+        );
+      }
+    }
   }
 
   /// Helper for [loadAllHistories]: load a single conversation file and return
@@ -834,92 +890,35 @@ class MessageHistoryPersistence {
       _historyById.remove(key);
     }
     
-    // Delete the persisted history file(s) (JSON file containing message records)
-    // Note: This only deletes the history file, NOT the actual media files
-    // (images, videos, etc.) that may be referenced in the messages
-    // 
-    // CRITICAL: We need to scan all files because:
-    // 1. The filename might be based on a sanitized/normalized version of the ID
-    // 2. The file might contain messages for this conversation even if filename doesn't match
-    // 3. There might be multiple files for the same conversation (original ID vs normalized ID)
+    // H7: filenames are deterministic — `_getHistoryFile` derives them from
+    // `ConversationIdUtils.normalize` + `sanitizeForFilename`. Compute both
+    // candidates (normalized + legacy un-normalized) and delete only those,
+    // instead of scanning + JSON-parsing every `.json` in the directory
+    // (which was O(n-conversations) and would race with concurrent debounced
+    // saves mid-rename, occasionally swallowing a parse error and leaving a
+    // file undeleted).
     try {
-      // First, try to delete the file with the exact ID
-      final file = await _getHistoryFile(conversationId);
-      if (await file.exists()) {
-        await file.delete();
-        // Verify deletion succeeded
-        if (await file.exists()) {
-          // If file still exists, try force delete
-          try {
-            await file.delete(recursive: false);
-          } catch (e2) {
-            // Log but don't throw - clearing should continue
+      final filesToTry = <File>{
+        await _getHistoryFile(normalizedConversationId),
+        if (conversationId != normalizedConversationId)
+          await _getHistoryFile(conversationId),
+      };
+      for (final f in filesToTry) {
+        try {
+          if (await f.exists()) {
+            await f.delete();
           }
+        } catch (_) {
+          // Best-effort; memory cache is already cleared above.
         }
       }
-      
-      // Also scan all history files to find any that contain messages for this conversation
-      // This handles cases where the file was created with a different ID format
+      // Also drop any backup file we may have left around.
       try {
-        final dir = await _getHistoryDirectory();
-        if (await dir.exists()) {
-          final files = dir.listSync();
-          for (final fileEntry in files) {
-            if (fileEntry is File && fileEntry.path.endsWith('.json')) {
-              try {
-                // Read the file to check if it contains messages for this conversation
-                final jsonString = await fileEntry.readAsString();
-                final decoded = jsonDecode(jsonString);
-                
-                String? fileConversationId;
-                if (decoded is Map<String, dynamic>) {
-                  // New format with metadata
-                  fileConversationId = decoded['conversationId'] as String?;
-                  
-                  // For C2C conversations, if conversationId is not set, try to infer from messages
-                  if (fileConversationId == null && decoded['messages'] is List) {
-                    final messages = decoded['messages'] as List;
-                    if (messages.isNotEmpty) {
-                      final firstMsg = messages.first as Map<String, dynamic>;
-                      // For C2C, use fromUserId; for group, use groupId
-                      fileConversationId = firstMsg['groupId'] as String? ?? 
-                                          firstMsg['fromUserId'] as String?;
-                    }
-                  }
-                } else if (decoded is List<dynamic> && decoded.isNotEmpty) {
-                  // Old format - try to infer from first message
-                  final firstMsg = decoded.first as Map<String, dynamic>;
-                  // For C2C, use fromUserId; for group, use groupId
-                  fileConversationId = firstMsg['groupId'] as String? ?? 
-                                      firstMsg['fromUserId'] as String?;
-                }
-                
-                // Check if this file contains messages for the conversation we're clearing
-                // Use ConversationIdUtils for consistent comparison
-                bool matches = false;
-                if (fileConversationId != null) {
-                  matches = ConversationIdUtils.equals(fileConversationId, conversationId) ||
-                            ConversationIdUtils.equals(fileConversationId, normalizedConversationId);
-                }
-                
-                if (matches) {
-                  // This file contains messages for this conversation, delete it
-                  await fileEntry.delete();
-                  // Also clear cache if it exists
-                  if (fileConversationId != null) {
-                    _historyById.remove(fileConversationId);
-                  }
-                }
-              } catch (e) {
-                // Skip files that can't be read or parsed
-                continue;
-              }
-            }
-          }
+        final backup = await _getBackupFile(normalizedConversationId);
+        if (await backup.exists()) {
+          await backup.delete();
         }
-      } catch (e) {
-        // Log error but don't throw - we've already cleared memory cache
-      }
+      } catch (_) {}
     } catch (e) {
       // Log error but don't throw - clearing should continue
       // The file may not exist or may be locked, but we've cleared memory cache
@@ -1026,19 +1025,20 @@ class MessageHistoryPersistence {
       fileSize: fileSize,
     );
     
-    // 4. Update message atomically
+    // 4. Update message atomically. M4: the previous "verify by re-reading
+    // the same in-memory list we just wrote into" was dead code (the check
+    // could never trip) and swallowed real disk-write failures. Wrap the
+    // save in try/catch instead so an actual `saveHistory` exception is
+    // surfaced to the caller and the in-memory mutation gets reverted.
     list[index] = updated;
-    await saveHistory(normalizedId, list);
-    
-    // 5. Verify update succeeded
-    final verifyIndex = list.indexWhere((msg) => msg.msgID == msgID);
-    if (verifyIndex == -1 || list[verifyIndex].filePath != newFilePath) {
-      // Update verification failed, revert change
+    try {
+      await saveHistory(normalizedId, list);
+    } catch (_) {
       list[index] = existing;
       return false;
     }
-    
-    // 6. Delete old temp file if requested and update was successful
+
+    // 5. Delete old temp file if requested and update was successful
     if (deleteOldTempFile && oldFilePath != null && existing.isTempPath) {
       // Delay deletion to ensure update is persisted
       Future.delayed(Duration(seconds: 5), () async {

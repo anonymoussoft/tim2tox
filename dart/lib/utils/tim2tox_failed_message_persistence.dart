@@ -5,17 +5,53 @@ import 'package:tencent_cloud_chat_sdk/enum/message_status.dart';
 import 'package:tencent_cloud_chat_sdk/models/v2_tim_message.dart';
 
 /// Utility class for persisting and restoring failed messages.
-/// When [accountToxId] is provided, storage is scoped per account (key suffix = first 16 chars of toxId).
+/// When [accountToxId] is provided, storage is scoped per account using the
+/// full Tox ID (76 chars) as the key suffix.
+///
+/// H12 fix: previously the suffix was truncated to the first 16 chars of the
+/// Tox ID. Two Tox IDs sharing a 16-char prefix would collide and overwrite
+/// each other's failed-message queue. The full Tox ID is now used. A one-time
+/// migration in the loader (see [_migrateLegacyPrefixKey]) copies any pre-fix
+/// 16-char-prefixed entry into the new full-ID key before reading.
 class Tim2ToxFailedMessagePersistence {
   static const String _persistenceKey = 'tencent_cloud_chat_failed_messages';
-  static const int _accountPrefixLen = 16;
+  static const int _legacyAccountPrefixLen = 16;
 
   static String _storageKey(String? accountToxId) {
     if (accountToxId == null || accountToxId.isEmpty) return _persistenceKey;
-    final prefix = accountToxId.length >= _accountPrefixLen
-        ? accountToxId.substring(0, _accountPrefixLen)
-        : accountToxId;
+    return '${_persistenceKey}_$accountToxId';
+  }
+
+  /// Legacy (pre-H12) storage key — first 16 chars of Tox ID. Returns null
+  /// if the account has no legacy key (no accountToxId, or shorter than the
+  /// legacy prefix length — those were stored verbatim under the new key).
+  static String? _legacyStorageKey(String? accountToxId) {
+    if (accountToxId == null || accountToxId.isEmpty) return null;
+    if (accountToxId.length < _legacyAccountPrefixLen) return null;
+    final prefix = accountToxId.substring(0, _legacyAccountPrefixLen);
     return '${_persistenceKey}_$prefix';
+  }
+
+  /// Migrate a legacy 16-char-prefixed key to the full-Tox-ID key. Runs on
+  /// the first read/write touching a given [accountToxId]. Safe to call
+  /// repeatedly: once migrated, the legacy key is gone and this is a no-op.
+  static Future<void> _migrateLegacyPrefixKey(
+    SharedPreferences prefs,
+    String? accountToxId,
+  ) async {
+    if (accountToxId == null || accountToxId.isEmpty) return;
+    final legacyKey = _legacyStorageKey(accountToxId);
+    if (legacyKey == null) return;
+    final newKey = _storageKey(accountToxId);
+    if (legacyKey == newKey) return;
+    final legacyValue = prefs.getString(legacyKey);
+    if (legacyValue == null) return;
+    // Only copy if there's nothing under the new key yet, otherwise the
+    // newer (full-id) entry wins and we just drop the legacy one.
+    if (prefs.getString(newKey) == null) {
+      await prefs.setString(newKey, legacyValue);
+    }
+    await prefs.remove(legacyKey);
   }
 
   static const int _messageTimeoutSeconds = 5; // Default timeout: 5 seconds for text messages
@@ -33,14 +69,15 @@ class Tim2ToxFailedMessagePersistence {
   }) async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      await _migrateLegacyPrefixKey(prefs, accountToxId);
       final key = _storageKey(accountToxId);
       final jsonString = prefs.getString(key);
       Map<String, dynamic> failedMessagesMap = {};
-      
+
       if (jsonString != null && jsonString.isNotEmpty) {
         failedMessagesMap = json.decode(jsonString) as Map<String, dynamic>;
       }
-      
+
       // Use conversation key (groupID or userID) as the key
       final conversationKey = groupID ?? userID ?? '';
       if (conversationKey.isEmpty) return;
@@ -97,10 +134,11 @@ class Tim2ToxFailedMessagePersistence {
   }) async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      await _migrateLegacyPrefixKey(prefs, accountToxId);
       final key = _storageKey(accountToxId);
       final jsonString = prefs.getString(key);
       if (jsonString == null || jsonString.isEmpty) return;
-      
+
       Map<String, dynamic> failedMessagesMap = json.decode(jsonString) as Map<String, dynamic>;
       final conversationKey = groupID ?? userID ?? '';
       if (conversationKey.isEmpty || !failedMessagesMap.containsKey(conversationKey)) return;
@@ -135,10 +173,11 @@ class Tim2ToxFailedMessagePersistence {
   }) async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      await _migrateLegacyPrefixKey(prefs, accountToxId);
       final key = _storageKey(accountToxId);
       final jsonString = prefs.getString(key);
       if (jsonString == null || jsonString.isEmpty) return [];
-      
+
       Map<String, dynamic> failedMessagesMap = json.decode(jsonString) as Map<String, dynamic>;
       final conversationKey = groupID ?? userID ?? '';
       if (conversationKey.isEmpty || !failedMessagesMap.containsKey(conversationKey)) return [];
@@ -156,8 +195,14 @@ class Tim2ToxFailedMessagePersistence {
   static Future<void> clearAllFailedMessages({String? accountToxId}) async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      // Clear both the new (full-id) key and any lingering legacy 16-char-prefix
+      // key so an account that hasn't been read-migrated yet is still cleared.
       final key = _storageKey(accountToxId);
       await prefs.remove(key);
+      final legacyKey = _legacyStorageKey(accountToxId);
+      if (legacyKey != null && legacyKey != key) {
+        await prefs.remove(legacyKey);
+      }
     } catch (e) {
       // Ignore errors
     }

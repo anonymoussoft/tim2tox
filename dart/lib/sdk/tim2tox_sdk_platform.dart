@@ -82,6 +82,7 @@ import 'package:tencent_cloud_chat_sdk/models/v2_tim_message_online_url.dart';
 import 'package:tencent_cloud_chat_sdk/enum/image_types.dart';
 import '../service/ffi_chat_service.dart';
 import '../models/chat_message.dart';
+import '../utils/message_converter.dart';
 import '../ffi/tim2tox_ffi.dart' as ffi_lib;
 import 'dart:ffi' as ffi;
 import 'package:ffi/ffi.dart' as pkgffi;
@@ -2653,6 +2654,27 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 for (final l in advList) {
                   l.onRecvMessageModified?.call(v2Msg);
                 }
+                // H2: persist the modified message so updates (e.g. pending →
+                // sent, content edits) survive restarts. Mirrors the
+                // appendHistory call in the modified-branch handler around
+                // lines 1226-1231. Wrapped in try/catch so a persistence
+                // error doesn't break callback dispatch.
+                try {
+                  final conversationId =
+                      v2Msg.groupID ?? v2Msg.userID ?? '';
+                  if (conversationId.isNotEmpty) {
+                    final chatMsg =
+                        MessageConverter.v2TimMessageToChatMessage(
+                            v2Msg, ffiService.selfId);
+                    await ffiService.messageHistoryPersistence
+                        .appendHistory(conversationId, chatMsg);
+                  }
+                } catch (e) {
+                  if (_debugLog) {
+                    print(
+                        '[Tim2ToxSdkPlatform] MessageUpdate persistence error: $e');
+                  }
+                }
               });
             }
           }
@@ -2672,6 +2694,21 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                   : '';
               for (final l in advList) {
                 l.onRecvMessageRevoked?.call(loc);
+              }
+              // H2: persist the revoke by deleting the message from history.
+              // Single call outside the listener loop so a persistence error
+              // doesn't fan out across listeners.
+              if (loc.isNotEmpty) {
+                Future.microtask(() async {
+                  try {
+                    await ffiService.deleteMessages([loc]);
+                  } catch (e) {
+                    if (_debugLog) {
+                      print(
+                          '[Tim2ToxSdkPlatform] MessageRevoke persistence error: $e');
+                    }
+                  }
+                });
               }
             }
           }
@@ -4845,6 +4882,24 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     int? timePeriod,
   }) async {
     try {
+      // M7: `lastMsgSeq` and `messageSeqList` are intentionally unsupported
+      // here. Tox has no server-assigned sequence numbers — all ordering is
+      // local-timestamp based. The Tencent V2TIM SDK uses these for
+      // cloud-side anchored pagination; in Tim2Tox the equivalent anchor is
+      // `lastMsgID`. If a caller passes a non-default value we log a warning
+      // so they can fix the call site rather than silently mis-paginating.
+      if (lastMsgSeq != -1) {
+        if (_debugLog) {
+          print(
+              '[Tim2ToxSdkPlatform] getHistoryMessageListV2: lastMsgSeq=$lastMsgSeq ignored (Tox has no server sequence numbers; use lastMsgID instead)');
+        }
+      }
+      if (messageSeqList != null && messageSeqList.isNotEmpty) {
+        if (_debugLog) {
+          print(
+              '[Tim2ToxSdkPlatform] getHistoryMessageListV2: messageSeqList (${messageSeqList.length} entries) ignored (Tox has no server sequence numbers)');
+        }
+      }
       final targetID = groupID ?? userID ?? '';
       if (targetID.isEmpty) {
         return V2TimValueCallback<V2TimMessageListResult>(
@@ -5017,9 +5072,18 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
             }
           }
         } else {
-          // lastMsgID not found, return empty list
+          // H4: lastMsgID not found in the filtered history. Returning
+          // `isFinished: true` here freezes the UIKit pagination state and
+          // the caller can never recover — typical cause is a stale
+          // anchor (e.g. the message was just revoked, or the type filter
+          // excluded it). Return `isFinished: false` with an empty page so
+          // the caller can retry with a different anchor.
+          if (_debugLog) {
+            print(
+                '[Tim2ToxSdkPlatform] getHistoryMessageListV2: lastMsgID="$lastMsgID" not found in filtered history; keeping pagination open (isFinished=false)');
+          }
           sublist = [];
-          isFinished = true;
+          isFinished = false;
         }
       } else {
         // No lastMsgID provided - return the most recent messages
@@ -5706,7 +5770,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String userID,
   }) async {
     try {
-      // Mark all messages from this user as read
+      // H3: cold cache → no-op. Load from persistence before iterating so
+      // the first mark-as-read after app launch actually flips the in-memory
+      // history (which getHistory reads).
+      await ffiService.messageHistoryPersistence.loadHistory(userID);
       final history = ffiService.getHistory(userID);
       for (final msg in history) {
         if (!msg.isSelf) {
@@ -5731,7 +5798,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String groupID,
   }) async {
     try {
-      // Mark all messages from this group as read
+      // H3: same cold-cache fix as markC2CMessageAsRead — load persistence
+      // before iterating so the first mark-as-read post-launch isn't a no-op.
+      await ffiService.messageHistoryPersistence.loadHistory(groupID);
       final history = ffiService.getHistory(groupID);
       for (final msg in history) {
         if (!msg.isSelf) {
