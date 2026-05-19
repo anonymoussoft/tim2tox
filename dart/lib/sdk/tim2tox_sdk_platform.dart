@@ -6297,6 +6297,25 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   }) async {
     try {
       final prefs = _prefs;
+
+      // friendRemark requested but no preferences service available — the
+      // caller's data is being dropped. Surface this as a real failure
+      // instead of returning code:0 (which previously made integrators see
+      // "success" while nothing was written).
+      if (friendRemark != null && prefs == null) {
+        _log(
+          '[Tim2ToxSdkPlatform] setFriendInfo: no preferences service '
+          'attached — dropping friendRemark for $userID. Caller should '
+          'inject ExtendedPreferencesService via the Tim2ToxSdkPlatform '
+          'constructor or FfiChatService.preferencesService.',
+        );
+        return V2TimCallback(
+          code: -1,
+          desc:
+              'setFriendInfo: no preferences service available, friendRemark not persisted',
+        );
+      }
+
       if (prefs != null && friendRemark != null) {
         // Persist via the typed [ExtendedPreferencesService.setFriendRemark]
         // so the host adapter applies its per-account scoping (toxee scopes
@@ -6307,9 +6326,30 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         // ephemeral state.
         await prefs.setFriendRemark(userID, friendRemark);
       }
+
       // TODO(tim2tox): `friendCustomInfo` requires a structured per-friend
-      // map in `ExtendedPreferencesService`. Drop on the floor for now —
-      // UIKit's profile page does not call this with custom info today.
+      // map in `ExtendedPreferencesService`. Until that lands, log a warning
+      // when callers pass it so the silent-drop is visible. UIKit's profile
+      // page does not call this with custom info today, so the warning is
+      // effectively a tripwire for a future contract change.
+      if (friendCustomInfo != null && friendCustomInfo.isNotEmpty) {
+        _log(
+          '[Tim2ToxSdkPlatform] setFriendInfo: friendCustomInfo is not yet '
+          'implemented — dropping ${friendCustomInfo.length} key(s) for '
+          '$userID. If the host UI starts relying on this, wire it through '
+          'ExtendedPreferencesService.',
+        );
+        // If the caller only asked for customInfo (no remark), they got
+        // nothing — return failure rather than pretending it worked.
+        if (friendRemark == null) {
+          return V2TimCallback(
+            code: -1,
+            desc:
+                'setFriendInfo: friendCustomInfo not supported, no remark provided',
+          );
+        }
+      }
+
       return V2TimCallback(
         code: 0,
         desc: 'success',

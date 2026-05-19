@@ -383,9 +383,23 @@ class MessageHistoryPersistence {
         _lastViewTimestampById[targetId] = 0;
       }
       
-      // Save the updated history (with isPending=false and deduplicated) to disk if any changes were made
+      // Save the updated history (with isPending=false and deduplicated) to disk if any changes were made.
+      // The save is fire-and-forget so a slow disk write doesn't block load,
+      // but we wrap with catchError so a serialization or I/O failure surfaces
+      // through the injected logger instead of bubbling out as an uncaught
+      // async error on cold start. The cold-start parallel batch can launch
+      // many of these concurrently — without this, any one disk-write failure
+      // would crash the zone.
       if (deduplicatedList.length != messages.length || updatedMessages != messages) {
-        unawaited(saveHistory(targetId, deduplicatedList));
+        unawaited(
+          saveHistory(targetId, deduplicatedList).catchError((Object e, StackTrace st) {
+            _logger?.logError(
+              '[MessageHistoryPersistence] post-load save failed for $targetId',
+              e,
+              st,
+            );
+          }),
+        );
       }
       
       return deduplicatedList;
@@ -603,9 +617,17 @@ class MessageHistoryPersistence {
       _appendDebounceTimers.remove(normalizedId)?.cancel();
       final pending = _appendDebouncePending.remove(normalizedId);
       if (pending != null && !pending.isCompleted) {
+        // Forward result with an explicit (error, stack) signature so the
+        // 2-arg `onError` form is picked. Using `pending.completeError` as a
+        // tear-off would silently drop the stack trace (Dart resolves the
+        // 1-arg variant), making disk-write failures unhelpful to debug.
         saveFuture.then(
-          pending.complete,
-          onError: pending.completeError,
+          (_) {
+            if (!pending.isCompleted) pending.complete();
+          },
+          onError: (Object error, StackTrace stack) {
+            if (!pending.isCompleted) pending.completeError(error, stack);
+          },
         );
       }
       return saveFuture;

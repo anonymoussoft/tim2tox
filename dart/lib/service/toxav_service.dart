@@ -98,8 +98,14 @@ class ToxAVService implements CallAvBackend {
   // Kept for backward compatibility with default instance
   static ToxAVService? _globalService;
 
-  // Last-wins logger usable from static trampolines (for early-startup
+  // First-wins logger usable from static trampolines (for early-startup
   // diagnostics before a per-instance lookup succeeds).
+  //
+  // Last-wins would let a second instance (e.g. an auto_test peer constructed
+  // after the primary) overwrite an active logger with one that may be a
+  // no-op, silently swallowing errors from the first instance's trampolines.
+  // First-wins keeps the earliest non-null logger; production is single-
+  // instance so this only matters in multi-peer test scenarios.
   static LoggerService? _staticLogger;
 
   // Callbacks
@@ -111,7 +117,10 @@ class ToxAVService implements CallAvBackend {
   VideoBitrateChangedCallback? _onVideoBitrateChanged;
 
   ToxAVService(this._ffi, {LoggerService? logger}) : _logger = logger {
-    if (logger != null) _staticLogger = logger;
+    // First-wins: only adopt this logger statically if none has been set yet.
+    if (logger != null && _staticLogger == null) {
+      _staticLogger = logger;
+    }
     try {
       _instanceId = _ffi.getCurrentInstanceId();
       _logger?.logDebug('[ToxAVService] Constructor: instanceId=$_instanceId');
@@ -207,10 +216,16 @@ class ToxAVService implements CallAvBackend {
 
     // Allocate memory for instance ID (will be passed as user_data).
     //
-    // This block is intentionally retained for the lifetime of the registered
-    // native callbacks. Freeing it during `shutdown()` is unsafe because
-    // c-toxcore may still hold the pointer and dispatch a final tail-event
-    // after `avShutdown()` returns. The memory cost is 8 bytes per instance.
+    // **Accepted-tradeoff leak.** This 8-byte block is intentionally never
+    // freed for the lifetime of the process. Freeing it during `shutdown()`
+    // is unsafe because c-toxcore may still hold the pointer and dispatch a
+    // final tail-event after `avShutdown()` returns; there is no exposed
+    // "callbacks-quiesced" signal we could wait on. Practical cost: one
+    // 8-byte allocation per `_setupCallbacks()` invocation (i.e. per
+    // re-initialize after a logout/login that uses ToxAV). At single-digit
+    // re-inits per day this is negligible (~bytes/day) and bounded by
+    // process lifetime. Do NOT add a "smart" cleanup — that was tried and
+    // produced use-after-free crashes when tail events landed.
     final instanceIdPtr = pkgffi.malloc<ffi.Int64>();
     instanceIdPtr.value = instanceId;
 

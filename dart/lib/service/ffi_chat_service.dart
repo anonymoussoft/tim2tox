@@ -283,11 +283,22 @@ final _ircUserJoinPartCbPtr =
 /// wants paths routed through its own central path authority (e.g. toxee's
 /// `AppPaths`), it implements this and passes it to the constructor.
 ///
-/// Implementations must return absolute directory paths. The caller will
-/// create the directory if it does not exist. Returning `null` (or omitting
-/// the parameter entirely) makes [FfiChatService] fall back to its built-in
+/// Implementations must return **non-empty absolute directory paths**. The
+/// caller will create the directory if it does not exist. Returning a
+/// relative path, empty string, or null is a contract violation and triggers
+/// an [ArgumentError] — this guards against path-traversal-shaped bugs (e.g.
+/// `"../../etc"`) and silent fall-through to a misconfigured default.
+///
+/// Returning the [FfiChatPathResolver] argument as null (or omitting the
+/// parameter entirely) makes [FfiChatService] fall back to its built-in
 /// `getApplicationSupportDirectory()` defaults, so this stays optional for
 /// tim2tox standalone tests.
+///
+/// Note for integrators upgrading from the legacy `_fileRecvPath` /
+/// `_avatarsPath` constructor parameters: existing on-disk files at the old
+/// location are **not** migrated automatically when a resolver is introduced.
+/// If the resolver returns a different directory, surface the migration in
+/// the integrator's account/bootstrap layer.
 abstract class FfiChatPathResolver {
   /// Directory where tox file_recv puts incoming file transfers.
   /// Default fallback: `<appSupport>/file_recv`.
@@ -296,6 +307,26 @@ abstract class FfiChatPathResolver {
   /// Directory where the service places avatar images it has copied.
   /// Default fallback: `<appSupport>/avatars`.
   Future<String> resolveAvatarsDirectory();
+}
+
+/// Validate a resolver-returned directory path. Throws [ArgumentError] if the
+/// returned path is empty or not absolute — both are contract violations of
+/// [FfiChatPathResolver]. Returns [path] unchanged on success.
+String _assertResolverPath(String path, String which) {
+  if (path.isEmpty) {
+    throw ArgumentError(
+      'FfiChatPathResolver.$which returned an empty string; '
+      'must be a non-empty absolute directory path.',
+    );
+  }
+  // p.isAbsolute is platform-aware and handles both POSIX and Windows roots.
+  if (!p.isAbsolute(path)) {
+    throw ArgumentError(
+      'FfiChatPathResolver.$which returned a non-absolute path "$path"; '
+      'must be an absolute directory path (e.g. /Users/.../foo or C:\\foo).',
+    );
+  }
+  return path;
 }
 
 class FfiChatService {
@@ -944,7 +975,10 @@ class FfiChatService {
       if (_fileRecvPath != null && _fileRecvPath!.isNotEmpty) {
         recvPath = _fileRecvPath!;
       } else if (_pathResolver != null) {
-        recvPath = await _pathResolver!.resolveFileRecvDirectory();
+        recvPath = _assertResolverPath(
+          await _pathResolver!.resolveFileRecvDirectory(),
+          'resolveFileRecvDirectory',
+        );
       } else {
         final appDir = await getApplicationSupportDirectory();
         recvPath = '${appDir.path}/file_recv';
@@ -3434,9 +3468,34 @@ class FfiChatService {
     return out;
   }
 
+  /// Wordings surfaced by [getFriendApplications] per userId since startup.
+  ///
+  /// Acts as a fallback source for [refuseFriendApplication]: if the C++
+  /// queue has already been consumed between the most recent poll and the
+  /// user's refuse tap, we can still record the right
+  /// `(userId, wording)` fingerprint from what the UI was last shown.
+  /// Without this, a refuse click after the C++ queue drains is a silent
+  /// no-op and the refused application reappears on the next poll.
+  ///
+  /// Cleared per-userId on [acceptFriendRequest] (the user explicitly chose
+  /// to accept, so old wordings are no longer interesting) and on dispose.
+  final Map<String, Set<String>> _observedApplicationWordings = {};
+
   Future<List<({String userId, String wording})>>
       getFriendApplications() async {
     final raw = await _getFriendApplicationsUnfiltered();
+
+    // Remember the wordings the UI is being shown so refuseFriendApplication
+    // can fall back to them if the C++ queue clears the entry before the user
+    // taps refuse. We snapshot from the unfiltered list because the dismissed
+    // filter below removes entries the user has already refused — those are
+    // already in the persisted dismissed set and don't need re-snapshotting.
+    for (final app in raw) {
+      final norm = _normalizeApplicationUserId(app.userId);
+      _observedApplicationWordings
+          .putIfAbsent(norm, () => <String>{})
+          .add(app.wording);
+    }
 
     // Filter out applications the user has explicitly refused/deleted. Without
     // this, the C++ application queue keeps returning the same entries every
@@ -3455,20 +3514,29 @@ class FfiChatService {
   /// fingerprint. If the peer happens to re-send with identical wording the
   /// user can simply dismiss again.
   ///
-  /// Idempotent. If no matching entry is currently in the C++ queue at call
-  /// time, this is a no-op (defensive: a stale UI refusal click shouldn't
-  /// poison the dismissed set with a fingerprint we never observed).
+  /// Idempotent. If the C++ queue no longer surfaces an entry for [userID] at
+  /// call time, falls back to the wordings observed via [getFriendApplications]
+  /// since startup ([_observedApplicationWordings]) — this covers the case
+  /// where the poll has already consumed the C++ entry between the UI render
+  /// and the user's refuse tap. Only a refuse click for a userId we've truly
+  /// never seen is a no-op.
   Future<void> refuseFriendApplication(String userID) async {
     final normalized = _normalizeApplicationUserId(userID);
     final apps = await _getFriendApplicationsUnfiltered();
-    final matched = apps.where(
-      (a) => _normalizeApplicationUserId(a.userId) == normalized,
-    );
-    if (matched.isEmpty) return;
+    final liveWordings = apps
+        .where((a) => _normalizeApplicationUserId(a.userId) == normalized)
+        .map((a) => a.wording)
+        .toSet();
+
+    final wordings = liveWordings.isNotEmpty
+        ? liveWordings
+        : (_observedApplicationWordings[normalized] ?? const <String>{});
+    if (wordings.isEmpty) return;
+
     final dismissed = await _getDismissedFriendApplications();
     bool changed = false;
-    for (final app in matched) {
-      if (dismissed.add(_fingerprint(normalized, app.wording))) {
+    for (final w in wordings) {
+      if (dismissed.add(_fingerprint(normalized, w))) {
         changed = true;
       }
     }
@@ -3499,6 +3567,9 @@ class FfiChatService {
     if (dismissed.length != before) {
       await _saveDismissedFriendApplications(dismissed);
     }
+    // Also drop the observed-wordings snapshot — once accepted, future
+    // requests from this peer are interesting again regardless of past wording.
+    _observedApplicationWordings.remove(normalized);
   }
 
   Future<void> removeFriend(String userId) async {
@@ -5446,7 +5517,10 @@ class FfiChatService {
       return _avatarsPath!;
     }
     if (_pathResolver != null) {
-      final resolved = await _pathResolver!.resolveAvatarsDirectory();
+      final resolved = _assertResolverPath(
+        await _pathResolver!.resolveAvatarsDirectory(),
+        'resolveAvatarsDirectory',
+      );
       final dir = Directory(resolved);
       if (!await dir.exists()) await dir.create(recursive: true);
       return dir.path;
@@ -5802,25 +5876,59 @@ class FfiChatService {
   }
 
   Future<void> dispose() async {
-    // Clear global service pointer so FFI callbacks no longer route to this instance
+    // Order matters here — the previous arrangement had a race where a poll
+    // tick or in-flight callback could `appendHistory` between
+    // `flushPendingSaves()` and `clearAllCached()`, resurrecting the
+    // just-cleared cache and then losing the message when the debounce timer
+    // fired against an empty service. To close that window:
+    //
+    //   1. Stop every source of new `appendHistory` calls (route, poller,
+    //      profile timer, instance-map registration, in-flight file callbacks).
+    //   2. Only then flush pending writes to disk.
+    //   3. Switch the persistence layer into its "disposed" mode so any
+    //      defensive late call falls through to a synchronous save instead of
+    //      scheduling a timer that will never fire.
+    //   4. Finally clear caches and tear down FFI / streams.
+
+    // 1. Stop new work.
     if (_globalService == this) {
       _globalService = null;
     }
-    // Clear global file transfer path cache
     _lastSentPathByPeer.clear();
 
-    // Flush any pending debounced history writes before the in-memory cache
-    // is wiped. `clearAllCached()` below removes `_historyById`, which is the
-    // source the debounce timer reads from — without this flush, the last
-    // ~200ms window of appended messages gets stranded in a not-yet-fired
-    // timer and silently dropped on exit / account switch.
+    if (_instanceId != null && _instanceId! != 0) {
+      synchronized(_instanceServicesLock, () {
+        _instanceServices.remove(_instanceId!);
+        _knownInstanceIds.remove(_instanceId!);
+      });
+    }
+
+    _poller?.cancel();
+    _poller = null;
+    _pollingStarted = false;
+    _profileSaveTimer?.cancel();
+    _profileSaveTimer = null;
+
+    // Cancel any in-flight file transfers — must happen after the poller has
+    // been killed so cancellation callbacks don't race a fresh poll tick.
+    await _cancelPendingFileTransfers();
+
+    // 2. Flush pending debounced history writes. By this point no new
+    // appendHistory should arrive, so the snapshot the flush takes is final.
     try {
       await _messageHistoryPersistence.flushPendingSaves();
     } catch (_) {
       // Best-effort: don't block dispose on a single conversation's save error.
     }
 
-    // Clear per-account in-memory caches to prevent data leakage between accounts
+    // 3. Switch persistence into disposed mode. After this, any late call
+    // into _scheduleDebouncedSave (defensive — should not happen given step 1)
+    // falls through to a synchronous saveHistory using the still-present
+    // in-memory list, instead of scheduling a timer that gets cancelled in
+    // step 4.
+    _messageHistoryPersistence.dispose();
+
+    // 4. Clear caches and tear down.
     _messageHistoryPersistence.clearAllCached();
     _unreadByPeer.clear();
     _knownGroups.clear();
@@ -5828,22 +5936,9 @@ class FfiChatService {
     _lastByPeer.clear();
     _typingUntil.clear();
     _processingFileDone.clear();
+    _observedApplicationWordings.clear();
     _activePeerId = null;
 
-    // Unregister from static instance map so poll loop no longer polls this instance
-    if (_instanceId != null && _instanceId! != 0) {
-      synchronized(_instanceServicesLock, () {
-        _instanceServices.remove(_instanceId!);
-        _knownInstanceIds.remove(_instanceId!);
-      });
-    }
-    // Cancel all pending file transfers before disposing
-    await _cancelPendingFileTransfers();
-    _poller?.cancel();
-    _poller = null;
-    _pollingStarted = false;
-    _profileSaveTimer?.cancel();
-    _profileSaveTimer = null;
     _ffi.uninit();
     await _messages.close();
     await _connectionStatus.close();
