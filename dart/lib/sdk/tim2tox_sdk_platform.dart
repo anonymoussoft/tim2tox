@@ -258,6 +258,44 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   final Map<String, ({String? userID, String? groupID, int timestamp})>
       _pendingForwardTargets = {};
 
+  // U-3 (partial): remember per-path soundElem.duration values handed to us
+  // by `sendMessage`. The Tox file-transfer envelope has no duration field,
+  // so the receiver currently displays 0 (see TODO(P1-11) in
+  // fake_msg_provider_mapping.dart). At least the SENDER side can be made
+  // consistent: when the local echo for an audio file lands in
+  // `_setupMessageListener`, we patch the v2Msg.soundElem.duration from
+  // this map so the sender's own history shows the correct length.
+  // Entries are cleaned up after 60 s.
+  final Map<String, ({int durationMs, int timestampMs})>
+      _pendingSoundDurations = {};
+
+  void _rememberSoundDuration(String filePath, int? durationMs) {
+    if (filePath.isEmpty || durationMs == null || durationMs <= 0) return;
+    _pendingSoundDurations[filePath] = (
+      durationMs: durationMs,
+      timestampMs: DateTime.now().millisecondsSinceEpoch,
+    );
+    // Best-effort cleanup of stale entries.
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _pendingSoundDurations
+        .removeWhere((_, v) => (now - v.timestampMs).abs() > 60000);
+  }
+
+  int? _lookupSoundDuration(String? filePath) {
+    if (filePath == null || filePath.isEmpty) return null;
+    final entry = _pendingSoundDurations[filePath];
+    if (entry != null) return entry.durationMs;
+    // Fallback: filename-encoded duration `..._dur1234.ext` (used when the
+    // receiver wants the duration too — see U-3 in sendMessage).
+    final base = filePath.split('/').last;
+    final marker = RegExp(r'__dur(\d+)');
+    final m = marker.firstMatch(base);
+    if (m != null) {
+      return int.tryParse(m.group(1)!);
+    }
+    return null;
+  }
+
   // Avatar path cache for populating faceUrl on V2TimMessages
   String? _selfAvatarPathCache;
   final Map<String, String> _friendAvatarPathCache = {};
@@ -638,6 +676,46 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // Clean up old pending forward targets periodically
       _cleanupPendingForwardTargets();
 
+      // R-3 / U-1 / U-2 / H-H: inspect text-only payloads for our magic
+      // control-signal prefixes before anything else touches them. Runs
+      // for BOTH inbound and self-echoed messages so the sender does not
+      // see their own `__revoke__:` payload as a ghost bubble either.
+      // Skips file-transfer messages (mediaKind != null) since those carry
+      // their text in a different envelope.
+      ({
+        bool swallow,
+        String? rewriteText,
+        String? rewriteCustomData,
+        String? originalText,
+      })? controlIntercept;
+      if ((chatMsg.mediaKind == null || chatMsg.mediaKind!.isEmpty) &&
+          chatMsg.text.isNotEmpty &&
+          chatMsg.text.startsWith('__')) {
+        controlIntercept = await _maybeInterceptControlSignal(chatMsg);
+        if (controlIntercept.swallow) {
+          // Revoke (or unrecognized __… control) — the chatMsg has already
+          // been persisted by FfiChatService before reaching this stream,
+          // so reverse-delete it best-effort. UIKit/history listeners are
+          // never notified of the original text.
+          final msgIDToReap = chatMsg.msgID;
+          if (msgIDToReap != null && msgIDToReap.isNotEmpty) {
+            try {
+              await deleteMessages(msgIDs: [msgIDToReap]);
+            } catch (e) {
+              if (_debugLog) {
+                print(
+                    '[Tim2ToxSdkPlatform] _setupMessageListener: failed to reap self-echo for control signal (swallowed): $e');
+              }
+            }
+          }
+          if (_debugLog) {
+            print(
+                '[Tim2ToxSdkPlatform] _setupMessageListener: swallowed control signal (isSelf=${chatMsg.isSelf}, text="${chatMsg.text}")');
+          }
+          return;
+        }
+      }
+
       // Check if this is a forward message BEFORE converting to V2TimMessage
       // This allows us to fix the userID/groupID during conversion
       String? forwardTargetUserID;
@@ -785,6 +863,60 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       final v2Msg = chatMessageToV2TimMessage(chatMsg, ffiService.selfId,
           forwardTargetUserID: forwardTargetUserID,
           forwardTargetGroupID: forwardTargetGroupID);
+
+      // U-1 / U-2: __face__ / __custom__ / __location__ → keep message but
+      // rewrite the bubble text and stash the original JSON into
+      // customElem.data for later rich rendering. The chatMsg.text in
+      // history will still be the raw payload (since ChatMessage is
+      // immutable); UIKit only ever sees the rewritten v2Msg.
+      if (controlIntercept != null &&
+          !controlIntercept.swallow &&
+          (controlIntercept.rewriteText != null ||
+              controlIntercept.rewriteCustomData != null)) {
+        if (controlIntercept.rewriteText != null) {
+          v2Msg.textElem = V2TimTextElem(text: controlIntercept.rewriteText);
+        }
+        if (controlIntercept.rewriteCustomData != null) {
+          v2Msg.customElem = V2TimCustomElem(
+            data: controlIntercept.rewriteCustomData,
+            desc: controlIntercept.originalText ?? '',
+            extension: '',
+          );
+        }
+      }
+
+      // U-3: patch local sender's soundElem.duration from
+      // `_pendingSoundDurations`. Receiver-side duration recovery is
+      // partial (filename-encoded `__dur{ms}`) and only kicks in for files
+      // whose name went through sendMessage's encoding path.
+      if (chatMsg.isSelf && v2Msg.soundElem != null) {
+        final p = v2Msg.soundElem!.path ?? chatMsg.filePath;
+        final dur = _lookupSoundDuration(p);
+        if (dur != null && dur > 0 && (v2Msg.soundElem!.duration ?? 0) == 0) {
+          v2Msg.soundElem = V2TimSoundElem(
+            path: v2Msg.soundElem!.path,
+            UUID: v2Msg.soundElem!.UUID,
+            dataSize: v2Msg.soundElem!.dataSize,
+            duration: dur,
+            url: v2Msg.soundElem!.url,
+            localUrl: v2Msg.soundElem!.localUrl,
+          );
+        }
+      } else if (!chatMsg.isSelf && v2Msg.soundElem != null) {
+        // Receiver: try filename-encoded duration as a best-effort.
+        final p = v2Msg.soundElem!.path ?? chatMsg.filePath;
+        final dur = _lookupSoundDuration(p);
+        if (dur != null && dur > 0 && (v2Msg.soundElem!.duration ?? 0) == 0) {
+          v2Msg.soundElem = V2TimSoundElem(
+            path: v2Msg.soundElem!.path,
+            UUID: v2Msg.soundElem!.UUID,
+            dataSize: v2Msg.soundElem!.dataSize,
+            duration: dur,
+            url: v2Msg.soundElem!.url,
+            localUrl: v2Msg.soundElem!.localUrl,
+          );
+        }
+      }
 
       // If we found forward target before conversion, fix userID/groupID now
       if (forwardTargetUserID != null || forwardTargetGroupID != null) {
@@ -4733,16 +4865,76 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           // Sound has a `path` field (verified against
           // tencent_cloud_chat_sdk/lib/models/v2_tim_sound_elem.dart:16).
           final soundPath = messageToSend.soundElem!.path!;
+          final soundDuration = messageToSend.soundElem!.duration ?? 0;
           print(
-              '[Tim2ToxSdkPlatform] Sending sound message: $soundPath');
+              '[Tim2ToxSdkPlatform] Sending sound message: $soundPath (duration=$soundDuration ms)');
+          // U-3: Tox's file-transfer envelope has no duration field, so we
+          // smuggle it via the filename: `<base>__dur{ms}<ext>`. Because
+          // FfiChatService.sendFile derives the wire filename from the
+          // on-disk basename and we cannot edit FfiChatService here, we
+          // copy the audio file to a temp file with the encoded name and
+          // send that. The receive-side fake_msg_provider mapping decoder
+          // strips `__dur{ms}` back out when constructing
+          // soundElem.duration. We also remember the local sender-side
+          // duration for our own echo so the sender's UI does not show
+          // 0 ms.
+          // Best-effort: if copy fails or duration is 0, fall back to the
+          // original path/name.
+          _rememberSoundDuration(soundPath, soundDuration);
+          String pathToSend = soundPath;
+          String? encodedName;
+          if (soundDuration > 0) {
+            try {
+              final originalName = soundPath.split('/').last;
+              final dotIdx = originalName.lastIndexOf('.');
+              final base = dotIdx > 0
+                  ? originalName.substring(0, dotIdx)
+                  : originalName;
+              final ext = dotIdx > 0 ? originalName.substring(dotIdx) : '';
+              encodedName = '${base}__dur$soundDuration$ext';
+              final srcFile = File(soundPath);
+              if (await srcFile.exists()) {
+                final tmpDir = Directory.systemTemp;
+                final tmpPath = '${tmpDir.path}/$encodedName';
+                final tmpFile = File(tmpPath);
+                // Copy is idempotent: overwrite if it somehow exists from a
+                // previous send of the same recording.
+                await srcFile.copy(tmpPath);
+                // Map the temp path → duration too so the local echo
+                // (which may arrive with the temp path) is patched.
+                _rememberSoundDuration(tmpPath, soundDuration);
+                pathToSend = tmpPath;
+                // Schedule a delayed cleanup. Tox file transfer might still
+                // be reading the file when we return; keep it around for a
+                // few minutes.
+                Future.delayed(const Duration(minutes: 5), () async {
+                  try {
+                    if (await tmpFile.exists()) {
+                      await tmpFile.delete();
+                    }
+                  } catch (_) {
+                    // Cleanup is best-effort.
+                  }
+                });
+              }
+            } catch (e) {
+              if (_debugLog) {
+                print(
+                    '[Tim2ToxSdkPlatform] U-3 duration encode failed (falling back to raw path): $e');
+              }
+              pathToSend = soundPath;
+              encodedName = null;
+            }
+          }
           await provider.sendFile(
             userID: userID,
             groupID: groupID.isNotEmpty ? groupID : null,
-            filePath: soundPath,
-            fileName: soundPath.split('/').last,
+            filePath: pathToSend,
+            fileName: encodedName ?? pathToSend.split('/').last,
           );
           if (_debugLog)
-            print('[Tim2ToxSdkPlatform] Sound message sent successfully');
+            print(
+                '[Tim2ToxSdkPlatform] Sound message sent successfully (pathToSend=$pathToSend, encodedName=${encodedName ?? "(none)"})');
         } else if (messageToSend.videoElem != null &&
             messageToSend.videoElem!.videoPath != null &&
             messageToSend.videoElem!.videoPath!.isNotEmpty) {
@@ -6108,6 +6300,20 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
 
       final message = foundMessages.data!.first;
 
+      // M-5: enforce a 2-minute revoke window. V2TimMessage.timestamp is in
+      // seconds. Treat a missing timestamp as 'recent enough'.
+      final tsSeconds = message.timestamp ?? 0;
+      if (tsSeconds > 0) {
+        final nowSeconds = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        final ageSeconds = nowSeconds - tsSeconds;
+        if (ageSeconds > 120) {
+          return V2TimCallback(
+            code: 7501,
+            desc: 'Message too old to revoke',
+          );
+        }
+      }
+
       // In Tox there is no native revoke; emulate it with a magic-prefix
       // text message (`__revoke__:<json>`) so a peer that understands the
       // protocol can delete its local copy too.
@@ -6119,10 +6325,10 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       //    the local revoke from succeeding.
       //
       // P0-11 (send side). Receive-side handling is implemented best-effort
-      // in `_maybeInterceptRevokeSignal` (called from incoming message
-      // pathways below). If the peer does not run a build with the
-      // intercept, the message will display as raw text — degraded but
-      // strictly better than silent drop.
+      // in `_maybeInterceptControlSignal` (called from `_setupMessageListener`).
+      // If the peer does not run a build with the intercept, the message
+      // will display as raw text — degraded but strictly better than
+      // silent drop.
 
       // Delete the message locally first so the sender sees the result
       // immediately even if the signal send fails.
@@ -6137,8 +6343,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       try {
         final String? peerUserID = message.userID;
         final String? peerGroupID = message.groupID;
+        // H-G: include the sender-side timestamp (ms) so the receiver
+        // can locate the matching history entry by sender + timestamp
+        // window when our msgID doesn't survive the wire trip.
+        final senderTimestampMs = (message.timestamp ?? 0) * 1000;
         final payload = '__revoke__:${json.encode({
               'msgID': msgID,
+              'senderTimestampMs': senderTimestampMs,
+              'fromUserId': ffiService.selfId,
             })}';
         if (peerUserID != null && peerUserID.isNotEmpty) {
           await ffiService.sendText(peerUserID, payload);
@@ -6166,38 +6378,173 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     }
   }
 
-  /// P0-11 receive-side handler.
+  /// Result of [_maybeInterceptControlSignal].
   ///
-  /// Inspect an incoming text payload; if it carries the `__revoke__:`
-  /// signaling prefix, locally delete the referenced message and fire
-  /// `onRecvMessageRevoked`. Returns true when the message was handled as a
-  /// revoke signal (caller should swallow it from the normal UI flow).
+  /// * [swallow] — caller must drop the message entirely (used for
+  ///   `__revoke__:` signals where the message should never reach UIKit).
+  /// * [rewriteText] / [rewriteCustomData] — when non-null, caller should
+  ///   patch the outgoing V2TimMessage so the UI bubble shows a friendly
+  ///   placeholder (e.g. "[Sticker]") and the original JSON travels in
+  ///   `customElem.data` for future rich rendering.
+  /// * [originalText] — the raw payload (kept for log/persistence purposes).
   ///
-  /// TODO(P0-11): wire this into the actual incoming text dispatch path
-  /// once the routing pipeline is stable. Today it's exported so
-  /// integrating code (Tim2ToxSdkPlatform receive handler, FakeChatMessageProvider
-  /// routing) can call it explicitly. Single-side implementation is
-  /// strictly better than silent drop.
-  Future<bool> _maybeInterceptRevokeSignal(String text) async {
-    if (!text.startsWith('__revoke__:')) return false;
-    try {
-      final payload = text.substring('__revoke__:'.length);
-      final parsed = json.decode(payload);
-      if (parsed is Map && parsed['msgID'] is String) {
-        final revokedID = parsed['msgID'] as String;
-        await deleteMessages(msgIDs: [revokedID]);
-        _notifyAdvancedMsgListeners((listener) {
-          listener.onRecvMessageRevoked?.call(revokedID);
-        });
-        return true;
+  /// Used by both the receive listener and the self-echo path to keep
+  /// `__revoke__:`/`__face__:`/`__custom__:`/`__location__:` prefixes from
+  /// ever showing up as raw JSON in chat bubbles.
+  ({
+    bool swallow,
+    String? rewriteText,
+    String? rewriteCustomData,
+    String? originalText,
+  }) _interceptResult({
+    bool swallow = false,
+    String? rewriteText,
+    String? rewriteCustomData,
+    String? originalText,
+  }) =>
+      (
+        swallow: swallow,
+        rewriteText: rewriteText,
+        rewriteCustomData: rewriteCustomData,
+        originalText: originalText,
+      );
+
+  /// P0-11 / R-3 / U-1 / U-2 receive-side handler.
+  ///
+  /// Inspect an incoming text payload for any of our magic-prefix control
+  /// signals. Handling is:
+  ///
+  /// * `__revoke__:{json}` → best-effort delete the referenced message from
+  ///   local history (by msgID if available, otherwise by sender + timestamp
+  ///   match within a 5 s window), fire `onRecvMessageRevoked`, and signal
+  ///   the caller to swallow the message entirely.
+  /// * `__face__:{json}` → keep the message in history but rewrite the
+  ///   bubble text to `[Sticker]` and stash the original JSON in
+  ///   `customElem.data` so a future renderer can pick it up.
+  /// * `__custom__:{json}` → same idea, bubble text becomes
+  ///   `[Custom Message]`.
+  /// * `__location__:{json}` → same idea, bubble text becomes `[Location]`.
+  ///
+  /// Returns a record describing what the caller should do.
+  Future<
+      ({
+        bool swallow,
+        String? rewriteText,
+        String? rewriteCustomData,
+        String? originalText,
+      })> _maybeInterceptControlSignal(ChatMessage chatMsg) async {
+    final text = chatMsg.text;
+    if (text.isEmpty) return _interceptResult();
+
+    // __revoke__: { msgID, senderTimestampMs?, fromUserId? }
+    if (text.startsWith('__revoke__:')) {
+      try {
+        final payload = text.substring('__revoke__:'.length);
+        final parsed = json.decode(payload);
+        if (parsed is Map) {
+          final revokedID = parsed['msgID'] as String?;
+          final senderTimestampMs = parsed['senderTimestampMs'] is int
+              ? parsed['senderTimestampMs'] as int
+              : null;
+
+          String? targetMsgID = revokedID;
+          // H-G: sender's msgID rarely matches the receiver's history
+          // msgID. Use sender + timestamp window to locate the actual
+          // entry in our history. Skipped for self-sent revoke signals
+          // (revokeMessage already deleted the sender's own copy).
+          if (!chatMsg.isSelf && senderTimestampMs != null) {
+            final senderUid = chatMsg.fromUserId;
+            final convId = chatMsg.groupId ?? senderUid;
+            try {
+              // Make sure we have history loaded for this conversation.
+              await ffiService.messageHistoryPersistence
+                  .loadHistory(convId);
+            } catch (_) {
+              // Best-effort: continue with whatever is in memory.
+            }
+            final history = ffiService.getHistory(convId);
+            // Walk the most recent 50 entries from this sender; pick the
+            // closest match within 5 s.
+            ChatMessage? best;
+            int bestDelta = 5000;
+            final recent = history.reversed.take(50);
+            for (final m in recent) {
+              if (m.fromUserId != senderUid) continue;
+              if (m.text.isEmpty) continue;
+              if (m.text.startsWith('__')) continue; // skip control msgs
+              final delta =
+                  (m.timestamp.millisecondsSinceEpoch - senderTimestampMs)
+                      .abs();
+              if (delta <= bestDelta && m.msgID != null) {
+                best = m;
+                bestDelta = delta;
+              }
+            }
+            if (best != null) {
+              targetMsgID = best.msgID;
+            }
+          }
+
+          if (targetMsgID != null && targetMsgID.isNotEmpty) {
+            try {
+              await deleteMessages(msgIDs: [targetMsgID]);
+            } catch (e) {
+              if (_debugLog) {
+                print(
+                    '[Tim2ToxSdkPlatform] _maybeInterceptControlSignal: revoke deleteMessages failed (swallowed): $e');
+              }
+            }
+            final notifyID = targetMsgID;
+            _notifyAdvancedMsgListeners((listener) {
+              listener.onRecvMessageRevoked?.call(notifyID);
+            });
+          } else if (_debugLog) {
+            print(
+                '[Tim2ToxSdkPlatform] _maybeInterceptControlSignal: revoke target not found, swallowing anyway');
+          }
+          return _interceptResult(swallow: true, originalText: text);
+        }
+      } catch (e) {
+        if (_debugLog) {
+          print(
+              '[Tim2ToxSdkPlatform] _maybeInterceptControlSignal: __revoke__ parse error: $e');
+        }
       }
-    } catch (e) {
-      if (_debugLog) {
-        print(
-            '[Tim2ToxSdkPlatform] _maybeInterceptRevokeSignal: parse error: $e');
-      }
+      // Parse failed: still swallow so we never show raw control text.
+      return _interceptResult(swallow: true, originalText: text);
     }
-    return false;
+
+    // __face__: { index, data } — keep message, show "[Sticker]" placeholder.
+    if (text.startsWith('__face__:')) {
+      final payload = text.substring('__face__:'.length);
+      return _interceptResult(
+        rewriteText: '[Sticker]',
+        rewriteCustomData: payload,
+        originalText: text,
+      );
+    }
+
+    // __location__: { desc, longitude, latitude } — show "[Location]".
+    if (text.startsWith('__location__:')) {
+      final payload = text.substring('__location__:'.length);
+      return _interceptResult(
+        rewriteText: '[Location]',
+        rewriteCustomData: payload,
+        originalText: text,
+      );
+    }
+
+    // __custom__: arbitrary JSON — show "[Custom Message]".
+    if (text.startsWith('__custom__:')) {
+      final payload = text.substring('__custom__:'.length);
+      return _interceptResult(
+        rewriteText: '[Custom Message]',
+        rewriteCustomData: payload,
+        originalText: text,
+      );
+    }
+
+    return _interceptResult();
   }
 
   @override

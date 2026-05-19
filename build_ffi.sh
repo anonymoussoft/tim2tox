@@ -7,8 +7,16 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
 FFI_BUILD_DIR="$BUILD_DIR/ffi"
-LIB_FILE="$FFI_BUILD_DIR/libtim2tox_ffi.dylib"
 FFI_SOURCE_DIR="$SCRIPT_DIR/ffi"
+
+# Cross-platform native library extension/prefix
+case "$OSTYPE" in
+  darwin*) LIB_EXT="dylib"; LIB_PREFIX="lib" ;;
+  linux*)  LIB_EXT="so"; LIB_PREFIX="lib" ;;
+  msys*|cygwin*|mingw*) LIB_EXT="dll"; LIB_PREFIX="" ;;
+  *) LIB_EXT="dylib"; LIB_PREFIX="lib" ;;
+esac
+LIB_FILE="$FFI_BUILD_DIR/${LIB_PREFIX}tim2tox_ffi.${LIB_EXT}"
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -109,7 +117,7 @@ if [[ "$NEEDS_BUILD" == "true" ]]; then
     
     # Build only the FFI library
     echo -e "${BLUE}Building tim2tox_ffi target...${NC}"
-    make -j$(sysctl -n hw.ncpu 2>/dev/null || echo 4) tim2tox_ffi
+    make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4) tim2tox_ffi
     
     if [[ -f "$LIB_FILE" ]]; then
         echo -e "${GREEN}✅ Successfully built libtim2tox_ffi.dylib${NC}"

@@ -557,7 +557,10 @@ class FfiChatService {
   static const int _imageAutoAcceptLimitBytes = 50 * 1024 * 1024; // 50 MiB
   // P1-7: How long a receive transfer can sit without a progress update
   // before we treat it as dead and clean it up.
-  static const Duration _fileTransferIdleTimeout = Duration(seconds: 60);
+  // P1-7 refined (H-D): 180s + at-least-one-chunk heuristic. Tox onion
+  // path rebuilds and legitimate "long pauses" can approach 60s; the old
+  // window killed perfectly healthy transfers on flaky networks.
+  static const Duration _fileTransferIdleTimeout = Duration(seconds: 180);
   final Map<String, (String, int)> _progressKeyCache =
       {}; // path -> (uid, fileNumber) cache for fast lookup
   DateTime? _lastPollActivity; // Track last activity time for adaptive polling
@@ -1862,9 +1865,22 @@ class FfiChatService {
                 final sent = int.tryParse(parts[2]) ?? 0;
                 final tot = int.tryParse(parts[3]) ?? 0;
                 final path = _lastSentPathByPeer[uid];
-                // Find msgID for this send path
-                String? sendMsgID = path != null ? _pathToMsgID[path] : null;
-                // If not found in path mapping, try to find from last message for this peer
+                // Find msgID for this send path.
+                // R-1: prefer the precise per-msgID reverse map first — it
+                // is populated on every send and is immune to the
+                // "concurrent send to same peer overwrites _lastSentPathByPeer"
+                // race that the legacy path-based lookup has.
+                String? sendMsgID;
+                if (path != null) {
+                  for (final e in _msgIDToSentPath.entries) {
+                    if (e.value == path) {
+                      sendMsgID = e.key;
+                      break;
+                    }
+                  }
+                  sendMsgID ??= _pathToMsgID[path];
+                }
+                // If still not found, try to find from last message for this peer.
                 if (sendMsgID == null && path != null) {
                   final normalizedUid =
                       uid.length > 64 ? _normalizeFriendId(uid) : uid;
@@ -2737,6 +2753,11 @@ class FfiChatService {
           if (finalPath.isEmpty) {
             _logger?.log(
                 '[FfiChatService] _handleFileDone: finalPath is empty (transfer failed earlier), aborting history update');
+            // R-4: release the dedupe slot on this failure path — without
+            // this, the same processingKey is stuck in the set forever and
+            // a legitimate retry of the same (uid,path) gets dropped as a
+            // duplicate.
+            _processingFileDone.remove(processingKey);
             return;
           }
           // Verify file exists before updating message
@@ -3947,9 +3968,20 @@ class FfiChatService {
       final sent = parts.isNotEmpty ? int.tryParse(parts[0]) ?? 0 : 0;
       final tot = parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0;
       final path = _lastSentPathByPeer[sender];
-      // Find msgID for this send path
-      String? sendMsgID = path != null ? _pathToMsgID[path] : null;
-      // If not found in path mapping, try to find from last message for this peer
+      // Find msgID for this send path.
+      // R-1: prefer the precise per-msgID reverse map first (see
+      // progress_send polling branch above for the rationale).
+      String? sendMsgID;
+      if (path != null) {
+        for (final e in _msgIDToSentPath.entries) {
+          if (e.value == path) {
+            sendMsgID = e.key;
+            break;
+          }
+        }
+        sendMsgID ??= _pathToMsgID[path];
+      }
+      // If still not found, try to find from last message for this peer.
       if (sendMsgID == null && path != null) {
         final normalizedSender =
             sender.length > 64 ? _normalizeFriendId(sender) : sender;
@@ -5081,6 +5113,76 @@ class FfiChatService {
         'File transfer in group chats is not supported. Please send files in a private chat.');
   }
 
+  /// H-B: tox_file_send caps the filename at 255 UTF-8 bytes. Multi-byte
+  /// names (Chinese, emoji, …) hit the limit at ~85 chars and the C side
+  /// silently rejects the transfer. Truncate to [maxBytes] UTF-8 bytes
+  /// while preserving the file extension and snapping to a valid UTF-8
+  /// boundary so the resulting name is still well-formed.
+  String _truncateFileNameForTox(String name, {int maxBytes = 250}) {
+    final bytes = utf8.encode(name);
+    if (bytes.length <= maxBytes) return name;
+    final ext = p.extension(name); // includes leading dot, e.g. ".jpg"
+    final extBytes = utf8.encode(ext).length;
+    final base = p.basenameWithoutExtension(name);
+    final baseBudget = maxBytes - extBytes;
+    if (baseBudget <= 0) {
+      // Pathological case: extension alone exceeds the budget. Drop the
+      // extension and truncate the base by bytes.
+      int lo = 0, hi = base.length;
+      while (lo < hi) {
+        final mid = (lo + hi + 1) >> 1;
+        if (utf8.encode(base.substring(0, mid)).length <= maxBytes) {
+          lo = mid;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      return base.substring(0, lo);
+    }
+    // Binary search the longest character prefix of [base] whose UTF-8
+    // encoding fits in [baseBudget] bytes.
+    int lo = 0, hi = base.length;
+    while (lo < hi) {
+      final mid = (lo + hi + 1) >> 1;
+      if (utf8.encode(base.substring(0, mid)).length <= baseBudget) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return base.substring(0, lo) + ext;
+  }
+
+  /// H-B: when [originalPath]'s basename is too long for tox, materialise
+  /// a symlink (or a fallback copy) under a temp dir whose name is the
+  /// truncated form. Returns the path the FFI layer should send. The
+  /// caller is responsible for cleaning up the temp entry — we currently
+  /// rely on the OS temp-dir reaper since the transfer outlives the call.
+  Future<String> _materializeSafeSendPath(String originalPath) async {
+    final basename = p.basename(originalPath);
+    final safeName = _truncateFileNameForTox(basename);
+    if (safeName == basename) return originalPath;
+    try {
+      final dir = await Directory.systemTemp.createTemp('tim2tox_send_');
+      final linkPath = p.join(dir.path, safeName);
+      try {
+        await Link(linkPath).create(originalPath);
+        return linkPath;
+      } catch (_) {
+        // Symlink creation failed (Windows w/o privileges, FUSE mounts,
+        // etc.). Fall back to a copy so the send still succeeds.
+        await File(originalPath).copy(linkPath);
+        return linkPath;
+      }
+    } catch (e, st) {
+      _logger?.logError(
+          '[FfiChatService] _materializeSafeSendPath: failed to materialise truncated-name path for $originalPath; falling back to original path',
+          e,
+          st);
+      return originalPath;
+    }
+  }
+
   Future<void> sendFile(
     String peerId,
     String filePath, {
@@ -5113,9 +5215,15 @@ class FfiChatService {
       throw Exception('Friend is offline. Cannot send file.');
     }
 
+    // H-B: if the basename exceeds tox's 255-UTF-8-byte filename limit,
+    // hand the FFI a symlink/copy with a safely-truncated name. The
+    // history record below still uses the original [filePath] so the UI
+    // and on-disk references stay intact.
+    final effectiveSendPath = await _materializeSafeSendPath(filePath);
+
     // Friend is online - send immediately
     final pto = normalizedPeerId.toNativeUtf8();
-    final pfp = filePath.toNativeUtf8();
+    final pfp = effectiveSendPath.toNativeUtf8();
     final result = _ffi.sendFileNative(_ffi.getCurrentInstanceId(), pto, pfp);
     pkgffi.malloc.free(pto);
     pkgffi.malloc.free(pfp);
@@ -5158,10 +5266,11 @@ class FfiChatService {
     _lastByPeer[normalizedPeerId] = out;
     // remember last sent path and msgID for progress correlation
     _lastSentPathByPeer[normalizedPeerId] = filePath;
-    // Store msgID for this path to enable progress matching
-    if (!_pathToMsgID.containsKey(filePath)) {
-      _pathToMsgID[filePath] = msgID;
-    }
+    // Store msgID for this path to enable progress matching.
+    // R-2: always overwrite — the freshest send wins. The old containsKey
+    // guard meant a second send of the same file routed progress to the
+    // first (now-completed) msgID.
+    _pathToMsgID[filePath] = msgID;
     // P2-23: precise per-message reverse lookup. _lastSentPathByPeer is a
     // single-slot map keyed by peer, so back-to-back concurrent sends to
     // the same peer overwrite each other and the progress_send handler
@@ -6132,7 +6241,16 @@ class FfiChatService {
               final updated = m.copyWith(isPending: false, filePath: '');
               history[i] = updated;
               _messages.add(updated);
-              unawaited(_saveHistory(normalizedUid).catchError((_) {}));
+              // H-F: do not silently swallow save errors — at least leave
+              // a trail so the failure isn't invisible. The unawaited()
+              // is intentional; we don't want to block the caller on disk
+              // I/O, but we still want a log if the write blew up.
+              unawaited(_saveHistory(normalizedUid).catchError((e, st) {
+                _logger?.logError(
+                    '[FfiChatService] _markFileTransferFailed: history save failed for $normalizedUid',
+                    e,
+                    st);
+              }));
               break;
             }
           }
@@ -6211,6 +6329,11 @@ class FfiChatService {
 
   /// P1-7: Walk in-flight receives and treat ones with no progress update in
   /// [_fileTransferIdleTimeout] as dead. Called from the poll loop.
+  /// P1-7 refined (H-D): 180s + at-least-one-chunk heuristic. We only
+  /// declare a transfer dead if we've already seen *some* progress on it
+  /// — a transfer that's been pending with zero bytes received is more
+  /// likely a peer that hasn't started yet (still establishing the onion
+  /// path, queued behind another transfer, etc.) than a wedged one.
   void _checkFileTransferTimeouts() {
     if (_fileReceiveProgress.isEmpty) return;
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -6226,7 +6349,17 @@ class FfiChatService {
         _lastProgressTs[key] = now;
         continue;
       }
-      if (ts < cutoff) stale.add(key);
+      if (ts < cutoff) {
+        // H-D: only cull transfers that have actually started receiving
+        // bytes. Zero-progress transfers are noisy at startup and on
+        // flaky networks — log them but leave them alone.
+        if (entry.value.received <= 0) {
+          _logger?.log(
+              '[FfiChatService] _checkFileTransferTimeouts: idle but zero-progress uid=${key.$1} fileNumber=${key.$2} — leaving alone (H-D heuristic)');
+          continue;
+        }
+        stale.add(key);
+      }
     }
     for (final key in stale) {
       _logger?.log(
@@ -6321,6 +6454,33 @@ class FfiChatService {
                 await ent.delete();
               } catch (_) {}
             }
+          }
+          // H-E: detect orphan *complete* files — files that the C layer
+          // finished writing under a non-`receiving_` name but for which
+          // we never recorded a history entry (Dart crashed mid-handoff,
+          // _handleFileDone never ran, etc.). Synthesizing a history row
+          // here requires sender/msgID/timestamp metadata we don't have
+          // post-crash, so for now we only log + leave the file in place.
+          // Auto-deleting user data here would be worse than the leak.
+          // TODO(H-E): synthesize history entry from any available
+          // _fileReceiveProgress remnants persisted on disk.
+          try {
+            await for (final ent in dir.list(followLinks: false)) {
+              if (ent is! File) continue;
+              final basename = p.basename(ent.path);
+              if (basename.startsWith('receiving_')) continue;
+              int size = -1;
+              try {
+                size = await ent.length();
+              } catch (_) {}
+              _logger?.log(
+                  '[FfiChatService] orphan file in file_recv/: ${ent.path} (size=$size) — TODO(H-E) synthesize history entry');
+            }
+          } catch (e, st) {
+            _logger?.logError(
+                '[FfiChatService] _cancelPendingFileTransfers: H-E orphan scan failed for recvDir=$recvDir',
+                e,
+                st);
           }
         }
       } catch (e, st) {

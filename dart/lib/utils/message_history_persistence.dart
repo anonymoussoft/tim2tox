@@ -145,16 +145,23 @@ class MessageHistoryPersistence {
   
   /// Cached per-process storage-root lookup so we don't hit
   /// path_provider on every load/save.
-  ({String? appSupport, String? documents})? _storageRootsCache;
+  ({String? appSupport, String? documents, String? userDownloads})?
+      _storageRootsCache;
 
-  /// P1-15 helper. Resolves and caches the two storage roots we
-  /// relativize against: AppSupport (where file_recv lives) and Documents
-  /// (where Downloads lives on desktop). Returns null parts when the
-  /// platform does not expose the corresponding directory.
-  Future<({String? appSupport, String? documents})> _resolveStorageRoots() async {
+  /// P1-15 helper. Resolves and caches the storage roots we relativize
+  /// against:
+  ///   - AppSupport (where file_recv lives)
+  ///   - Documents (where Downloads lives on some desktop platforms)
+  ///   - userDownloads (R-5: the OS-level user Downloads dir, e.g. ~/Downloads
+  ///     on macOS — this is *not* under Documents).
+  /// Returns null parts when the platform does not expose the corresponding
+  /// directory.
+  Future<({String? appSupport, String? documents, String? userDownloads})>
+      _resolveStorageRoots() async {
     if (_storageRootsCache != null) return _storageRootsCache!;
     String? appSupport;
     String? documents;
+    String? userDownloads;
     try {
       final dir = await getApplicationSupportDirectory();
       appSupport = dir.path;
@@ -167,7 +174,25 @@ class MessageHistoryPersistence {
     } catch (_) {
       // Best-effort.
     }
-    final roots = (appSupport: appSupport, documents: documents);
+    try {
+      // R-5: macOS' ~/Downloads (and the analogous user-level Downloads
+      // dir on other platforms) is the real default landing spot for
+      // received files but lives outside the Documents tree, so the old
+      // {{downloads}} placeholder only matched a niche `documents/Downloads/`
+      // subdir. Add a dedicated placeholder so cross-device / reinstall
+      // history continues to resolve.
+      final dir = await getDownloadsDirectory();
+      if (dir != null) {
+        userDownloads = dir.path;
+      }
+    } catch (_) {
+      // Best-effort; getDownloadsDirectory is not implemented everywhere.
+    }
+    final roots = (
+      appSupport: appSupport,
+      documents: documents,
+      userDownloads: userDownloads,
+    );
     _storageRootsCache = roots;
     return roots;
   }
@@ -176,9 +201,11 @@ class MessageHistoryPersistence {
   /// placeholder token. Unknown paths are returned unchanged so legacy
   /// rows continue to round-trip.
   String _relativizePath(
-      String absolutePath, ({String? appSupport, String? documents}) roots) {
+      String absolutePath,
+      ({String? appSupport, String? documents, String? userDownloads}) roots) {
     final appSupport = roots.appSupport;
     final documents = roots.documents;
+    final userDownloads = roots.userDownloads;
     if (appSupport != null && absolutePath.startsWith('$appSupport/file_recv/')) {
       final tail = absolutePath.substring('$appSupport/file_recv/'.length);
       return '{{fileRecv}}/$tail';
@@ -187,9 +214,17 @@ class MessageHistoryPersistence {
       final tail = absolutePath.substring('$appSupport/avatars/'.length);
       return '{{avatars}}/$tail';
     }
+    // R-5: keep the precise `documents/Downloads/` match BEFORE the
+    // broader userDownloads check. On platforms where the user-level
+    // Downloads dir happens to coincide with documents/Downloads/, we'd
+    // otherwise emit the same path under two different placeholders.
     if (documents != null && absolutePath.startsWith('$documents/Downloads/')) {
       final tail = absolutePath.substring('$documents/Downloads/'.length);
       return '{{downloads}}/$tail';
+    }
+    if (userDownloads != null && absolutePath.startsWith('$userDownloads/')) {
+      final tail = absolutePath.substring('$userDownloads/'.length);
+      return '{{userDownloads}}/$tail';
     }
     return absolutePath;
   }
@@ -198,9 +233,11 @@ class MessageHistoryPersistence {
   /// substituted with the current device's storage roots; absolute paths
   /// (legacy v1 entries) are returned unchanged.
   String _resolvePath(
-      String storedPath, ({String? appSupport, String? documents}) roots) {
+      String storedPath,
+      ({String? appSupport, String? documents, String? userDownloads}) roots) {
     final appSupport = roots.appSupport;
     final documents = roots.documents;
+    final userDownloads = roots.userDownloads;
     if (storedPath.startsWith('{{fileRecv}}/') && appSupport != null) {
       return '$appSupport/file_recv/${storedPath.substring('{{fileRecv}}/'.length)}';
     }
@@ -209,6 +246,12 @@ class MessageHistoryPersistence {
     }
     if (storedPath.startsWith('{{downloads}}/') && documents != null) {
       return '$documents/Downloads/${storedPath.substring('{{downloads}}/'.length)}';
+    }
+    // R-5: rehydrate the new userDownloads placeholder. Schema version
+    // stays at 2 — older v2 files simply don't contain the token, and
+    // unknown placeholders fall through to the unchanged-string return.
+    if (storedPath.startsWith('{{userDownloads}}/') && userDownloads != null) {
+      return '$userDownloads/${storedPath.substring('{{userDownloads}}/'.length)}';
     }
     return storedPath;
   }
