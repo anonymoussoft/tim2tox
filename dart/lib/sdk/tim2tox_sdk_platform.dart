@@ -4917,11 +4917,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         } catch (e) {}
       }
 
-      // Filter messages based on criteria
-      // IMPORTANT: Sort history by timestamp descending (newest first, oldest last)
-      // This matches the internal storage format in TencentCloudChatMessageData
+      // Filter + sort history.
+      //
+      // Performance (P4 in `local-storage-review-2026-05-18.md`): the previous
+      // implementation called `.sort()` three times — once up front, then again
+      // after each `where(...).toList()`. Filtering preserves relative order,
+      // so a single sort after both filters have run is correct and O(n log n)
+      // instead of O(3·n log n). For 1k-message conversations on a cold open
+      // this used to dominate `getHistoryMessageListV2`'s wall time.
       List<ChatMessage> filteredHistory = List.from(history);
-      filteredHistory.sort((a, b) => b.timestamp.compareTo(a.timestamp));
 
       // Filter by message type if specified
       if (messageTypeList != null && messageTypeList.isNotEmpty) {
@@ -4938,8 +4942,6 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
           return messageTypeList.contains(msgType);
         }).toList();
-        // Re-sort after filtering to maintain descending order
-        filteredHistory.sort((a, b) => b.timestamp.compareTo(a.timestamp));
       }
 
       // Filter by time range if specified
@@ -4949,9 +4951,12 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           final msgTime = msg.timestamp.millisecondsSinceEpoch ~/ 1000;
           return msgTime >= timeBegin && msgTime <= timeEnd;
         }).toList();
-        // Re-sort after filtering to maintain descending order
-        filteredHistory.sort((a, b) => b.timestamp.compareTo(a.timestamp));
       }
+
+      // Sort once, descending (newest first, oldest last) — matches the
+      // internal storage format in TencentCloudChatMessageData and is required
+      // for the pagination logic below.
+      filteredHistory.sort((a, b) => b.timestamp.compareTo(a.timestamp));
 
       // CRITICAL: Keep descending order (newest first, oldest last)
       // This is required for correct pagination logic below
@@ -5120,7 +5125,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   }
 
   /// Ensure message has necessary download info (imageList with uuid/url for images, UUID/url for files)
-  V2TimMessage _ensureDownloadInfo(V2TimMessage msg) {
+  ///
+  /// Performance (P5 in `local-storage-review-2026-05-18.md`): file size and
+  /// existence checks are async (`File.length()` / `File.exists()`) so the UI
+  /// isolate doesn't block on a synchronous `stat()` per message while the
+  /// page is being built. The previous `existsSync` + `lengthSync` pair was
+  /// hot in `getHistoryMessageListV2`'s response path.
+  Future<V2TimMessage> _ensureDownloadInfo(V2TimMessage msg) async {
     final msgID = msg.msgID ?? msg.id ?? '';
     if (msgID.isEmpty) return msg;
 
@@ -5151,8 +5162,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         int? fileSize;
         try {
           final file = File(imagePath);
-          if (file.existsSync()) {
-            fileSize = file.lengthSync();
+          if (await file.exists()) {
+            fileSize = await file.length();
           }
         } catch (e) {
           // Ignore file size errors
@@ -5206,8 +5217,8 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           if (fileSize == null) {
             try {
               final file = File(filePath);
-              if (file.existsSync()) {
-                fileSize = file.lengthSync();
+              if (await file.exists()) {
+                fileSize = await file.length();
               }
             } catch (e) {
               // Ignore file size errors
@@ -5383,7 +5394,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               forwardTargetGroupID: isGroup ? peerId : null,
             );
             // Ensure download info is set
-            final fixedMsg = _ensureDownloadInfo(v2Msg);
+            final fixedMsg = await _ensureDownloadInfo(v2Msg);
             // Required for deleteMessagesForMe/revokeMessage: native adapter rejects messages without userID/groupID
             if ((fixedMsg.userID == null || fixedMsg.userID!.isEmpty) &&
                 (fixedMsg.groupID == null || fixedMsg.groupID!.isEmpty)) {
@@ -5517,7 +5528,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 print(
                     '[Tim2ToxSdkPlatform] Found message $msgID in messageData for conversation $targetID');
                 // Ensure download info is set before adding
-                final fixedMsg = _ensureDownloadInfo(found);
+                final fixedMsg = await _ensureDownloadInfo(found);
                 // Required for deleteMessagesForMe/revokeMessage: ensure userID/groupID from conversation
                 if ((fixedMsg.userID == null || fixedMsg.userID!.isEmpty) &&
                     (fixedMsg.groupID == null || fixedMsg.groupID!.isEmpty)) {
@@ -6255,9 +6266,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required int type,
   }) async {
     try {
-      // Refuse friend application - in Tox, we just don't accept it
-      // There's no explicit refuse, so we'll just return success
-      // The application will remain in the list until manually deleted
+      // Tox has no native "refuse" RPC; persist the dismissal locally so the
+      // entry stops reappearing on every 5s poll and across restarts.
+      await ffiService.refuseFriendApplication(userID);
       return V2TimValueCallback<V2TimFriendOperationResult>(
         code: 0,
         desc: 'success',
@@ -6284,12 +6295,71 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     String? friendRemark,
     Map<String, String>? friendCustomInfo,
   }) async {
-    // Friend info is stored locally, not in FfiChatService
-    // For now, just return success
-    return V2TimCallback(
-      code: 0,
-      desc: 'success',
-    );
+    try {
+      final prefs = _prefs;
+
+      // friendRemark requested but no preferences service available — the
+      // caller's data is being dropped. Surface this as a real failure
+      // instead of returning code:0 (which previously made integrators see
+      // "success" while nothing was written).
+      if (friendRemark != null && prefs == null) {
+        _log(
+          '[Tim2ToxSdkPlatform] setFriendInfo: no preferences service '
+          'attached — dropping friendRemark for $userID. Caller should '
+          'inject ExtendedPreferencesService via the Tim2ToxSdkPlatform '
+          'constructor or FfiChatService.preferencesService.',
+        );
+        return V2TimCallback(
+          code: -1,
+          desc:
+              'setFriendInfo: no preferences service available, friendRemark not persisted',
+        );
+      }
+
+      if (prefs != null && friendRemark != null) {
+        // Persist via the typed [ExtendedPreferencesService.setFriendRemark]
+        // so the host adapter applies its per-account scoping (toxee scopes
+        // by the current Tox-ID prefix). The matching read in
+        // `fakeUserToV2TimFriendInfo` calls `getFriendRemark` against the
+        // same scope, which is how the alias becomes visible across the
+        // contact list, search, and chat headers — not just the editing UI's
+        // ephemeral state.
+        await prefs.setFriendRemark(userID, friendRemark);
+      }
+
+      // TODO(tim2tox): `friendCustomInfo` requires a structured per-friend
+      // map in `ExtendedPreferencesService`. Until that lands, log a warning
+      // when callers pass it so the silent-drop is visible. UIKit's profile
+      // page does not call this with custom info today, so the warning is
+      // effectively a tripwire for a future contract change.
+      if (friendCustomInfo != null && friendCustomInfo.isNotEmpty) {
+        _log(
+          '[Tim2ToxSdkPlatform] setFriendInfo: friendCustomInfo is not yet '
+          'implemented — dropping ${friendCustomInfo.length} key(s) for '
+          '$userID. If the host UI starts relying on this, wire it through '
+          'ExtendedPreferencesService.',
+        );
+        // If the caller only asked for customInfo (no remark), they got
+        // nothing — return failure rather than pretending it worked.
+        if (friendRemark == null) {
+          return V2TimCallback(
+            code: -1,
+            desc:
+                'setFriendInfo: friendCustomInfo not supported, no remark provided',
+          );
+        }
+      }
+
+      return V2TimCallback(
+        code: 0,
+        desc: 'success',
+      );
+    } catch (e) {
+      return V2TimCallback(
+        code: -1,
+        desc: 'setFriendInfo failed: $e',
+      );
+    }
   }
 
   @override
@@ -6298,9 +6368,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     required String userID,
   }) async {
     try {
-      // Delete friend application - in Tox, we just remove it from the list
-      // For now, just return success
-      // The application will be removed from the list when it's accepted or refused
+      // Same path as refuse — the V2TIM API distinguishes the two for IM
+      // analytics, but for Tox both mean "drop it from the local queue".
+      await ffiService.deleteFriendApplication(userID);
       return V2TimCallback(
         code: 0,
         desc: 'success',

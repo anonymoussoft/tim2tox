@@ -278,6 +278,57 @@ final _ircUserJoinPartCbPtr =
     ffi.Pointer.fromFunction<_irc_user_join_part_callback_native>(
         _ircUserJoinPartTrampoline);
 
+/// Resolves on-disk paths for [FfiChatService] without coupling tim2tox to
+/// any particular client (toxee, examples, auto_tests). When an integrator
+/// wants paths routed through its own central path authority (e.g. toxee's
+/// `AppPaths`), it implements this and passes it to the constructor.
+///
+/// Implementations must return **non-empty absolute directory paths**. The
+/// caller will create the directory if it does not exist. Returning a
+/// relative path, empty string, or null is a contract violation and triggers
+/// an [ArgumentError] — this guards against path-traversal-shaped bugs (e.g.
+/// `"../../etc"`) and silent fall-through to a misconfigured default.
+///
+/// Returning the [FfiChatPathResolver] argument as null (or omitting the
+/// parameter entirely) makes [FfiChatService] fall back to its built-in
+/// `getApplicationSupportDirectory()` defaults, so this stays optional for
+/// tim2tox standalone tests.
+///
+/// Note for integrators upgrading from the legacy `_fileRecvPath` /
+/// `_avatarsPath` constructor parameters: existing on-disk files at the old
+/// location are **not** migrated automatically when a resolver is introduced.
+/// If the resolver returns a different directory, surface the migration in
+/// the integrator's account/bootstrap layer.
+abstract class FfiChatPathResolver {
+  /// Directory where tox file_recv puts incoming file transfers.
+  /// Default fallback: `<appSupport>/file_recv`.
+  Future<String> resolveFileRecvDirectory();
+
+  /// Directory where the service places avatar images it has copied.
+  /// Default fallback: `<appSupport>/avatars`.
+  Future<String> resolveAvatarsDirectory();
+}
+
+/// Validate a resolver-returned directory path. Throws [ArgumentError] if the
+/// returned path is empty or not absolute — both are contract violations of
+/// [FfiChatPathResolver]. Returns [path] unchanged on success.
+String _assertResolverPath(String path, String which) {
+  if (path.isEmpty) {
+    throw ArgumentError(
+      'FfiChatPathResolver.$which returned an empty string; '
+      'must be a non-empty absolute directory path.',
+    );
+  }
+  // p.isAbsolute is platform-aware and handles both POSIX and Windows roots.
+  if (!p.isAbsolute(path)) {
+    throw ArgumentError(
+      'FfiChatPathResolver.$which returned a non-absolute path "$path"; '
+      'must be an absolute directory path (e.g. /Users/.../foo or C:\\foo).',
+    );
+  }
+  return path;
+}
+
 class FfiChatService {
   // Static counter for msgID sequence to ensure uniqueness
   static int _msgIDSequence = 0;
@@ -321,20 +372,28 @@ class FfiChatService {
     String? queueFilePath,
     String? fileRecvPath,
     String? avatarsPath,
+    FfiChatPathResolver? pathResolver,
   })  : _ffi = Tim2ToxFfi.open(),
         _prefs = preferencesService,
         _logger = loggerService,
         _bootstrap = bootstrapService,
+        // X11: forward the injected logger so the no-historyDirectory
+        // warning emitted from MessageHistoryPersistence's constructor lands
+        // in the integrator's structured log rather than just stderr.
         _messageHistoryPersistence = messageHistoryPersistence ??
             (historyDirectory != null && historyDirectory.isNotEmpty
-                ? MessageHistoryPersistence(historyDirectory: historyDirectory)
-                : _createMessageHistoryPersistence()),
+                ? MessageHistoryPersistence(
+                    historyDirectory: historyDirectory,
+                    logger: loggerService,
+                  )
+                : _createMessageHistoryPersistence(logger: loggerService)),
         _offlineQueuePersistence = offlineMessageQueuePersistence ??
             (queueFilePath != null && queueFilePath.isNotEmpty
                 ? OfflineMessageQueuePersistence(queueFilePath: queueFilePath)
                 : OfflineMessageQueuePersistence()),
         _fileRecvPath = fileRecvPath,
-        _avatarsPath = avatarsPath {
+        _avatarsPath = avatarsPath,
+        _pathResolver = pathResolver {
     try {
       final id = _ffi.getCurrentInstanceId();
       if (id != 0) _instanceId = id;
@@ -342,16 +401,19 @@ class FfiChatService {
   }
 
   /// Create MessageHistoryPersistence with instance ID support
-  static MessageHistoryPersistence _createMessageHistoryPersistence() {
+  static MessageHistoryPersistence _createMessageHistoryPersistence(
+      {LoggerService? logger}) {
     try {
       final ffi = Tim2ToxFfi.open();
       final instanceId = ffi.getCurrentInstanceId();
       // Use instanceId if it's not 0 (default instance), otherwise use null
       return MessageHistoryPersistence(
-          instanceId: instanceId != 0 ? instanceId : null);
+        instanceId: instanceId != 0 ? instanceId : null,
+        logger: logger,
+      );
     } catch (e) {
       // If we can't get instance ID, create without it (will use default directory)
-      return MessageHistoryPersistence();
+      return MessageHistoryPersistence(logger: logger);
     }
   }
 
@@ -367,6 +429,12 @@ class FfiChatService {
 
   /// Per-account avatars directory (when set, used instead of app support avatars).
   final String? _avatarsPath;
+
+  /// Optional path resolver injected by the integrating client. When set,
+  /// overrides the `getApplicationSupportDirectory()` defaults used for
+  /// file_recv / avatars fallbacks. Lets toxee route these through `AppPaths`
+  /// without tim2tox depending on toxee (X6 from the 2026-05-18 review).
+  final FfiChatPathResolver? _pathResolver;
 
   /// Expose FFI instance for ToxAVService creation (named to avoid shadowing dart:ffi)
   Tim2ToxFfi get tim2toxFfi => _ffi;
@@ -414,35 +482,20 @@ class FfiChatService {
 
   /// Periodic save of tox_profile.tox to reduce data loss on crash (every 60s when running).
   Timer? _profileSaveTimer;
-  // Keep _historyById for backward compatibility and direct access
-  // Use internal map that syncs with MessageHistoryPersistence
-  // Initialize from persistence service cache on first access
-  Map<String, List<ChatMessage>> _historyByIdInternal = {};
-  Map<String, List<ChatMessage>> get _historyById {
-    // Sync with persistence service cache if internal map is empty
-    // CRITICAL: Only sync if internal map is empty AND persistence cache is not empty
-    // This prevents re-loading cleared history from persistence cache
-    if (_historyByIdInternal.isEmpty &&
-        _messageHistoryPersistence.cache.isNotEmpty) {
-      _historyByIdInternal = Map.from(_messageHistoryPersistence.cache);
-    }
-    return _historyByIdInternal;
-  }
-
-  // Sync internal map to persistence service
-  Future<void> _syncHistoryToPersistence(String id) async {
-    final list = _historyByIdInternal[id];
-    if (list != null) {
-      await _messageHistoryPersistence.saveHistory(id, list);
-    }
-  }
-
-  // Sync all histories to persistence service
-  Future<void> _syncAllHistoriesToPersistence() async {
-    for (final entry in _historyByIdInternal.entries) {
-      await _messageHistoryPersistence.saveHistory(entry.key, entry.value);
-    }
-  }
+  // ---- X4 in-memory history cache (single source of truth) ----
+  //
+  // Previously this class kept its own `_historyByIdInternal` map and lazily
+  // merged from MessageHistoryPersistence's cache, which let the two drift.
+  // We now treat MessageHistoryPersistence as the sole owner of the in-memory
+  // map and route all reads/writes through it.
+  //
+  // `_historyById` is kept as a private shim that returns the persistence
+  // cache as a Map<String, List<ChatMessage>> view. Each contained list is
+  // the persistence layer's actual mutable list (mutations are observable
+  // through getHistory/cache). External callers should prefer
+  // `getHistory(id)` for defensive-copy reads.
+  Map<String, List<ChatMessage>> get _historyById =>
+      _messageHistoryPersistence.cache;
 
   String _selfId = '';
   String get selfId => _selfId;
@@ -832,7 +885,7 @@ class FfiChatService {
 
   // Save message history for a conversation (delegate to persistence service)
   Future<void> _saveHistory(String id) async {
-    final list = _historyById[id];
+    final list = _messageHistoryPersistence.getCachedList(id);
     if (list != null && list.isNotEmpty) {
       await _messageHistoryPersistence.saveHistory(id, list);
     }
@@ -844,9 +897,8 @@ class FfiChatService {
     final messages = await _messageHistoryPersistence.loadHistory(id,
         quitGroups: quitGroups);
     if (messages.isNotEmpty) {
-      // Update internal map
-      _historyByIdInternal[id] = messages;
-      // Update lastMessages with the most recent message from history
+      // Persistence already owns the in-memory list; we only need to refresh
+      // conversation-preview state here.
       messages.sort((a, b) => b.timestamp.compareTo(a.timestamp));
       final lastMsg = messages.first;
       _lastByPeer[id] = lastMsg;
@@ -860,9 +912,9 @@ class FfiChatService {
       final allHistories = await _messageHistoryPersistence.loadAllHistories(
           quitGroups: quitGroups);
 
-      // Update internal map
-      _historyByIdInternal.clear();
-      _historyByIdInternal.addAll(allHistories);
+      // Persistence already owns the in-memory map (each `loadHistory` call
+      // inside `loadAllHistories` populates `_historyById` directly); we only
+      // need to refresh conversation-preview state here.
 
       // Update lastMessages with the most recent message from each history
       for (final entry in allHistories.entries) {
@@ -916,11 +968,17 @@ class FfiChatService {
     } else {
       _ffi.init();
     }
-    // Set file receive directory: per-account when _fileRecvPath is set, else app support file_recv
+    // Set file receive directory: per-account when _fileRecvPath is set, else
+    // ask the injected resolver (X6), else fall back to app support file_recv.
     try {
       final String recvPath;
       if (_fileRecvPath != null && _fileRecvPath!.isNotEmpty) {
         recvPath = _fileRecvPath!;
+      } else if (_pathResolver != null) {
+        recvPath = _assertResolverPath(
+          await _pathResolver!.resolveFileRecvDirectory(),
+          'resolveFileRecvDirectory',
+        );
       } else {
         final appDir = await getApplicationSupportDirectory();
         recvPath = '${appDir.path}/file_recv';
@@ -2691,14 +2749,21 @@ class FfiChatService {
             if (existingMsgID != null) {
               _logger?.log(
                   '[FfiChatService] _handleFileDone: Found existing message, msgID=$existingMsgID');
-              // Use normalized ID for consistency
-              var history = _historyById[normalizedUid];
+              // Use normalized ID for consistency. Persistence normalizes
+              // internally; the legacy-uid fallback is preserved for callers
+              // that may still query by raw id during the same tick.
+              var history = _messageHistoryPersistence.getCachedList(normalizedUid);
               if (history == null && uid != normalizedUid) {
-                history = _historyById[uid];
+                history = _messageHistoryPersistence.getCachedList(uid);
                 // Migrate to normalized ID if found with original ID
                 if (history != null && history.isNotEmpty) {
-                  _historyById[normalizedUid] = history;
-                  _historyById.remove(uid);
+                  _messageHistoryPersistence.setCachedHistory(
+                      normalizedUid, history);
+                  _messageHistoryPersistence.removeCachedHistory(uid);
+                  // Re-fetch the now-canonical list so mutations land in the
+                  // persistence-owned instance (setCachedHistory copies).
+                  history = _messageHistoryPersistence
+                      .getCachedList(normalizedUid);
                 }
               }
               _logger?.log(
@@ -2892,14 +2957,16 @@ class FfiChatService {
             if (existingMsgID != null) {
               _logger?.log(
                   '[FfiChatService] _handleFileDone: Found existing message (file doesn\'t exist), msgID=$existingMsgID');
-              // Use normalized ID for consistency
-              var history = _historyById[normalizedUid];
+              // Use normalized ID for consistency (see migration comment above).
+              var history = _messageHistoryPersistence.getCachedList(normalizedUid);
               if (history == null && uid != normalizedUid) {
-                history = _historyById[uid];
-                // Migrate to normalized ID if found with original ID
+                history = _messageHistoryPersistence.getCachedList(uid);
                 if (history != null && history.isNotEmpty) {
-                  _historyById[normalizedUid] = history;
-                  _historyById.remove(uid);
+                  _messageHistoryPersistence.setCachedHistory(
+                      normalizedUid, history);
+                  _messageHistoryPersistence.removeCachedHistory(uid);
+                  history = _messageHistoryPersistence
+                      .getCachedList(normalizedUid);
                 }
               }
               _logger?.log(
@@ -3293,8 +3360,95 @@ class FfiChatService {
     return out;
   }
 
+  /// Preferences key for the set of dismissed friend-application fingerprints.
+  /// The C++ layer has no native "drop application" call, so we filter
+  /// dismissed entries out of [getFriendApplications] here. Stored via
+  /// `getStringList`/`setStringList` on the injected
+  /// [ExtendedPreferencesService]; the host's adapter is responsible for any
+  /// per-account scoping it needs.
+  ///
+  /// Each entry is a fingerprint of `<userId>|<wording>` (see [_fingerprint]).
+  /// Pinning to wording — not userId alone — is what makes a *new* application
+  /// from the same peer surface again after the previous one was dismissed.
+  /// The C++ queue re-emits the original entry on every poll with identical
+  /// wording, so it still matches and stays filtered; a fresh request from
+  /// the peer will typically carry different wording and bypass the filter.
+  ///
+  /// Visible-for-testing: exposed via [dismissedFriendApplicationsKey].
+  static const String _kDismissedFriendApplicationsKey =
+      'dismissed_friend_applications';
+
+  /// Visible-for-testing accessor for [_kDismissedFriendApplicationsKey].
+  static String get dismissedFriendApplicationsKey =>
+      _kDismissedFriendApplicationsKey;
+
+  /// Build the fingerprint stored in the dismissed set. The `|` separator
+  /// cannot collide with the userId (64-char hex) and is distinct from the
+  /// `\t` used by the FFI list encoding.
+  static String _fingerprint(String userId, String wording) =>
+      '$userId|$wording';
+
+  /// Visible-for-testing: applies the dismissed-application filter to a raw
+  /// list (the FFI-derived list, in the production path). Static and pure so
+  /// it can be unit-tested without an FFI library or a running service.
+  static List<({String userId, String wording})> filterDismissedApplications(
+    List<({String userId, String wording})> raw,
+    Set<String> dismissed,
+  ) {
+    if (dismissed.isEmpty) return raw;
+    String normalize(String userID) =>
+        userID.length > 64 ? userID.substring(0, 64) : userID;
+    return raw.where((app) {
+      final fp = _fingerprint(normalize(app.userId), app.wording);
+      return !dismissed.contains(fp);
+    }).toList();
+  }
+
+  /// Load the persisted set of dismissed friend-application fingerprints.
+  /// Returns an empty set when no preferences service is attached or no
+  /// entries exist. Legacy entries (pre-fingerprint format: bare userIds with
+  /// no `|wording` suffix) are dropped on read — they were created with
+  /// userId-only semantics that permanently filtered every future application
+  /// from the same peer; treating them as stale once is the migration. The
+  /// dropped entries are re-persisted so the migration only happens once.
+  Future<Set<String>> _getDismissedFriendApplications() async {
+    final prefs = _prefs;
+    if (prefs == null) return <String>{};
+    final list = await prefs.getStringList(_kDismissedFriendApplicationsKey);
+    if (list == null || list.isEmpty) return <String>{};
+    final fingerprints = list.where((s) => s.contains('|')).toList();
+    if (fingerprints.length != list.length) {
+      // Drop legacy bare-userId entries by re-saving the filtered list.
+      await prefs.setStringList(
+        _kDismissedFriendApplicationsKey,
+        fingerprints,
+      );
+    }
+    return fingerprints.toSet();
+  }
+
+  Future<void> _saveDismissedFriendApplications(Set<String> fingerprints) async {
+    final prefs = _prefs;
+    if (prefs == null) return;
+    await prefs.setStringList(
+      _kDismissedFriendApplicationsKey,
+      fingerprints.toList(),
+    );
+  }
+
+  /// Normalize a friend-application user ID to its 64-char public key for
+  /// stable comparison with native data (which always emits a 64-char key).
+  String _normalizeApplicationUserId(String userID) =>
+      userID.length > 64 ? userID.substring(0, 64) : userID;
+
+  /// Read the unfiltered friend-application list from the FFI layer.
+  ///
+  /// Production callers go through [getFriendApplications], which applies the
+  /// dismissed-filter on top of this. Refuse/delete paths need the raw view
+  /// so they can capture the current wording for each entry matching the
+  /// target userId.
   Future<List<({String userId, String wording})>>
-      getFriendApplications() async {
+      _getFriendApplicationsUnfiltered() async {
     final buf = pkgffi.malloc.allocate<ffi.Int8>(32 * 1024);
     // Use current instance ID at call time so runWithInstanceAsync(Alice) gets Alice's list
     final instanceId = _ffi.getCurrentInstanceId();
@@ -3314,10 +3468,108 @@ class FfiChatService {
     return out;
   }
 
+  /// Wordings surfaced by [getFriendApplications] per userId since startup.
+  ///
+  /// Acts as a fallback source for [refuseFriendApplication]: if the C++
+  /// queue has already been consumed between the most recent poll and the
+  /// user's refuse tap, we can still record the right
+  /// `(userId, wording)` fingerprint from what the UI was last shown.
+  /// Without this, a refuse click after the C++ queue drains is a silent
+  /// no-op and the refused application reappears on the next poll.
+  ///
+  /// Cleared per-userId on [acceptFriendRequest] (the user explicitly chose
+  /// to accept, so old wordings are no longer interesting) and on dispose.
+  final Map<String, Set<String>> _observedApplicationWordings = {};
+
+  Future<List<({String userId, String wording})>>
+      getFriendApplications() async {
+    final raw = await _getFriendApplicationsUnfiltered();
+
+    // Remember the wordings the UI is being shown so refuseFriendApplication
+    // can fall back to them if the C++ queue clears the entry before the user
+    // taps refuse. We snapshot from the unfiltered list because the dismissed
+    // filter below removes entries the user has already refused — those are
+    // already in the persisted dismissed set and don't need re-snapshotting.
+    for (final app in raw) {
+      final norm = _normalizeApplicationUserId(app.userId);
+      _observedApplicationWordings
+          .putIfAbsent(norm, () => <String>{})
+          .add(app.wording);
+    }
+
+    // Filter out applications the user has explicitly refused/deleted. Without
+    // this, the C++ application queue keeps returning the same entries every
+    // 5s poll because there is no native "dismiss" call.
+    final dismissed = await _getDismissedFriendApplications();
+    return filterDismissedApplications(raw, dismissed);
+  }
+
+  /// Mark all currently-pending friend applications from [userID] as dismissed
+  /// (refused). Persists the `(userId, wording)` fingerprint of every matching
+  /// entry the C++ queue is currently surfacing, so they no longer reappear in
+  /// [getFriendApplications] across polls or restarts.
+  ///
+  /// A subsequent fresh application from the same peer with different wording
+  /// surfaces again — that is the whole point of the wording-aware
+  /// fingerprint. If the peer happens to re-send with identical wording the
+  /// user can simply dismiss again.
+  ///
+  /// Idempotent. If the C++ queue no longer surfaces an entry for [userID] at
+  /// call time, falls back to the wordings observed via [getFriendApplications]
+  /// since startup ([_observedApplicationWordings]) — this covers the case
+  /// where the poll has already consumed the C++ entry between the UI render
+  /// and the user's refuse tap. Only a refuse click for a userId we've truly
+  /// never seen is a no-op.
+  Future<void> refuseFriendApplication(String userID) async {
+    final normalized = _normalizeApplicationUserId(userID);
+    final apps = await _getFriendApplicationsUnfiltered();
+    final liveWordings = apps
+        .where((a) => _normalizeApplicationUserId(a.userId) == normalized)
+        .map((a) => a.wording)
+        .toSet();
+
+    final wordings = liveWordings.isNotEmpty
+        ? liveWordings
+        : (_observedApplicationWordings[normalized] ?? const <String>{});
+    if (wordings.isEmpty) return;
+
+    final dismissed = await _getDismissedFriendApplications();
+    bool changed = false;
+    for (final w in wordings) {
+      if (dismissed.add(_fingerprint(normalized, w))) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      await _saveDismissedFriendApplications(dismissed);
+    }
+  }
+
+  /// Mark a friend application as dismissed (deleted). Same semantics as
+  /// [refuseFriendApplication] from Tim2Tox's perspective: both simply drop
+  /// the entry from the local application queue.
+  Future<void> deleteFriendApplication(String userID) async {
+    await refuseFriendApplication(userID);
+  }
+
   Future<void> acceptFriendRequest(String userId) async {
     final p = userId.toNativeUtf8();
     _ffi.acceptFriend(p);
     pkgffi.malloc.free(p);
+    // If this user was previously dismissed and is now being accepted, clear
+    // every fingerprint for that userId so a future re-request from the same
+    // peer surfaces regardless of wording.
+    final normalized = _normalizeApplicationUserId(userId);
+    final prefix = '$normalized|';
+    final dismissed = await _getDismissedFriendApplications();
+    final before = dismissed.length;
+    dismissed.removeWhere((fp) => fp.startsWith(prefix));
+    if (dismissed.length != before) {
+      await _saveDismissedFriendApplications(dismissed);
+    }
+    // Also drop the observed-wordings snapshot — once accepted, future
+    // requests from this peer are interesting again regardless of past wording.
+    _observedApplicationWordings.remove(normalized);
   }
 
   Future<void> removeFriend(String userId) async {
@@ -3534,7 +3786,7 @@ class FfiChatService {
   /// Returns true if we already have a recent group message with the same (gid, from, text).
   /// Used to deduplicate when both conference and group callbacks fire for the same message (tox_conf_*).
   bool _isDuplicateGroupTextMessage(String gid, String from, String text) {
-    final list = _historyByIdInternal[gid];
+    final list = _messageHistoryPersistence.getCachedList(gid);
     if (list == null || list.isEmpty) return false;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final windowMs = 5000; // 5 seconds
@@ -3550,15 +3802,10 @@ class FfiChatService {
   }
 
   void _appendHistory(String id, ChatMessage msg) {
-    // Update internal map
-    final list = _historyByIdInternal.putIfAbsent(id, () => <ChatMessage>[]);
-    list.add(msg);
-    if (list.length > 1000) {
-      list.removeRange(0, list.length - 1000);
-    }
-    // Use persistence service to append history. Fire-and-forget by design:
-    // callers of _appendHistory expect a synchronous void; on-disk save races
-    // continue in the background. Wrap explicitly to silence unawaited_futures.
+    // Persistence is the single owner of the in-memory list; it also applies
+    // the 1000-message memory cap and dedup-by-msgID inside `appendHistory`.
+    // Fire-and-forget by design: callers of _appendHistory expect a
+    // synchronous void; on-disk save races continue in the background.
     unawaited(_messageHistoryPersistence.appendHistory(id, msg));
     // Also update lastByPeer for immediate access
     _lastByPeer[id] = msg;
@@ -3722,14 +3969,16 @@ class FfiChatService {
     // Normalize friend ID to 64 characters (public key length)
     final normalizedUserID = _normalizeFriendId(userID);
 
-    // Clear in-memory history (both internal map and persistence cache)
-    // CRITICAL: Clear all possible ID variants from _historyByIdInternal
-    _historyByIdInternal.remove(normalizedUserID);
-    _historyByIdInternal.remove(userID);
+    // Eagerly drop any matching cache entry from the persistence-owned map.
+    // Persistence's `clearHistory` (called below) also clears in-memory state,
+    // but doing it up-front means a concurrent reader sees the clear
+    // immediately even while disk I/O is still in flight.
+    _messageHistoryPersistence.removeCachedHistory(normalizedUserID);
+    _messageHistoryPersistence.removeCachedHistory(userID);
 
-    // Also clear any cache entries that might match (with normalization)
+    // Also drop any stored variant (e.g. 76-char address key).
     final keysToRemove = <String>[];
-    for (final key in _historyByIdInternal.keys) {
+    for (final key in _messageHistoryPersistence.cache.keys) {
       final normalizedKey = key.length > 64 ? _normalizeFriendId(key) : key;
       if (normalizedKey == normalizedUserID ||
           key == userID ||
@@ -3739,7 +3988,7 @@ class FfiChatService {
       }
     }
     for (final key in keysToRemove) {
-      _historyByIdInternal.remove(key);
+      _messageHistoryPersistence.removeCachedHistory(key);
     }
 
     // Clear persisted history file using persistence service
@@ -3782,10 +4031,13 @@ class FfiChatService {
   /// (images, videos, audio, documents) that may be referenced in the messages
   Future<void> clearGroupHistory(String groupID) async {
     print('[FfiChatService] clearGroupHistory: ENTRY - groupID=$groupID');
-    // Clear in-memory history (both internal map and persistence cache)
-    bool removed = _historyByIdInternal.remove(groupID) != null;
+    // Eagerly drop the cached list. `clearHistory` below also clears the cache
+    // and removes the on-disk file.
+    final bool removed =
+        _messageHistoryPersistence.getCachedList(groupID) != null;
+    _messageHistoryPersistence.removeCachedHistory(groupID);
     print(
-        '[FfiChatService] clearGroupHistory: Removed from _historyByIdInternal: $removed');
+        '[FfiChatService] clearGroupHistory: Removed from persistence cache: $removed');
 
     // Clear persisted history file using persistence service
     // This deletes the JSON history file but preserves actual media files
@@ -3878,42 +4130,101 @@ class FfiChatService {
     }
   }
 
-  /// Delete messages by their IDs
-  /// Returns the number of messages deleted
+  /// Delete messages by their IDs.
+  ///
+  /// Matches by the message's stored [ChatMessage.msgID] (the value written by
+  /// `_appendHistory` of the form `'${timestamp}_${sequence}_${from}'`, or by
+  /// `MessageIdGenerator` for outbound sends). Falls back to the legacy
+  /// two-component reconstruction `'${timestamp}_${fromUserId}'` only for
+  /// records persisted before msgID was attached, so old data is still
+  /// deletable. Updates `MessageHistoryPersistence`'s in-memory cache for
+  /// every modified conversation so reads do not repopulate stale data.
+  ///
+  /// Also refreshes the conversation-preview state (`_lastByPeer`,
+  /// `_unreadByPeer`) for every conversation whose messages changed, because
+  /// the conversation-list builder reads `lastMessages[peerId]` and the
+  /// per-peer unread counter directly. Without this refresh, deleting the
+  /// final message of a conversation leaves the sidebar showing the deleted
+  /// message as the preview until a new message arrives or the app reloads
+  /// (the same pattern already used by `_cleanIncompleteFileTransfersOnInit`).
+  ///
+  /// Returns the number of messages deleted.
   Future<int> deleteMessages(List<String> msgIDs) async {
+    if (msgIDs.isEmpty) return 0;
+    final msgIDSet = msgIDs.toSet();
     int deletedCount = 0;
-    // Iterate through all conversation histories to find and delete messages
-    for (final entry in _historyById.entries) {
+    final modifiedConversations = <String>{};
+
+    bool matches(ChatMessage msg) {
+      final id = msg.msgID;
+      if (id != null && id.isNotEmpty) {
+        return msgIDSet.contains(id);
+      }
+      // Legacy fallback: pre-msgID records used (timestamp, fromUserId).
+      final legacy =
+          '${msg.timestamp.millisecondsSinceEpoch}_${msg.fromUserId}';
+      return msgIDSet.contains(legacy);
+    }
+
+    // Iterate through all conversation histories to find and delete messages.
+    for (final entry in _historyById.entries.toList()) {
       final conversationId = entry.key;
       final messages = entry.value;
       final originalLength = messages.length;
-      // Remove messages that match any of the provided msgIDs
-      // msgID format in our system is: "${timestamp}_${fromUserId}"
-      // Also check if msgID matches directly (in case UIKit uses a different format)
       messages.removeWhere((msg) {
-        final msgID =
-            '${msg.timestamp.millisecondsSinceEpoch}_${msg.fromUserId}';
-        if (msgIDs.contains(msgID)) {
+        if (matches(msg)) {
           deletedCount++;
           return true;
         }
         return false;
       });
-      // If messages were deleted, save the updated history
       if (messages.length < originalLength) {
+        modifiedConversations.add(conversationId);
+        // Persist the truncated list to disk. The in-memory cache mutation
+        // above (`messages.removeWhere`) already lands in the
+        // persistence-owned list — `_historyById` IS the persistence cache as
+        // of the X4 consolidation. No separate setCachedHistory call needed.
         await _saveHistory(conversationId);
+
+        // Recompute conversation-preview state from what remains. Last
+        // message: highest-timestamp survivor, or remove the entry entirely
+        // when the conversation is now empty. Unread: recount incoming
+        // unread messages from the remaining list rather than trying to
+        // decrement against the per-message deletion (we cannot reconstruct
+        // which deleted entries were unread once they're gone, and recount
+        // is O(n) for a per-peer list that's already in memory).
+        final remaining = _historyById[conversationId];
+        if (remaining == null || remaining.isEmpty) {
+          _lastByPeer.remove(conversationId);
+          _unreadByPeer.remove(conversationId);
+        } else {
+          ChatMessage newest = remaining.first;
+          int unread = 0;
+          for (final m in remaining) {
+            if (m.timestamp.isAfter(newest.timestamp)) newest = m;
+            if (!m.isSelf && !m.isRead) unread++;
+          }
+          _lastByPeer[conversationId] = newest;
+          // Preserve the "user is currently viewing this conversation"
+          // zero-out: `setActivePeer` already drives _unreadByPeer to 0 for
+          // the active conversation, so we don't want to bump it back up
+          // here. Treat the active peer's unread as 0 regardless of the
+          // remaining-list scan.
+          if (_activePeerId == conversationId) {
+            _unreadByPeer[conversationId] = 0;
+          } else if (unread > 0) {
+            _unreadByPeer[conversationId] = unread;
+          } else {
+            _unreadByPeer.remove(conversationId);
+          }
+        }
       }
     }
-    // Also remove from _messages list (if it's a List)
-    if (_messages is List) {
-      final messagesList = _messages as List;
-      final beforeCount = messagesList.length;
-      messagesList.removeWhere((msg) {
-        final msgID =
-            '${msg.timestamp.millisecondsSinceEpoch}_${msg.fromUserId}';
-        return msgIDs.contains(msgID);
-      });
-    }
+
+    // `_messages` is a broadcast StreamController, not a List — there is no
+    // historical buffer to clean. The previous `_messages is List` block was
+    // a no-op left from an earlier shape. Intentionally drop it: the new
+    // msgID-aware match above is also what would have been needed here.
     return deletedCount;
   }
 
@@ -5196,12 +5507,23 @@ class FfiChatService {
     return null;
   }
 
-  /// Get the avatars directory path. Uses per-account path if set, otherwise global fallback.
+  /// Get the avatars directory path. Uses per-account path if set, then the
+  /// injected resolver (X6 — lets toxee route through `AppPaths`), then the
+  /// `<appSupport>/avatars` default for tim2tox standalone tests.
   Future<String> _getAvatarsDir() async {
     if (_avatarsPath != null && _avatarsPath!.isNotEmpty) {
       final dir = Directory(_avatarsPath!);
       if (!await dir.exists()) await dir.create(recursive: true);
       return _avatarsPath!;
+    }
+    if (_pathResolver != null) {
+      final resolved = _assertResolverPath(
+        await _pathResolver!.resolveAvatarsDirectory(),
+        'resolveAvatarsDirectory',
+      );
+      final dir = Directory(resolved);
+      if (!await dir.exists()) await dir.create(recursive: true);
+      return dir.path;
     }
     final appDir = await getApplicationSupportDirectory();
     final dir = Directory(p.join(appDir.path, 'avatars'));
@@ -5432,10 +5754,8 @@ class FfiChatService {
             );
             history[pendingMsgIndex] = updatedMsg;
             _lastByPeer[normalizedPeerId] = updatedMsg;
-            // Also update the message in _historyById to ensure consistency
-            if (_historyById.containsKey(normalizedPeerId)) {
-              _historyById[normalizedPeerId] = history;
-            }
+            // `history` IS the persistence-owned list; the index mutation
+            // above is already visible through `_historyById` / `getHistory`.
             // Save updated history first
             try {
               await _saveHistory(normalizedPeerId);
@@ -5556,37 +5876,69 @@ class FfiChatService {
   }
 
   Future<void> dispose() async {
-    // Clear global service pointer so FFI callbacks no longer route to this instance
+    // Order matters here — the previous arrangement had a race where a poll
+    // tick or in-flight callback could `appendHistory` between
+    // `flushPendingSaves()` and `clearAllCached()`, resurrecting the
+    // just-cleared cache and then losing the message when the debounce timer
+    // fired against an empty service. To close that window:
+    //
+    //   1. Stop every source of new `appendHistory` calls (route, poller,
+    //      profile timer, instance-map registration, in-flight file callbacks).
+    //   2. Only then flush pending writes to disk.
+    //   3. Switch the persistence layer into its "disposed" mode so any
+    //      defensive late call falls through to a synchronous save instead of
+    //      scheduling a timer that will never fire.
+    //   4. Finally clear caches and tear down FFI / streams.
+
+    // 1. Stop new work.
     if (_globalService == this) {
       _globalService = null;
     }
-    // Clear global file transfer path cache
     _lastSentPathByPeer.clear();
 
-    // Clear per-account in-memory caches to prevent data leakage between accounts
-    _historyByIdInternal.clear();
-    _unreadByPeer.clear();
-    _knownGroups.clear();
-    _quitGroups.clear();
-    _lastByPeer.clear();
-    _typingUntil.clear();
-    _processingFileDone.clear();
-    _activePeerId = null;
-
-    // Unregister from static instance map so poll loop no longer polls this instance
     if (_instanceId != null && _instanceId! != 0) {
       synchronized(_instanceServicesLock, () {
         _instanceServices.remove(_instanceId!);
         _knownInstanceIds.remove(_instanceId!);
       });
     }
-    // Cancel all pending file transfers before disposing
-    await _cancelPendingFileTransfers();
+
     _poller?.cancel();
     _poller = null;
     _pollingStarted = false;
     _profileSaveTimer?.cancel();
     _profileSaveTimer = null;
+
+    // Cancel any in-flight file transfers — must happen after the poller has
+    // been killed so cancellation callbacks don't race a fresh poll tick.
+    await _cancelPendingFileTransfers();
+
+    // 2. Flush pending debounced history writes. By this point no new
+    // appendHistory should arrive, so the snapshot the flush takes is final.
+    try {
+      await _messageHistoryPersistence.flushPendingSaves();
+    } catch (_) {
+      // Best-effort: don't block dispose on a single conversation's save error.
+    }
+
+    // 3. Switch persistence into disposed mode. After this, any late call
+    // into _scheduleDebouncedSave (defensive — should not happen given step 1)
+    // falls through to a synchronous saveHistory using the still-present
+    // in-memory list, instead of scheduling a timer that gets cancelled in
+    // step 4.
+    _messageHistoryPersistence.dispose();
+
+    // 4. Clear caches and tear down.
+    _messageHistoryPersistence.clearAllCached();
+    _unreadByPeer.clear();
+    _knownGroups.clear();
+    _quitGroups.clear();
+    _lastByPeer.clear();
+    _typingUntil.clear();
+    _processingFileDone.clear();
+    _observedApplicationWordings.clear();
+    _activePeerId = null;
+
     _ffi.uninit();
     await _messages.close();
     await _connectionStatus.close();

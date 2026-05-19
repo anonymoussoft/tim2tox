@@ -5,6 +5,7 @@
 import 'dart:async';
 import 'package:tencent_cloud_chat_sdk/enum/V2TimSignalingListener.dart';
 import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
+import '../interfaces/logger_service.dart';
 import 'call_av_backend.dart';
 
 export 'call_av_backend.dart';
@@ -43,6 +44,7 @@ class CallInfo {
 class CallBridgeService {
   final TencentCloudChatSdkPlatform _sdkPlatform;
   final CallAvBackend _avService;
+  final LoggerService? _logger;
 
   // Active calls: inviteID -> CallInfo
   final Map<String, CallInfo> _activeCalls = {};
@@ -53,7 +55,9 @@ class CallBridgeService {
   // Callbacks
   Function(String inviteID, CallState state)? onCallStateChanged;
 
-  CallBridgeService(this._sdkPlatform, this._avService) {
+  CallBridgeService(this._sdkPlatform, this._avService,
+      {LoggerService? logger})
+      : _logger = logger {
     _setupSignalingListener();
   }
 
@@ -105,8 +109,13 @@ class CallBridgeService {
           if (callInfo.state == CallState.calling &&
               callInfo.friendNumber != null) {
             try {
-              final audioBitRate = 48;
-              final videoBitRate = 5000;
+              // Mid-tier opening targets in kbit/s; the integrator (e.g.
+              // toxee's CallCodecProfile) can be wired to push different
+              // targets in response to bitrate-change callbacks once the
+              // call is up. See `tim2tox/source/ToxAVManager.h` for the
+              // peer-suggested bitrate callbacks.
+              const audioBitRate = 48;
+              const videoBitRate = 2000;
 
               final success = await _avService.startCall(callInfo.friendNumber!,
                   audioBitRate: audioBitRate, videoBitRate: videoBitRate);
@@ -114,8 +123,8 @@ class CallBridgeService {
                 callInfo.state = CallState.inCall;
                 onCallStateChanged?.call(inviteID, CallState.inCall);
               }
-            } catch (e) {
-              print('[CallBridge] Error starting call: $e');
+            } catch (e, st) {
+              _logger?.logError('[CallBridge] Error starting call', e, st);
             }
           } else {
             // Call already started, just update state
@@ -172,9 +181,16 @@ class CallBridgeService {
     );
   }
 
-  /// Accept an invitation and start call
+  /// Accept an invitation and start call.
+  ///
+  /// `audioBitRate` and `videoBitRate` are in kbit/s (the libtoxav unit).
+  /// Defaults match the mid-tier target used elsewhere in this bridge
+  /// (48 kbps audio / 2000 kbps video). The previous defaults — 64000 audio
+  /// and 5000000 video — were latently wrong: they only worked because no
+  /// known caller used the defaults, but if anyone ever did the encoder
+  /// would have been asked for ~64 Mbit/s of audio and ~5 Gbit/s of video.
   Future<bool> acceptInvitation(String inviteID,
-      {int audioBitRate = 64000, int videoBitRate = 5000000}) async {
+      {int audioBitRate = 48, int videoBitRate = 2000}) async {
     final callInfo = _activeCalls[inviteID];
     if (callInfo == null) return false;
 
