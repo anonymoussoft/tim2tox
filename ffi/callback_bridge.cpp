@@ -66,6 +66,17 @@ extern "C" {
         std::lock_guard<std::mutex> lock(g_dart_port_mutex);
         g_dart_port = static_cast<Dart_Port>(send_port);
     }
+
+    // Symmetric counterpart to DartRegisterSendPort. The Tencent SDK started
+    // calling this in 8.9.7540+3 from NativeLibraryManager.unregisterPort().
+    // No toxee code path invokes it today, but the symbol must exist so the
+    // FFI lookup doesn't crash if it ever fires.
+    void DartUnregisterSendPort(int64_t send_port) {
+        std::lock_guard<std::mutex> lock(g_dart_port_mutex);
+        if (g_dart_port == static_cast<Dart_Port>(send_port)) {
+            g_dart_port = ILLEGAL_PORT;
+        }
+    }
 }
 
 // Check if Dart port is registered

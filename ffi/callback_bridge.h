@@ -51,6 +51,8 @@ int DartInitDartApiDL(void* data);
 // Register Dart SendPort for receiving callbacks
 // Note: Dart_Port is int64_t (64-bit), not int (32-bit)
 void DartRegisterSendPort(int64_t send_port);
+// Symmetric unregister; added in 8.9.7540+3 to match SDK call site.
+void DartUnregisterSendPort(int64_t send_port);
 
 #ifdef __cplusplus
 }

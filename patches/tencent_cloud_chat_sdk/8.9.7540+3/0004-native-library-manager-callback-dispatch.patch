@@ -1,14 +1,14 @@
-From 1ca47b0a2a9cf822539f136df2ca3a27a60e28ab Mon Sep 17 00:00:00 2001
+From 398610baee43b119a1526f6463bd396508b13c32 Mon Sep 17 00:00:00 2001
 From: tim2tox-bootstrap <bootstrap@local>
-Date: Tue, 19 May 2026 02:49:27 -0700
+Date: Tue, 19 May 2026 02:52:09 -0700
 Subject: [PATCH 4/5] 0004-native-library-manager-callback-dispatch
 
 ---
- .../bindings/native_library_manager.dart      | 57 ++++++++++++++++++-
- 1 file changed, 56 insertions(+), 1 deletion(-)
+ .../bindings/native_library_manager.dart      | 73 +++++++++++++++++--
+ 1 file changed, 68 insertions(+), 5 deletions(-)
 
 diff --git a/lib/native_im/bindings/native_library_manager.dart b/lib/native_im/bindings/native_library_manager.dart
-index 6a99ca0..9be98fa 100644
+index 6a99ca0..e546c0a 100644
 --- a/lib/native_im/bindings/native_library_manager.dart
 +++ b/lib/native_im/bindings/native_library_manager.dart
 @@ -40,6 +40,7 @@ import 'package:tencent_cloud_chat_sdk/enum/V2TimCommunityListener.dart';
@@ -45,10 +45,14 @@ index 6a99ca0..9be98fa 100644
          break;
      }
    }
-@@ -307,6 +320,20 @@ class NativeLibraryManager {
+@@ -307,15 +320,65 @@ class NativeLibraryManager {
      _apiCallbackMap.remove(userData);
    }
  
+-  /// 从全局回调数据中获取指定 key 的字符串值
+-  static String _getGlobalCallbackJsonString(Map<String, dynamic> dataFromNativeMap, String key) {
+-    String rawValue = dataFromNativeMap[key] ?? '';
+-    return rawValue;
 +  /// Backwards-compatibility aliases for tim2tox callers written against the
 +  /// 8.7.x API surface (renamed to `addTimXxx2Map` in 8.9.x). These delegate
 +  /// to the new names with the same signatures, so dart/lib code in
@@ -63,10 +67,19 @@ index 6a99ca0..9be98fa 100644
 +          String userData, ApiCallback callback) =>
 +      addTimApiValueCallback2Map(userData, callback);
 +
-   /// 从全局回调数据中获取指定 key 的字符串值
-   static String _getGlobalCallbackJsonString(Map<String, dynamic> dataFromNativeMap, String key) {
-     String rawValue = dataFromNativeMap[key] ?? '';
-@@ -315,7 +342,35 @@ class NativeLibraryManager {
++  /// 从全局回调数据中获取指定 key 的字符串值。
++  ///
++  /// tim2tox's callback bridge may deliver the value as a String, an
++  /// already-decoded List/Map, or null. Normalize all three to a JSON
++  /// string so callers' `json.decode(rawValue)` continues to work.
++  static String _getGlobalCallbackJsonString(
++      Map<String, dynamic> dataFromNativeMap, String key) {
++    final raw = dataFromNativeMap[key];
++    if (raw == null) return '';
++    if (raw is String) return raw;
++    if (raw is List || raw is Map) return json.encode(raw);
++    return raw.toString();
+   }
  
    static void _handleGlobalCallback(Map<String, dynamic> dataFromNativeMap) {
      int callbackType = dataFromNativeMap["callbackType"];

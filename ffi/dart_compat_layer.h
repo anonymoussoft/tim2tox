@@ -13,6 +13,7 @@ extern "C" {
 int DartInitDartApiDL(void* data);
 // Note: Dart_Port is int64_t (64-bit), not int (32-bit)
 void DartRegisterSendPort(int64_t send_port);
+void DartUnregisterSendPort(int64_t send_port);
 
 // SDK global callbacks
 void DartSetNetworkStatusListenerCallback(void* user_data);
@@ -23,6 +24,8 @@ void DartSetUserStatusChangedCallback(void* user_data);
 void DartSetUserInfoChangedCallback(void* user_data);
 void DartSetMsgAllMessageReceiveOptionCallback(void* user_data);
 void DartSetLogCallback(void* user_data);
+// Introduced in tencent_cloud_chat_sdk 8.9.7540+3; no-op stub on Tim2Tox.
+void DartSetExperimentalNotifyCallback(void* user_data);
 
 // Message callbacks
 void DartAddReceiveNewMsgCallback(void* user_data);

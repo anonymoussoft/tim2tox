@@ -1,9 +1,10 @@
 # List of Dart* functions that need to be implemented
-# Total: 68 functions (66 callback setup functions + 2 infrastructure functions)
+# Total: 70 functions (67 callback setup functions + 3 infrastructure functions)
 
-# Infrastructure functions (2)
+# Infrastructure functions (3)
 DartInitDartApiDL
 DartRegisterSendPort
+DartUnregisterSendPort
 
 # Callback setup functions (66)
 DartAddReceiveNewMsgCallback
@@ -37,6 +38,7 @@ DartSetFriendGroupDeletedCallback
 DartSetFriendGroupNameChangedCallback
 DartSetFriendsAddedToGroupCallback
 DartSetFriendsDeletedFromGroupCallback
+DartSetExperimentalNotifyCallback
 DartSetGroupAttributeChangedCallback
 DartSetGroupCounterChangedCallback
 DartSetGroupTipsEventCallback

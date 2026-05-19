@@ -764,6 +764,16 @@ extern "C" {
         DartSDKListenerImpl* listener = GetOrCreateSDKListener();
         manager->AddSDKListener(listener);
     }
+
+    // Introduced in tencent_cloud_chat_sdk 8.9.7540+3. Tim2Tox doesn't have an
+    // analogue of Tencent's "experimental notify" channel, but the SDK calls
+    // this unconditionally during TIMManager._initInternalSDKListener() and
+    // crashes if the symbol is missing. Store the user_data for symmetry with
+    // the other SDK-listener callbacks; no V2TIM listener is registered.
+    void DartSetExperimentalNotifyCallback(void* user_data) {
+        int64_t instance_id = GetCurrentInstanceId();
+        StoreCallbackUserData(instance_id, "ExperimentalNotify", user_data);
+    }
 }
 
 // ============================================================================
