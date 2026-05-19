@@ -4529,9 +4529,13 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
       }
 
-      // Copy other fields
-      forwardMsg.sender = originalMsg.sender;
-      forwardMsg.nickName = originalMsg.nickName;
+      // Copy other fields.
+      // H-I: forwarded messages must NOT inherit the original sender,
+      // otherwise the receiver shows Bob's nick/avatar on a message that
+      // Alice forwarded. Leave `sender` empty so the sendMessage path
+      // populates it with selfId.
+      forwardMsg.sender = '';
+      forwardMsg.nickName = null;
       // Don't copy userID/groupID from original message - they should be set by UIKit
       // when the message is sent to the target conversation
       // Setting them to null ensures UIKit will use the target conversation's userID/groupID
@@ -4762,6 +4766,15 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           desc: 'Message not found (id: $id)',
         );
       }
+
+      // H-I: forwarded messages clear sender/nickName in createForwardMessage
+      // so we can repopulate them here with the local user (we are the sender
+      // when forwarding). Done unconditionally for self-sent flows — never
+      // overwrite when the field is already set to a non-empty real value.
+      if (messageToSend.sender == null || messageToSend.sender!.isEmpty) {
+        messageToSend.sender = ffiService.selfId;
+      }
+      messageToSend.isSelf = true;
 
       // Set faceUrl immediately so the list shows correct avatar from the first frame (avoids default→correct flicker)
       await _setFaceUrlForMsg(messageToSend);
@@ -5174,11 +5187,37 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         );
       }
     } catch (e, stackTrace) {
-      if (_debugLog)
+      if (_debugLog) {
         print('[Tim2ToxSdkPlatform] sendMessage outer exception: $e');
+        print(
+            '[Tim2ToxSdkPlatform] sendMessage outer exception stack trace: $stackTrace');
+      }
+      // H-L: outer-catch path — when failure happens before we found
+      // `messageToSend` (e.g. provider lookup, registry missing), we don't
+      // have a V2TimMessage to flip to FAIL. Try to recover one from
+      // _forwardMessageCache by `id` so the bubble doesn't get stuck in
+      // SENDING. If unrecoverable, return a non-null `data` with status
+      // marked FAIL so UIKit can route status updates correctly.
+      V2TimMessage failedMsg;
+      if (id != null && _forwardMessageCache.containsKey(id)) {
+        failedMsg = _forwardMessageCache[id]!;
+      } else {
+        failedMsg = V2TimMessage(elemType: MessageElemType.V2TIM_ELEM_TYPE_TEXT);
+        failedMsg.msgID = id;
+        failedMsg.id = id;
+      }
+      failedMsg.status = MessageStatus.V2TIM_MSG_STATUS_SEND_FAIL;
+      try {
+        _notifyAdvancedMsgListeners((listener) {
+          listener.onRecvMessageModified?.call(failedMsg);
+        });
+      } catch (_) {
+        // Listener fan-out errors are non-fatal here.
+      }
       return V2TimValueCallback<V2TimMessage>(
         code: -1,
         desc: 'sendMessage failed: $e',
+        data: failedMsg,
       );
     }
   }
@@ -5555,9 +5594,17 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           (groupID == null || groupID.isEmpty)) {
         // matchedConvKey is groupID for groups, userID for c2c (see
         // saveFailedMessage's conversationKey construction).
-        // We don't know which it is; assume userID and let upstream
-        // recover from a wrong-target failure.
-        userID = matchedConvKey;
+        // H-C: previously we always assumed userID, which silently routed
+        // group-message resends into a C2C target named `tox_conf_…`. In
+        // toxee, every group ID begins with `tox_` (`tox_conf_` for
+        // conferences, `tox_group_` for ng-groups), and C2C peer IDs are
+        // raw 64-char Tox public keys that never start with `tox_`. Use
+        // that as the discriminator so legacy entries route correctly.
+        if (matchedConvKey.startsWith('tox_')) {
+          groupID = matchedConvKey;
+        } else {
+          userID = matchedConvKey;
+        }
       }
 
       // Rebuild a V2TimMessage from the entry.
@@ -5680,6 +5727,19 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       // Cache the rebuilt message in the same way createXxxMessage does
       // so the sendMessage path can find it via id lookup.
       _forwardMessageCache[msgID] = rebuilt;
+
+      // H-A: drop the old failed entry from history BEFORE we kick off the
+      // new send. Otherwise the user sees two bubbles (the original failed
+      // one and the new sending/successful one) until manual cleanup. Done
+      // best-effort: a failure here must not block the resend.
+      try {
+        await deleteMessages(msgIDs: [msgID]);
+      } catch (e) {
+        if (_debugLog) {
+          print(
+              '[Tim2ToxSdkPlatform] reSendMessage: pre-resend cleanup of old entry failed (swallowed): $e');
+        }
+      }
 
       // Dispatch via sendMessage so we go through the elem branches that
       // we just added in P0-1.
