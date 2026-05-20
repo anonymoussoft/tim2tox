@@ -2401,11 +2401,36 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _groupDeletedSubscription = eventBus
         .on<FakeGroupDeleted>(EventTopics.groupDeleted)
         .listen((deleted) {
-      // Notify listeners about group deletion
+      // Dedup: a Dart-initiated quit takes two paths through this code —
+      // (a) `Tim2ToxSdkPlatform.quitGroup` calls `_notifyGroupListeners`
+      //     directly after the FFI call succeeds; UIKit then mirrors the
+      //     state change into a `quitGroup` data update, and toxee's
+      //     `home_page_bootstrap` listener re-emits FakeGroupDeleted onto
+      //     the event bus as the fan-out signal for everything else
+      //     (FakeChatDataProvider conversation cleanup, etc.).
+      // Without this guard, every quit fires `onQuitFromGroup` twice.
+      if (_recentlyNotifiedQuitGroup(deleted.groupID)) return;
       _notifyGroupListeners((listener) {
         listener.onQuitFromGroup?.call(deleted.groupID);
       });
     });
+  }
+
+  // Last-fired timestamps for onQuitFromGroup to suppress the
+  // direct-notify + event-bus-fanout double-fire. 5 s window matches the
+  // typical fan-out latency through UIKit's data layer.
+  final Map<String, int> _recentQuitNotifyMs = <String, int>{};
+  static const int _quitNotifyDedupMs = 5000;
+
+  bool _recentlyNotifiedQuitGroup(String groupID) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    // Drop stale entries opportunistically so this map cannot grow
+    // unboundedly across many quits.
+    _recentQuitNotifyMs.removeWhere(
+        (_, ts) => now - ts > _quitNotifyDedupMs);
+    final prev = _recentQuitNotifyMs[groupID];
+    _recentQuitNotifyMs[groupID] = now;
+    return prev != null && now - prev < _quitNotifyDedupMs;
   }
 
   void _setupInternalConversationListener() {
