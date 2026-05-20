@@ -1402,12 +1402,29 @@ class FfiChatService {
                         '[FfiChatService] Polled file_done event (after recovery): $s');
                   }
                 } else {
-                  // This looks like binary data, skip it
+                  // P0-C2: log unrecognized payloads instead of silently
+                  // dropping them. Used to be a silent return which masked
+                  // FFI boundary corruption / new event types added on the
+                  // C++ side that Dart didn't yet recognise.
+                  final hexPreview = bytes
+                      .take(64)
+                      .map((b) => b.toRadixString(16).padLeft(2, '0'))
+                      .join();
+                  _logger?.log(
+                      '[FfiChatService] Polled non-text payload, dropping (n=$n bytes=0x$hexPreview, asciiHead=${firstChars.substring(0, firstChars.length.clamp(0, 32))})');
                   pkgffi.malloc.free(buf);
                   _scheduleNextPoll();
                   return;
                 }
               } catch (e2) {
+                // P0-C2: log decode-recovery failures rather than swallowing.
+                final hexPreview = buf
+                    .asTypedList(n)
+                    .take(64)
+                    .map((b) => b.toRadixString(16).padLeft(2, '0'))
+                    .join();
+                _logger?.log(
+                    '[FfiChatService] Polled event UTF-8 decode failed even with recovery (n=$n bytes=0x$hexPreview): $e $e2');
                 pkgffi.malloc.free(buf);
                 _scheduleNextPoll();
                 return;
@@ -1417,10 +1434,15 @@ class FfiChatService {
             if (s.startsWith('conn:')) {
               // conn:success or conn:failed
               if (s == 'conn:success') {
+                final wasOffline = !_isConnected;
                 _isConnected = true;
                 _connectionStatus.add(true);
                 // When connected, send avatar to all online friends
                 unawaited(_sendAvatarToAllFriendsOnConnect());
+                // P0-C1: drain any group messages queued while offline.
+                if (wasOffline) {
+                  unawaited(_drainAllPendingGroupMessages());
+                }
               } else if (s == 'conn:failed') {
                 _isConnected = false;
                 _connectionStatus.add(false);
@@ -3825,8 +3847,22 @@ class FfiChatService {
 
   Future<void> acceptFriendRequest(String userId) async {
     final p = userId.toNativeUtf8();
-    _ffi.acceptFriend(p);
-    pkgffi.malloc.free(p);
+    final int rc;
+    try {
+      // P0-A3: previously the return value was discarded, so a failed
+      // tox_friend_add_norequest (own_key, malloc fail, etc.) was silently
+      // dropped and the UI still treated the application as accepted. Now
+      // we surface the failure so callers can show an error and the
+      // application stays in the pending list for retry.
+      rc = _ffi.acceptFriend(p);
+    } finally {
+      pkgffi.malloc.free(p);
+    }
+    if (rc != 1) {
+      _logger?.log(
+          '[FfiChatService] acceptFriendRequest: FFI returned rc=$rc for userId=$userId');
+      throw StateError('acceptFriend failed (rc=$rc) for $userId');
+    }
     // If this user was previously dismissed and is now being accepted, clear
     // every fingerprint for that userId so a future re-request from the same
     // peer surfaces regardless of wording.
@@ -3844,9 +3880,13 @@ class FfiChatService {
   }
 
   Future<void> removeFriend(String userId) async {
-    // P2-21: tear down friend-scoped state before the native delete so we
-    // don't leak in-flight transfer tracking, presence flags, or partially
-    // received files for someone we no longer have a relationship with.
+    // P0-A4: centralize on deleteFriend. Previously this method called the
+    // FFI deleteFriend directly without writing the prefs side — the result
+    // was a friend that disappeared from Tox but lingered in
+    // Prefs.localFriends, surfacing as a ghost contact after restart. Now
+    // we do the in-flight cleanup (formerly tracked under P2-21) and then
+    // delegate to deleteFriend so both Tox state and local persistence are
+    // updated atomically by the same code path.
     final normalizedUid =
         userId.length > 64 ? _normalizeFriendId(userId) : userId;
     bool matchesUid((String, int) key) =>
@@ -3887,9 +3927,8 @@ class FfiChatService {
       } catch (_) {}
     }
 
-    final pUid = userId.toNativeUtf8();
-    _ffi.deleteFriend(pUid);
-    pkgffi.malloc.free(pUid);
+    // Delegate the actual Tox + Prefs delete to the canonical writer.
+    await deleteFriend(userId);
   }
 
   void _onNativeEvent(int type, String sender, String data) {
@@ -3897,10 +3936,16 @@ class FfiChatService {
     // 100=connect_success, 101=connect_failed
     if (type == 100) {
       // Connection success
+      final wasOffline = !_isConnected;
       _isConnected = true;
       _connectionStatus.add(true);
       // When connected, send avatar to all online friends
       unawaited(_sendAvatarToAllFriendsOnConnect());
+      // P0-C1: drain group offline queue on reconnect (parallel to the
+      // C2C drain done per-friend in getFriendList).
+      if (wasOffline) {
+        unawaited(_drainAllPendingGroupMessages());
+      }
       return;
     } else if (type == 101) {
       // Connection failed
@@ -4678,9 +4723,22 @@ class FfiChatService {
         ? requestMessage.trim()
         : '';
     final pmsg = wording.toNativeUtf8();
-    _ffi.joinGroup(p, pmsg);
-    pkgffi.malloc.free(p);
-    pkgffi.malloc.free(pmsg);
+    final int rc;
+    try {
+      // P0-B5: previously fire-and-forget. The FFI returns 1 on success,
+      // 0 on failure (per the int convention). Surface a failure rather
+      // than silently marking the group joined and persisting it to
+      // _knownGroups — that left ghost entries on the user's group list.
+      rc = _ffi.joinGroup(p, pmsg);
+    } finally {
+      pkgffi.malloc.free(p);
+      pkgffi.malloc.free(pmsg);
+    }
+    if (rc != 1) {
+      _logger?.log(
+          '[FfiChatService] joinGroup: FFI returned rc=$rc for groupId=$groupId');
+      throw StateError('joinGroup failed (rc=$rc) for $groupId');
+    }
     _knownGroups.add(groupId);
     await _persistKnownGroups(); // This will call _syncKnownGroupsToNative()
     // Remove from quit groups if it was previously quit
@@ -4732,8 +4790,26 @@ class FfiChatService {
       print(
           '[FfiChatService] quitGroup: DartQuitGroup call returned code=$callResult, waiting for callback');
 
-      // Wait for callback result
-      V2TimCallback result = await completer.future;
+      // Wait for callback result.
+      // P0-B1: bound the wait with a timeout. Without it, if the C++ side
+      // failed to deliver the SendPort message (e.g. callback bridge race
+      // on dispose, instance routing error) the UI would freeze on the
+      // unbounded `await completer.future`. 15s is generous for what is
+      // ultimately a tox_group_leave / tox_conference_delete syscall.
+      V2TimCallback result = await completer.future
+          .timeout(const Duration(seconds: 15), onTimeout: () {
+        print(
+            '[FfiChatService] quitGroup: TIMEOUT waiting for C++ callback for groupId=$groupId');
+        // Synthesize a failure result so the catch below cleans up native
+        // pointers and surfaces the error to the caller. We deliberately
+        // do not clean up local state here — the C++ side may still
+        // deliver the callback later and a separate cleanupGroupState()
+        // path exists for that case.
+        return V2TimCallback(
+            code: -1,
+            desc:
+                'quitGroup timed out after 15s waiting for native callback');
+      });
       print(
           '[FfiChatService] quitGroup: Received callback result: code=${result.code}, desc=${result.desc}');
 
@@ -5172,7 +5248,22 @@ class FfiChatService {
     }
   }
 
+  // Storage key used by the offline-message queue for group messages.
+  // Prefixed so it can't collide with the 64-char hex peer IDs used for the
+  // C2C queue, which share the same persistence backing store.
+  String _groupOfflineQueueKey(String groupId) => 'group:$groupId';
+
   Future<void> sendGroupText(String groupId, String text) async {
+    // P0-C1: parallel of the C2C offline-queue behavior. Group messages
+    // used to be sent fire-and-forget even when we had no DHT connection
+    // — Tox would silently drop them with no path for recovery, and the
+    // user only learned about it when peers asked why their replies went
+    // nowhere. Now: if we're not connected, queue the message and surface
+    // it as pending; drain on the next conn:success.
+    if (!_isConnected) {
+      await _queueOfflineGroupText(groupId, text);
+      return;
+    }
     final pg = groupId.toNativeUtf8();
     final pt = text.toNativeUtf8();
     _ffi.sendGroupText(pg, pt);
@@ -5193,6 +5284,114 @@ class FfiChatService {
     _unreadByPeer[groupId] = 0;
     _appendHistory(groupId, out);
     _messages.add(out);
+  }
+
+  Future<void> _queueOfflineGroupText(String groupId, String text) async {
+    final now = DateTime.now();
+    final storageKey = _groupOfflineQueueKey(groupId);
+    _addToOfflineQueue(storageKey, (
+      kind: 'text',
+      text: text,
+      filePath: null,
+      fileName: null,
+      timestamp: now,
+    ));
+    final timestamp = now.millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final msgID = '${timestamp}_${sequence}_${_selfId}_$groupId';
+    final msg = ChatMessage(
+      text: text,
+      fromUserId: _selfId,
+      isSelf: true,
+      timestamp: now,
+      groupId: groupId,
+      isPending: true,
+      msgID: msgID,
+    );
+    _lastByPeer[groupId] = msg;
+    _appendHistory(groupId, msg);
+    _messages.add(msg);
+    await _saveOfflineQueue();
+  }
+
+  /// Drains pending group messages for [groupId]. Called after a
+  /// conn:success transition, when we believe we can reach the DHT and
+  /// therefore the peers we're grouped with. There is no per-group-member
+  /// presence in Tox's old-conference or new-group APIs (peers come and
+  /// go independently), so the trigger is the overall connection state
+  /// rather than per-peer online status as it is for C2C.
+  Future<void> _sendPendingGroupMessages(String groupId) async {
+    final storageKey = _groupOfflineQueueKey(groupId);
+    final pending = List<OfflineMessageItem>.from(_getOfflineQueue(storageKey));
+    if (pending.isEmpty) return;
+    _logger?.log(
+        '[FfiChatService] _sendPendingGroupMessages: draining ${pending.length} item(s) for groupId=$groupId');
+    final history = _historyById[groupId];
+    for (final item in pending) {
+      // We only queue text items today; skip anything that snuck in as a
+      // file (group file transfer is unsupported anyway — see sendGroupFile).
+      if (item.kind != 'text' || item.text.isEmpty) {
+        await _offlineQueuePersistence.removeItem(storageKey, item);
+        continue;
+      }
+      if (!_isConnected) {
+        _logger?.log(
+            '[FfiChatService] _sendPendingGroupMessages: lost connection mid-drain for $groupId; ${pending.length - pending.indexOf(item)} item(s) kept in queue');
+        break;
+      }
+      try {
+        final pg = groupId.toNativeUtf8();
+        final pt = item.text.toNativeUtf8();
+        try {
+          _ffi.sendGroupText(pg, pt);
+        } finally {
+          pkgffi.malloc.free(pg);
+          pkgffi.malloc.free(pt);
+        }
+        // Flip the matching pending bubble to delivered.
+        if (history != null) {
+          for (int i = history.length - 1; i >= 0; i--) {
+            final msg = history[i];
+            if (msg.isSelf &&
+                msg.isPending &&
+                msg.filePath == null &&
+                msg.text == item.text &&
+                (msg.timestamp.difference(item.timestamp).abs().inSeconds <=
+                    10)) {
+              history[i] = msg.copyWith(isPending: false);
+              _lastByPeer[groupId] = history[i];
+              try {
+                await _saveHistory(groupId);
+              } catch (_) {}
+              break;
+            }
+          }
+        }
+        await _offlineQueuePersistence.removeItem(storageKey, item);
+        await Future.delayed(const Duration(milliseconds: 100));
+      } catch (e, stackTrace) {
+        _logger?.logError(
+            '[FfiChatService] _sendPendingGroupMessages: drain failed for group $groupId',
+            e,
+            stackTrace);
+        // One drain attempt per online transition, matching C2C semantics.
+        await _offlineQueuePersistence.removeItem(storageKey, item);
+      }
+    }
+    await _saveOfflineQueue();
+  }
+
+  Future<void> _drainAllPendingGroupMessages() async {
+    for (final gid in List<String>.from(_knownGroups)) {
+      try {
+        await _sendPendingGroupMessages(gid);
+      } catch (e, st) {
+        _logger?.logError(
+            '[FfiChatService] _drainAllPendingGroupMessages: error for $gid',
+            e,
+            st);
+      }
+    }
   }
 
   Future<void> sendGroupFile(String groupId, String filePath) async {

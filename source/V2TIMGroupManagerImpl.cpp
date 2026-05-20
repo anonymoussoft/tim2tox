@@ -743,23 +743,43 @@ void V2TIMGroupManagerImpl::QuitGroup(const V2TIMString& groupID, V2TIMCallback*
         V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: Group {} not found in mappings after recovery attempt, proceeding with cleanup anyway", groupID.CString());
     }
     
-    // Get group type to determine which API to use
-    std::string group_type = "group"; // Default to group
+    // Get group type to determine which API to use.
+    // P0-B2: previously this checked the in-memory `group_info_` cache and
+    // only fell back to persistent storage when the cached value happened
+    // to equal the default sentinel "group". That meant if the cache was
+    // empty (cold start before any group info had been observed) the
+    // storage fallback worked, but if the cache had been populated with
+    // a stale value the storage entry was ignored — producing a
+    // conference/group API mismatch when QuitGroup picked the wrong leg.
+    //
+    // InviteUserToGroup uses storage as an unconditional fallback (see
+    // GetGroupTypeFromStorage call further down the file). Mirror that
+    // here so the two code paths always agree on which Tox API to call
+    // for a given group.
+    std::string group_type;
+    bool found_in_cache = false;
     {
         std::lock_guard<std::mutex> lock(group_mutex_);
         auto it = group_info_.find(groupID.CString());
         if (it != group_info_.end() && !it->second.groupType.Empty()) {
             group_type = it->second.groupType.CString();
+            found_in_cache = true;
         }
     }
-    
-    // Try to get from storage if not found in cache
-    if (group_type == "group") {
-        // Function is already declared with extern "C" at file scope
+
+    if (!found_in_cache && manager_impl_) {
         char stored_type[16];
         if (manager_impl_->GetGroupTypeFromStorage(groupID.CString(), stored_type, sizeof(stored_type))) {
             group_type = std::string(stored_type);
+            V2TIM_LOG(kInfo, "V2TIMGroupManagerImpl::QuitGroup: Loaded group_type='{}' from persistent storage for groupID={}",
+                      group_type, groupID.CString());
         }
+    }
+
+    if (group_type.empty()) {
+        group_type = "group"; // Last-resort default: new-API group
+        V2TIM_LOG(kWarning, "V2TIMGroupManagerImpl::QuitGroup: No group_type found in cache or storage for groupID={}, defaulting to '{}'",
+                  groupID.CString(), group_type);
     }
     
     // Leave the group from Tox if found
