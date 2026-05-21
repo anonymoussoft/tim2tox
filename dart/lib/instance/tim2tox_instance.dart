@@ -12,6 +12,8 @@
 /// ```
 library;
 
+import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_library_manager.dart';
+
 import '../ffi/tim2tox_ffi.dart';
 
 /// Scope for running logic on a specific tim2tox instance.
@@ -37,31 +39,48 @@ class Tim2ToxInstance {
 
   /// Runs [action] with this instance as current, then restores the previous
   /// current instance. Use for synchronous calls to TIMManager / Friendship / Group.
+  ///
+  /// Also stamps [NativeLibraryManager.currentRegistrationInstanceId] for the
+  /// duration so that listener registrations made by [action] (e.g.
+  /// `TIMMessageManager.instance.addAdvancedMsgListener`) are tagged with this
+  /// instance id in the manager's per-instance bucket. The SDK's dispatch
+  /// helper (`_listenersForCurrentDispatch()`) then routes callbacks back to
+  /// only the listeners that belong to the right instance — without this
+  /// stamp, Alice's and Bob's listeners end up in the same flat list and an
+  /// event meant for Bob fires Alice's listener.
   R runWithInstance<R>(R Function() action) {
     final lib = _lib;
     final prev = lib.getCurrentInstanceId();
+    final prevReg = NativeLibraryManager.currentRegistrationInstanceId;
     try {
       if (instanceHandle != 0) {
         lib.setCurrentInstance(instanceHandle);
+        NativeLibraryManager.currentRegistrationInstanceId = instanceHandle;
       }
       return action();
     } finally {
       lib.setCurrentInstance(prev);
+      NativeLibraryManager.currentRegistrationInstanceId = prevReg;
     }
   }
 
   /// Runs [action] with this instance as current, then restores the previous
   /// current instance. Use for async calls (login, initSDK, etc.).
+  ///
+  /// See [runWithInstance] for the registration-id-stamp rationale.
   Future<R> runWithInstanceAsync<R>(Future<R> Function() action) async {
     final lib = _lib;
     final prev = lib.getCurrentInstanceId();
+    final prevReg = NativeLibraryManager.currentRegistrationInstanceId;
     try {
       if (instanceHandle != 0) {
         lib.setCurrentInstance(instanceHandle);
+        NativeLibraryManager.currentRegistrationInstanceId = instanceHandle;
       }
       return await action();
     } finally {
       lib.setCurrentInstance(prev);
+      NativeLibraryManager.currentRegistrationInstanceId = prevReg;
     }
   }
 }

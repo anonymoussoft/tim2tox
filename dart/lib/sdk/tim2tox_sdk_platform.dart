@@ -100,6 +100,8 @@ import 'package:tencent_cloud_chat_common/utils/tencent_cloud_chat_code_info.dar
 import 'tim2tox_sdk_platform_callbacks.dart' as callbacks;
 import 'tim2tox_sdk_platform_converters.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_conversation_manager.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
+import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_friendship_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_library_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/bindings/native_imsdk_bindings_generated.dart'
     show GlobalCallbackType;
@@ -344,6 +346,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         String? msgID
       })>? _progressSubscription;
   StreamSubscription<String>? _avatarUpdatedSubscription;
+  StreamSubscription<String>? _nicknameUpdatedSubscription;
   final Map<String, V2TimMessage> _progressMsgCache =
       {}; // msgID -> cached V2TimMessage for progress lookup
 
@@ -376,6 +379,9 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _setupProgressListener();
     // Setup avatar updated listener for faceUrl cache
     _setupAvatarUpdatedListener();
+    // Setup nickname updated listener so friendship listeners fire on remote
+    // peer name changes (mirror of avatar path).
+    _setupNicknameUpdatedListener();
     // Friend status checker is started lazily when SDK listeners exist.
     // Setup internal conversation listener to handle pin/unpin from C++ layer
     _setupInternalConversationListener();
@@ -2061,7 +2067,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
               targetMessage!,
               progressValue,
             );
-          });
+          }, dispatchInstanceId: progress.instanceId);
         } else {
           // Download progress
           final downloadProgress = V2TimMessageDownloadProgress(
@@ -2095,7 +2101,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
           }
           _notifyAdvancedMsgListeners((listener) {
             listener.onMessageDownloadProgressCallback?.call(downloadProgress);
-          });
+          }, dispatchInstanceId: progress.instanceId);
         }
       } else if (!progress.isSend &&
           progress.instanceId != 0 &&
@@ -2235,6 +2241,41 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   }
 
   /// Keep the avatar cache in sync when a new avatar is downloaded.
+  /// Fans the FfiChatService `nicknameUpdated` stream out to friendship
+  /// listeners so a peer renaming themselves (alice setSelfInfo → bob's
+  /// Tox `friend_name` callback → FfiChatService poll) triggers
+  /// `onFriendInfoChanged` on bob's V2TIM friendship listeners. The platform
+  /// already does this for avatar via [_setupAvatarUpdatedListener]; this is
+  /// the symmetric path for nickname.
+  void _setupNicknameUpdatedListener() {
+    _nicknameUpdatedSubscription?.cancel();
+    _nicknameUpdatedSubscription =
+        ffiService.nicknameUpdated.listen((uid) async {
+      try {
+        final friends = await ffiService.getFriendList();
+        final match = friends.where((e) => e.userId == uid).toList();
+        if (match.isEmpty) return;
+        final f = match.first;
+        final fakeUser = FakeUser(
+          userID: uid,
+          nickName: f.nickName,
+          online: f.online,
+        );
+        final friendInfo = await fakeUserToV2TimFriendInfo(fakeUser);
+        _notifyFriendshipListeners((listener) {
+          listener.onFriendInfoChanged?.call([friendInfo]);
+        });
+        // Conversations show this contact's nickName in the row; refresh.
+        notifyConversationChangedForC2C(uid);
+      } catch (e) {
+        if (_debugLog) {
+          print(
+              '[Tim2ToxSdkPlatform] nicknameUpdated notify friendInfoChanged: $e');
+        }
+      }
+    });
+  }
+
   void _setupAvatarUpdatedListener() {
     _avatarUpdatedSubscription?.cancel();
     _avatarUpdatedSubscription = ffiService.avatarUpdated.listen((uid) async {
@@ -2535,6 +2576,7 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
     _reactionSubscription?.cancel();
     _progressSubscription?.cancel();
     _avatarUpdatedSubscription?.cancel();
+    _nicknameUpdatedSubscription?.cancel();
     _friendStatusCheckTimer?.cancel();
     _sdkListeners.clear();
     _advancedMsgListeners.clear();
@@ -3559,14 +3601,39 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
   /// Notify all Advanced Message listeners.
   ///
   /// See [_notifySDKListeners] — same per-listener isolation pattern.
+  ///
+  /// Also fans out to the SDK singleton listener list
+  /// (`TIMMessageManager.instance.v2TimAdvancedMsgListenerList`) so that
+  /// listeners registered via the binary-replacement path
+  /// (`TIMMessageManager.instance.addAdvancedMsgListener` — used by tim2tox
+  /// auto_tests for multi-instance scenarios) also receive file-related
+  /// callbacks (`onRecvNewMessage` / `onMessageDownloadProgressCallback`).
+  ///
+  /// Double-dispatch is not a concern in toxee: `V2TIMMessageManager.
+  /// addAdvancedMsgListener` checks `isPlatformRouted` (always true for
+  /// `Tim2ToxSdkPlatform`) and routes to `_advancedMsgListeners`, so the
+  /// SDK singleton list stays empty in toxee. In auto_tests, `TIMMessageManager.
+  /// instance.addAdvancedMsgListener` is called directly to populate the
+  /// singleton list, and the platform list stays empty — so each listener is
+  /// reached exactly once.
   void _notifyAdvancedMsgListeners(
-      void Function(V2TimAdvancedMsgListener) callback) {
+      void Function(V2TimAdvancedMsgListener) callback,
+      {int? dispatchInstanceId}) {
     final listeners = List.of(_advancedMsgListeners);
+    // Multi-instance routing: when a non-zero `dispatchInstanceId` is known
+    // (e.g. `progress.instanceId` from the FFI bridge), filter the SDK
+    // singleton list to only the listeners registered against that instance.
+    // Without this filter Alice's and Bob's listeners both fire for events
+    // meant for one of them. When `dispatchInstanceId` is null/0 (the toxee
+    // production case) `listenersForInstance` falls back to the flat list —
+    // byte-identical behavior to the pre-0014 platform.
+    final singletonListeners = List.of(
+        TIMMessageManager.instance.listenersForInstance(dispatchInstanceId));
     if (_debugLog) {
       _log(
-          '[Tim2ToxSdkPlatform] _notifyAdvancedMsgListeners: ${listeners.length} listeners registered');
+          '[Tim2ToxSdkPlatform] _notifyAdvancedMsgListeners: ${listeners.length} platform listeners, ${singletonListeners.length} singleton listeners (dispatchInstanceId=$dispatchInstanceId)');
     }
-    if (listeners.isEmpty) {
+    if (listeners.isEmpty && singletonListeners.isEmpty) {
       // Always warn — no UIKit listener means messages disappear, which is
       // almost always a startup-ordering bug worth surfacing in release logs.
       _log(
@@ -3583,14 +3650,41 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         _logListenerError('V2TimAdvancedMsgListener', e, st);
       }
     }
+    for (final listener in singletonListeners) {
+      // Skip if the same instance is already in the platform list to avoid
+      // double-dispatch in the (currently hypothetical) case where the same
+      // listener is registered via both APIs.
+      if (listeners.contains(listener)) continue;
+      try {
+        if (_debugLog) {
+          _log(
+              '[Tim2ToxSdkPlatform] Notifying singleton listener: ${listener.runtimeType}');
+        }
+        callback(listener);
+      } catch (e, st) {
+        _logListenerError('V2TimAdvancedMsgListener (singleton)', e, st);
+      }
+    }
   }
 
   /// Notify all Conversation listeners.
   ///
   /// See [_notifySDKListeners] — same per-listener isolation pattern.
+  ///
+  /// Also fans out to the SDK singleton listener list
+  /// (`TIMConversationManager.instance.v2TimConversationListenerList`) so that
+  /// listeners registered via the binary-replacement path
+  /// (`TIMConversationManager.instance.addConversationListener` — used by
+  /// tim2tox auto_tests in multi-instance scenarios) also receive
+  /// conversation-change callbacks. Identical dedup contract to
+  /// [_notifyAdvancedMsgListeners].
   void _notifyConversationListeners(
-      void Function(V2TimConversationListener) callback) {
+      void Function(V2TimConversationListener) callback,
+      {int? dispatchInstanceId}) {
     final listeners = List.of(_conversationListeners);
+    // See `_notifyAdvancedMsgListeners` for the per-instance filter rationale.
+    final singletonListeners = List.of(TIMConversationManager.instance
+        .listenersForInstance(dispatchInstanceId));
     for (final listener in listeners) {
       try {
         callback(listener);
@@ -3598,19 +3692,47 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
         _logListenerError('V2TimConversationListener', e, st);
       }
     }
+    for (final listener in singletonListeners) {
+      if (listeners.contains(listener)) continue;
+      try {
+        callback(listener);
+      } catch (e, st) {
+        _logListenerError('V2TimConversationListener (singleton)', e, st);
+      }
+    }
   }
 
   /// Notify all Friendship listeners.
   ///
   /// See [_notifySDKListeners] — same per-listener isolation pattern.
+  ///
+  /// Also fans out to the SDK singleton listener list
+  /// (`TIMFriendshipManager.instance.v2TimFriendshipListenerList`) so that
+  /// listeners registered via the binary-replacement path
+  /// (`TIMFriendshipManager.instance.addFriendListener` — used by tim2tox
+  /// auto_tests for multi-instance scenarios) also receive friend-info /
+  /// friend-application callbacks. Identical dedup contract to
+  /// [_notifyAdvancedMsgListeners].
   void _notifyFriendshipListeners(
-      void Function(V2TimFriendshipListener) callback) {
+      void Function(V2TimFriendshipListener) callback,
+      {int? dispatchInstanceId}) {
     final listeners = List.of(_friendshipListeners);
+    // See `_notifyAdvancedMsgListeners` for the per-instance filter rationale.
+    final singletonListeners = List.of(
+        TIMFriendshipManager.instance.listenersForInstance(dispatchInstanceId));
     for (final listener in listeners) {
       try {
         callback(listener);
       } catch (e, st) {
         _logListenerError('V2TimFriendshipListener', e, st);
+      }
+    }
+    for (final listener in singletonListeners) {
+      if (listeners.contains(listener)) continue;
+      try {
+        callback(listener);
+      } catch (e, st) {
+        _logListenerError('V2TimFriendshipListener (singleton)', e, st);
       }
     }
   }
