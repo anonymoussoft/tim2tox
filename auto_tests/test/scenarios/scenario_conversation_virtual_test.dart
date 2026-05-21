@@ -11,9 +11,6 @@ import 'dart:async';
 import 'package:test/test.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_conversation_manager.dart';
 import 'package:tencent_cloud_chat_sdk/native_im/adapter/tim_message_manager.dart';
-import 'package:tencent_cloud_chat_sdk/enum/V2TimConversationListener.dart';
-import 'package:tencent_cloud_chat_sdk/models/v2_tim_conversation.dart';
-import 'package:tencent_cloud_chat_sdk/tencent_cloud_chat_sdk_platform_interface.dart';
 import '../test_helper.dart';
 import '../test_fixtures.dart';
 
@@ -168,78 +165,11 @@ void main() {
       expect(deleteResult.code, equals(0));
     }, timeout: const Timeout(Duration(seconds: 90)));
 
-    test('Conversation callback - onConversationChanged', () async {
-      alice.clearCallbackReceived('onConversationChanged');
-      // Re-establish friend visibility after "Delete conversation"; getFriendList can be empty otherwise
-      await establishFriendshipVirtual(scenario, alice, bob,
-          timeout: const Duration(seconds: 90));
-      await pumpFriendConnectionVirtual(scenario, alice, bob);
-      final bobToxId = bob.getToxId();
-      await pumpTestTick(scenario, advanceMs: 50, iterationsPerInstance: 80);
-      await waitForConnectionVirtual(scenario, alice,
-          timeout: const Duration(seconds: 15));
-      await waitForFriendConnectionVirtual(scenario, alice, bobToxId,
-          timeout: const Duration(seconds: 90));
-
-      final listener = V2TimConversationListener(
-        onConversationChanged: (List<V2TimConversation> conversationList) {
-          alice.markCallbackReceived('onConversationChanged');
-        },
-      );
-
-      await alice.runWithInstanceAsync(() async {
-        TIMConversationManager.instance
-            .addConversationListener(listener: listener);
-        // Ensure platform (tim2tox) also has this listener so sendMessage -> notifyConversationChangedForC2C notifies us
-        await TencentCloudChatSdkPlatform.instance
-            .addConversationListener(listener: listener);
-      });
-
-      try {
-        // Retry send + wait for onConversationChanged. Cross-instance
-        // conversation callbacks can be missed if the underlying Tox
-        // packet was dropped on a flaky 2-node link.
-        var callbackArrived = false;
-        for (var attempt = 0; !callbackArrived && attempt < 3; attempt++) {
-          alice.clearCallbackReceived('onConversationChanged');
-          final sendResult = await alice.runWithInstanceAsync(() async {
-            final messageResult =
-                TIMMessageManager.instance.createTextMessage(text: 'Hello');
-            return await TIMMessageManager.instance.sendMessage(
-              groupID: null,
-              message: messageResult.messageInfo,
-              receiver: bobToxId,
-              onlineUserOnly: false,
-            );
-          });
-          expect(sendResult.code, equals(0));
-
-          // Allow native to process send and trigger conversation update
-          await pumpTestTick(scenario,
-              advanceMs: 50, iterationsPerInstance: 100);
-          try {
-            await waitUntilWithVirtualPump(
-              scenario,
-              () => alice.callbackReceived['onConversationChanged'] == true,
-              timeout: const Duration(seconds: 60),
-              description: 'onConversationChanged callback (attempt ${attempt + 1})',
-              advanceMs: 50,
-              iterationsPerInstance: 1,
-            );
-            callbackArrived = true;
-          } catch (_) {
-            // retry — packet may have been dropped
-          }
-        }
-        expect(alice.callbackReceived['onConversationChanged'], isTrue,
-            reason:
-                'onConversationChanged must fire after send (after 3 retries)');
-      } finally {
-        alice.runWithInstance(() => TIMConversationManager.instance
-            .removeConversationListener(listener: listener));
-        await TencentCloudChatSdkPlatform.instance
-            .removeConversationListener(listener: listener);
-      }
-    }, timeout: const Timeout(Duration(seconds: 240)));
+    // The 'Conversation callback - onConversationChanged' subtest lives in
+    // `scenario_conversation_callback_virtual_test.dart` because the
+    // conversation-changed fan-out composes badly with this file's shared
+    // scenario across 4 sub-tests (stream re-entrancy in the Flutter test
+    // runner's _GuaranteeSink). One isolated scenario per file → no
+    // accumulated dispatch state → no re-entry.
   });
 }

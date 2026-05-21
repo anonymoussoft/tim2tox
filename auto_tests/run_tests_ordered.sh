@@ -373,6 +373,7 @@ PHASE6_PROFILE=(
 PHASE7_CONVERSATION=(
   "test/scenarios/scenario_conversation_test.dart"
   "test/scenarios/scenario_conversation_pin_test.dart"
+  "test/scenarios/scenario_conversation_callback_test.dart"
 )
 
 # File transfer
