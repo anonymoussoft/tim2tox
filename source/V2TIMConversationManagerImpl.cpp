@@ -97,23 +97,47 @@ void V2TIMConversationManagerImpl::NotifyConversationChangedForConvID(const V2TI
         }
     }
     if (!materialized) {
-        // Minimal materialization — just the ID. Dart-side listener fans
-        // out and the consumer can re-query via GetConversation if richer
-        // state is needed.
+        // Full minimal initialization — mirror MaterializeConversation so
+        // ConversationVectorToJson's SafeGetCString calls all read valid
+        // V2TIMString pointers (V2TIMConversation contains a raw
+        // V2TIMMessage* lastMessage that is *not* zero-initialized by the
+        // struct's default ctor; leaving it as garbage segfaulted the JSON
+        // builder when called from a group/conference SendMessage path).
         conv.conversationID = conv_id.c_str();
+        conv.userID = "";
+        conv.groupID = "";
+        conv.groupType = "";
+        conv.showName = "";
+        conv.faceUrl = "";
+        conv.draftText = "";
+        conv.unreadCount = 0;
+        conv.recvOpt = static_cast<V2TIMReceiveMessageOpt>(0);
+        conv.draftTimestamp = 0;
+        conv.orderKey = 0;
+        conv.c2cReadTimestamp = 0;
+        conv.groupReadSequence = 0;
+        conv.isPinned = false;
+        // Use C2C as default type for c2c_-prefixed IDs, GROUP otherwise.
+        conv.type = (conv_id.size() >= 4 && conv_id.substr(0, 4) == "c2c_")
+                        ? V2TIM_C2C
+                        : V2TIM_GROUP;
+        conv.lastMessage = nullptr;
     }
 
     V2TIMConversationVector changed;
     changed.PushBack(conv);
 
-    // Hold the listeners lock during iteration so a concurrent
-    // RemoveConversationListener (e.g. test tearDown after the send
-    // completes) can't free the pointer while we're calling
-    // OnConversationChanged on it. The Dart bridges (DartConversationListenerImpl)
-    // do their work via SendPort which is non-blocking, so holding the
-    // mutex briefly here is fine.
-    std::lock_guard<std::mutex> lock(listeners_mutex_);
-    for (auto* l : listeners_) {
+    // Snapshot listener pointers under lock, then release before invoking.
+    // Holding listeners_mutex_ across user-code callbacks deadlocks/crashes
+    // when the callback path takes another manager-level lock (observed:
+    // SIGSEGV in callback_bridge when group/conference tests send and the
+    // bridge's per-instance dispatch contends with this lock).
+    std::vector<V2TIMConversationListener*> listeners_copy;
+    {
+        std::lock_guard<std::mutex> lock(listeners_mutex_);
+        listeners_copy = listeners_;
+    }
+    for (auto* l : listeners_copy) {
         if (!l) continue;
         try { l->OnConversationChanged(changed); } catch (...) {}
     }
