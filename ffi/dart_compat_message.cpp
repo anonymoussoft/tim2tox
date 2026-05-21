@@ -504,7 +504,10 @@ extern "C" {
                 json << "{";
                 json << "\"message_msg_id\":\"" << EscapeJsonString(msg_id) << "\",";
                 json << "\"message_seq\":" << msg.seq << ",";
-                json << "\"message_rand\":" << msg.random << ",";
+                // V2TIMMessage::random is uninitialized uint64_t (see comment
+                // in dart_compat_listeners.cpp); clamp to 0 so Dart's int-typed
+                // V2TimMessage.random field parses without a cast error.
+                json << "\"message_rand\":" << 0 << ",";
                 json << "\"message_status\":" << static_cast<int>(msg.status) << ",";
                 json << "\"message_sender\":\"" << EscapeJsonString(sender) << "\",";
                 json << "\"message_client_time\":" << msg.timestamp << ",";

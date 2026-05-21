@@ -388,7 +388,11 @@ std::string ConversationVectorToJson(const V2TIMConversationVector& conversation
                     json << "\"conv_last_msg\":{";
                     json << "\"message_msg_id\":\"" << EscapeJsonString(msg_id) << "\",";
                     json << "\"message_seq\":" << conv.lastMessage->seq << ",";
-                    json << "\"message_rand\":" << conv.lastMessage->random << ",";
+                    // V2TIMMessage::random is uninitialized uint64_t (see
+                    // comment in dart_compat_listeners.cpp); clamp to 0 to
+                    // avoid Dart "'double' is not a subtype of type 'int?'"
+                    // when the uninit value overflows int53.
+                    json << "\"message_rand\":" << 0 << ",";
                     json << "\"message_status\":" << static_cast<int>(conv.lastMessage->status) << ",";
                     json << "\"message_sender\":\"" << EscapeJsonString(sender) << "\",";
                     json << "\"message_user_id\":\"" << EscapeJsonString(user_id) << "\",";
