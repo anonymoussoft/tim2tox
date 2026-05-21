@@ -102,6 +102,16 @@ public:
         RefreshConversationCache();
     }
 
+    // Fire OnConversationChanged on all listeners with the conversation identified by
+    // conversationID. If a cached snapshot exists it's used; otherwise a minimal
+    // V2TIMConversation with just the ID is materialized so Dart listeners
+    // still observe the change (mirror of the Platform-side
+    // `notifyConversationChangedForC2C` path used by Tim2ToxSdkPlatform.sendMessage).
+    // Used from V2TIMMessageManagerImpl::SendMessage post-success so binary-path
+    // sends trigger onConversationChanged (the test contract V2TIM clients
+    // expect: sending updates the local conversation row's lastMessage).
+    void NotifyConversationChangedForConvID(const V2TIMString& conversationID);
+
 private:
     std::vector<V2TIMConversationListener*> listeners_;
     std::mutex listeners_mutex_;

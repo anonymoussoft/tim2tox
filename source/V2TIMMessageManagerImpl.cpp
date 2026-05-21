@@ -1,5 +1,6 @@
 #include "V2TIMMessageManagerImpl.h"
 #include "V2TIMManagerImpl.h" // To call Send C2C/Group messages
+#include "V2TIMConversationManagerImpl.h" // To fire OnConversationChanged after send
 #include "ToxManager.h" // Potentially needed for direct Tox calls?
 #include <V2TIMErrorCode.h>
 #include <chrono> // For timestamps
@@ -703,6 +704,33 @@ V2TIMString V2TIMMessageManagerImpl::SendMessage(
     } else {
         // Send initiated, status remains SENDING. The callback will indicate final success/failure.
         // We return the original message ID generated during creation.
+        // V2TIM contract: a successful send updates the local conversation row
+        // (lastMessage / order), and `onConversationChanged` should fire on
+        // the sender's conversation listener. The Platform-path
+        // (Tim2ToxSdkPlatform.sendMessage) already does this via
+        // `_notifyConversationListeners`; the binary-path doesn't go through
+        // there, so fire the equivalent C++ notification here.
+        try {
+            V2TIMConversationManagerImpl* cm =
+                dynamic_cast<V2TIMConversationManagerImpl*>(manager->GetConversationManager());
+            if (cm) {
+                // Build conversation ID matching the Dart-side convention
+                // (`c2c_<64-char-pubkey>` for C2C, `group_<groupID>` for group).
+                // For C2C the receiver is the 76-char Tox ID — use the first
+                // 64 chars (public key) so it matches the Dart listener's key.
+                std::string conv_id;
+                if (isGroup && !isGroupPrivate) {
+                    conv_id = std::string("group_") + groupID.CString();
+                } else {
+                    std::string r = receiver.CString();
+                    if (r.size() >= 64) r = r.substr(0, 64);
+                    conv_id = std::string("c2c_") + r;
+                }
+                cm->NotifyConversationChangedForConvID(V2TIMString(conv_id.c_str()));
+            }
+        } catch (...) {
+            // Notification failures must never block send-success.
+        }
     }
 
     return message.msgID; // Return the client-generated message ID

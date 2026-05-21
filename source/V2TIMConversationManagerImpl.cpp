@@ -80,6 +80,45 @@ void V2TIMConversationManagerImpl::RemoveConversationListener(V2TIMConversationL
     listeners_.erase(std::remove(listeners_.begin(), listeners_.end(), listener), listeners_.end());
 }
 
+void V2TIMConversationManagerImpl::NotifyConversationChangedForConvID(const V2TIMString& conversationID) {
+    const char* cid_cstr = conversationID.CString();
+    if (!cid_cstr || !*cid_cstr) return;
+    const std::string conv_id(cid_cstr);
+
+    V2TIMConversation conv;
+    bool materialized = false;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        auto it = std::find_if(cached_conversations_.begin(), cached_conversations_.end(),
+                               [&](const ConversationSnapshot& s) { return s.conversation_id == conv_id; });
+        if (it != cached_conversations_.end()) {
+            conv = MaterializeConversation(*it);
+            materialized = true;
+        }
+    }
+    if (!materialized) {
+        // Minimal materialization — just the ID. Dart-side listener fans
+        // out and the consumer can re-query via GetConversation if richer
+        // state is needed.
+        conv.conversationID = conv_id.c_str();
+    }
+
+    V2TIMConversationVector changed;
+    changed.PushBack(conv);
+
+    // Hold the listeners lock during iteration so a concurrent
+    // RemoveConversationListener (e.g. test tearDown after the send
+    // completes) can't free the pointer while we're calling
+    // OnConversationChanged on it. The Dart bridges (DartConversationListenerImpl)
+    // do their work via SendPort which is non-blocking, so holding the
+    // mutex briefly here is fine.
+    std::lock_guard<std::mutex> lock(listeners_mutex_);
+    for (auto* l : listeners_) {
+        if (!l) continue;
+        try { l->OnConversationChanged(changed); } catch (...) {}
+    }
+}
+
 // Forward declaration for multi-instance: use current instance's manager when available
 extern V2TIMManager* SafeGetV2TIMManager(void);
 
