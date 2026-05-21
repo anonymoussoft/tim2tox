@@ -2702,6 +2702,23 @@ DartConversationListenerImpl* GetOrCreateConversationListener() {
     return listener;
 }
 
+// Helper function to get or create Conversation listener for a specific
+// instance_id. Mirror of GetOrCreateAdvancedMsgListenerForInstance /
+// GetOrCreateSDKListenerForInstance — used by ReplayListenersForNewInstance
+// so the new instance's V2TIMConversationManagerImpl has at least one
+// listener registered to receive NotifyConversationChangedForConvID etc.
+// from V2TIMMessageManagerImpl::SendMessage success paths.
+DartConversationListenerImpl* GetOrCreateConversationListenerForInstance(int64_t instance_id) {
+    std::lock_guard<std::mutex> lock(g_listeners_mutex);
+    auto it = g_conversation_listeners.find(instance_id);
+    if (it != g_conversation_listeners.end()) {
+        return it->second;
+    }
+    DartConversationListenerImpl* listener = new DartConversationListenerImpl();
+    g_conversation_listeners[instance_id] = listener;
+    return listener;
+}
+
 // Helper function to get or create Group listener for current instance
 DartGroupListenerImpl* GetOrCreateGroupListener() {
     std::lock_guard<std::mutex> lock(g_listeners_mutex);
@@ -3059,6 +3076,68 @@ void ReplayListenersForNewInstance(int64_t instance_id, V2TIMManagerImpl* manage
                     mm->AddAdvancedMsgListener(listener);
                     V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] Unconditionally registered AdvancedMsg listener={} on instance_id={} msgManager={} (no prior user_data found)",
                               (void*)listener, (long long)instance_id, (void*)mm);
+                }
+            }
+        }
+    }
+
+    // Conversation listener: V2TIMMessageManagerImpl::SendMessage success
+    // path now calls V2TIMConversationManagerImpl::NotifyConversationChangedForConvID
+    // which iterates the per-instance V2TIMConversationManagerImpl::listeners_
+    // set. That set is only populated when DartSetConv*Callback ran on this
+    // instance — which only happens on instance 1 (the first node whose
+    // Dart-side TIMManager.initSDK ran). Without this replay, send-success
+    // onConversationChanged dispatch is a no-op on instance 2/3 and the
+    // scenario_conversation_callback_virtual_test + scenario_conversation_test
+    // "Conversation callback - onConversationChanged" assertions time out
+    // on the receiver node.
+    //
+    // Mirrors the AdvancedMsg pattern above: scan prior user_data for known
+    // conversation-callback names, register on first hit, plus a defense-in-
+    // depth unconditional registration when nothing was found (the C++
+    // SendMessage notification doesn't actually need user_data — only the
+    // listener has to exist on the manager).
+    {
+        bool conv_registered = false;
+        auto register_conv_listener = [&]() {
+            if (conv_registered) return;
+            DartConversationListenerImpl* listener =
+                GetOrCreateConversationListenerForInstance(instance_id);
+            if (listener) {
+                auto* cm = manager->GetConversationManager();
+                if (cm) {
+                    cm->AddConversationListener(listener);
+                    conv_registered = true;
+                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] Registered Conversation listener={} on instance_id={} convManager={}",
+                              (void*)listener, (long long)instance_id, (void*)cm);
+                }
+            }
+        };
+        static const char* kConvCallbackNames[] = {
+            "ConvEvent",
+            "ConvTotalUnreadMessageCountChanged",
+            "ConvUnreadMessageCountChangedByFilter",
+            "ConvConversationGroupCreated",
+            "ConvConversationGroupDeleted",
+            "ConvConversationGroupNameChanged",
+            "ConvConversationsAddedToGroup",
+            "ConvConversationsDeletedFromGroup",
+        };
+        for (const char* name : kConvCallbackNames) {
+            if (void* ud = find_existing_user_data(name)) {
+                StoreCallbackUserData(instance_id, name, ud);
+                register_conv_listener();
+            }
+        }
+        if (!conv_registered) {
+            DartConversationListenerImpl* listener =
+                GetOrCreateConversationListenerForInstance(instance_id);
+            if (listener) {
+                auto* cm = manager->GetConversationManager();
+                if (cm) {
+                    cm->AddConversationListener(listener);
+                    V2TIM_LOG(kInfo, "[ReplayListenersForNewInstance] Unconditionally registered Conversation listener={} on instance_id={} convManager={} (no prior user_data found)",
+                              (void*)listener, (long long)instance_id, (void*)cm);
                 }
             }
         }
