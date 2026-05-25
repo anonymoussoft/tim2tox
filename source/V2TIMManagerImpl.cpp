@@ -6865,6 +6865,8 @@ void V2TIMManagerImpl::HandleGroupPeerExit(Tox_Group_Number group_number, Tox_Gr
 }
 
 void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_Group_Peer_Number source_peer_id, Tox_Group_Peer_Number target_peer_id, Tox_Group_Mod_Event mod_type) {
+    V2TIM_LOG(kInfo, "[HandleGroupModeration] ENTRY instance_id={} group_number={} source_peer={} target_peer={} mod_type={}",
+              (long long)GetInstanceIdFromManager(this), group_number, source_peer_id, target_peer_id, static_cast<int>(mod_type));
     V2TIMString groupID;
     {
         std::lock_guard<std::mutex> lock(mutex_);

@@ -777,9 +777,18 @@ run_single_test() {
     FAILED_TESTS+=("$test_name")
   fi
 
-  # Show last 30 lines of output for debugging
-  echo -e "${YELLOW}Last 30 lines of output:${NC}" | tee -a "$RESULTS_FILE"
-  tail -30 "$last_output_file" | tee -a "$RESULTS_FILE"
+  # Surface the actual Dart test assertion(s) first — on multi-subtest scenarios the
+  # failing 'expect'/timeout is otherwise buried far above the teardown spam that the
+  # tail captures, making CI failures undiagnosable from the artifact alone.
+  echo -e "${YELLOW}Assertion markers:${NC}" | tee -a "$RESULTS_FILE"
+  grep -aE '[+][0-9]+ -[0-9]+:|\[E\]|Expected:|Actual:|TimeoutException|Exception:|Test failed|Which:' "$last_output_file" \
+    | grep -avE '^Shell:|\[establishFriendship\]|\[waitForFriendConnection\]|\[Bootstrap\]' \
+    | tail -60 | tee -a "$RESULTS_FILE" || true
+
+  # Show last 120 lines of output for debugging (enough to clear teardown noise and
+  # reach the failing subtest's native logs on multi-subtest scenario files).
+  echo -e "${YELLOW}Last 120 lines of output:${NC}" | tee -a "$RESULTS_FILE"
+  tail -120 "$last_output_file" | tee -a "$RESULTS_FILE"
 
   ((TOTAL_FAILED++))
   rm -f "$last_output_file"
