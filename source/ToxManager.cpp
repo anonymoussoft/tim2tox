@@ -1415,8 +1415,13 @@ bool ToxManager::loadFrom(const std::string& path) {
         file.seekg(0);
         file.read(reinterpret_cast<char*>(data.data()), size);
 
-        // 创建新的 Tox 选项
-        Tox_Options options;
+        // 创建新的 Tox 选项。
+        // 必须零初始化：新版 c-toxcore 的 tox_options_default() 在赋默认值之前
+        // 会先调用 tox_options_set_proxy_host(options, nullptr)，该函数读取
+        // options->experimental_owned_data，若为真还会 free(options->owned_proxy_host)。
+        // 未初始化的栈内存会让这两个字段是垃圾值，从而 free() 野指针导致 SIGSEGV。
+        // tox_options_new() 走 calloc 不受影响，唯独这里的栈分配需要显式清零。
+        Tox_Options options{};
         tox_options_default(&options);
         options.savedata_type = TOX_SAVEDATA_TYPE_TOX_SAVE;
         options.savedata_data = data.data();

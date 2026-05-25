@@ -211,9 +211,15 @@ void main() {
       expect(aliceUserIDFromList, isNotNull, reason: 'could not identify Alice in member list (alicePublicKey or other member)');
       expect(bobUserIDFromList, isNotNull, reason: 'could not identify Bob in member list (bobPublicKey or other member)');
 
+      // Query by the userID reported by getGroupMemberList, NOT by Alice's
+      // long-term public key. For NGCv2 ('Meeting') groups, a non-self peer's
+      // userID is the group-scoped peer key, which does not equal the friend's
+      // long-term key — so getGroupMembersInfo can only resolve a non-self peer
+      // by the same userID the member list exposed. (Self lookups still resolve
+      // by long-term key via getGroupMembersInfo's self short-circuit.)
       final aliceMemberInfoResult = await bob.runWithInstanceAsync(() async => TIMGroupManager.instance.getGroupMembersInfo(
         groupID: groupId,
-        memberList: [alicePublicKey],
+        memberList: [aliceUserIDFromList!],
       ));
       expect(aliceMemberInfoResult.code, equals(0), reason: 'getGroupMembersInfo failed: ${aliceMemberInfoResult.code}');
       expect(aliceMemberInfoResult.data, isNotNull);

@@ -103,7 +103,6 @@ void main() {
         final inviteResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
           groupID: groupId,
           userList: [bobPublicKey, charliePublicKey],
-          instanceId: alice.testInstanceHandle,
         ));
         expect(inviteResult.code, equals(0));
         expect(inviteResult.data, isNotNull);
@@ -174,7 +173,6 @@ void main() {
       final inviteResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
         groupID: groupId,
         userList: [bob.getPublicKey(), charlie.getPublicKey()],
-        instanceId: alice.testInstanceHandle,
       ));
       expect(inviteResult.code, equals(0));
       print('[ConferenceSendMessage] Invite result: code=${inviteResult.code}, data=${inviteResult.data?.length ?? 0}');
@@ -332,7 +330,6 @@ void main() {
         final inviteResult = await alice.runWithInstanceAsync(() async => TIMGroupManager.instance.inviteUserToGroup(
           groupID: groupId,
           userList: [bobPk],
-          instanceId: alice.testInstanceHandle,
         ));
         expect(inviteResult.code, equals(0));
         expect(inviteResult.data, isNotNull);
