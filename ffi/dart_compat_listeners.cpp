@@ -1776,10 +1776,16 @@ static std::string GroupChangeInfoVectorToJson(const V2TIMGroupChangeInfoVector&
 
 // Helper function to convert V2TIMGroupMemberChangeInfo to JSON
 static std::string GroupMemberChangeInfoToJson(const V2TIMGroupMemberChangeInfo& change) {
+    // Field names MUST match Dart's V2TimGroupMemberChangeInfo.fromJson, which reads
+    // group_tips_member_change_info_identifier / _shutupTime — NOT userID / muteTime.
+    // Emitting the wrong keys made Dart parse an empty userID, so onMemberInfoChanged
+    // listeners could not tell which member changed (e.g. scenario_group_state_changes_test's
+    // role-change notification fired but carried no identity). Mirrors the correct names
+    // already used by dart_compat_group.cpp's NotifyTargetUserMemberInfoChanged.
     std::ostringstream json;
     json << "{";
-    json << "\"userID\":\"" << EscapeJsonString(change.userID.CString()) << "\",";
-    json << "\"muteTime\":" << change.muteTime;
+    json << "\"group_tips_member_change_info_identifier\":\"" << EscapeJsonString(change.userID.CString()) << "\",";
+    json << "\"group_tips_member_change_info_shutupTime\":" << change.muteTime;
     json << "}";
     return json.str();
 }
@@ -1946,14 +1952,24 @@ public:
         // Build GroupTipsElem JSON for member info change; tip_type must be Dart CGroupTipsType.GROUP_TIPS_TYPE_GROUP_MEMBER_INFO_CHANGE(7)
         V2TIMGroupMemberInfo opMember;
         opMember.userID = V2TIMString(""); // No operator info available
-        V2TIMGroupMemberInfoVector emptyMemberList;
+        // Populate the tip's member list with the changed members. Dart's
+        // native_library_manager only delivers onMemberInfoChanged when the tip's
+        // memberList is non-empty (`if (groupMemberList.isNotEmpty)`); a member-info
+        // change with an empty member list is silently dropped. Real Tencent IM tips
+        // carry the affected members here too, so mirror that.
+        V2TIMGroupMemberInfoVector changedMembers;
+        for (size_t i = 0; i < v2TIMGroupMemberChangeInfoList.Size(); i++) {
+            V2TIMGroupMemberInfo m;
+            m.userID = v2TIMGroupMemberChangeInfoList[i].userID;
+            changedMembers.PushBack(m);
+        }
         V2TIMGroupChangeInfoVector emptyChanges;
-        
+
         std::string groupTipsJson = BuildGroupTipsElemJson(
-            groupID, 
+            groupID,
             kDartTipTypeGroupMemberInfoChange,
             opMember,
-            emptyMemberList,
+            changedMembers,
             emptyChanges,
             v2TIMGroupMemberChangeInfoList,
             0);

@@ -3312,7 +3312,31 @@ void V2TIMManagerImpl::JoinGroup(const V2TIMString& groupID, const V2TIMString& 
     fprintf(stdout, "[JoinGroup] ✅ ToxManager and Tox instance available\n");
     fflush(stdout);
     V2TIM_LOG(kInfo, "[JoinGroup] Tox instance available");
-    
+
+    // Idempotent join for conferences: AV/text conferences auto-join inside the
+    // invite callback (see the conference invite handler's toxav_join_av_groupchat /
+    // tox_conference_join path) and then map the invite's tox_conf_<friend>_<ts> ID
+    // with type "conference". A caller that then follows V2TIM semantics — join with
+    // the groupID it received in onMemberInvited — would fall through to the pending
+    // path, find no pending (we auto-joined, so none was stored) and a non-creator
+    // ID, and fail with 6017 ERR_INVALID_PARAMETERS. For an already-joined conference
+    // the join is a no-op success. Scoped to conference type so NGCv2 ("group") join
+    // flows keep their existing pending/chat_id behaviour untouched.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const bool already_mapped =
+            group_id_to_group_number_.find(groupID) != group_id_to_group_number_.end();
+        auto type_it = group_id_to_type_.find(groupID);
+        const bool is_conference =
+            type_it != group_id_to_type_.end() && type_it->second == "conference";
+        if (already_mapped && is_conference) {
+            V2TIM_LOG(kInfo, "[JoinGroup] conference groupID {} already mapped (already a member) — returning success (idempotent join)",
+                      groupID.CString());
+            if (callback) callback->OnSuccess();
+            return;
+        }
+    }
+
     // Single-instance real client: allow joining a public group by passing chat_id (64-char hex) as groupID
     // so the creator can share the chat_id (e.g. link/QR) and others join without invite or cross-instance storage.
     char stored_chat_id[65]; // 32 bytes * 2 (hex) + 1 (null terminator)
@@ -6841,45 +6865,77 @@ void V2TIMManagerImpl::HandleGroupPeerExit(Tox_Group_Number group_number, Tox_Gr
 }
 
 void V2TIMManagerImpl::HandleGroupModeration(Tox_Group_Number group_number, Tox_Group_Peer_Number source_peer_id, Tox_Group_Peer_Number target_peer_id, Tox_Group_Mod_Event mod_type) {
+    V2TIM_LOG(kInfo, "[HandleGroupModeration] ENTRY instance_id={} group_number={} source_peer={} target_peer={} mod_type={}",
+              (long long)GetInstanceIdFromManager(this), group_number, source_peer_id, target_peer_id, static_cast<int>(mod_type));
     V2TIMString groupID;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = group_number_to_group_id_.find(group_number);
         if (it == group_number_to_group_id_.end()) {
+            V2TIM_LOG(kWarning, "[HandleGroupModeration] group_number={} not in mapping (size={}) — returning early",
+                      group_number, group_number_to_group_id_.size());
             return;
         }
         groupID = it->second;
     }
-    
+
     Tox* tox = GetToxManager()->getTox();
-    if (!tox) return;
-    
-    // Get target peer public key
+    if (!tox) { V2TIM_LOG(kWarning, "[HandleGroupModeration] tox null — returning early"); return; }
+
+    // Resolve whether this moderation targets our own peer FIRST. The self peer is
+    // not reachable through tox_group_peer_get_public_key — it resolves peers via
+    // their GC_Connection, and a peer has no connection to itself, so the peer API
+    // returns PEER_NOT_FOUND for the self peer_id. When the founder grants/revokes
+    // OUR role, the moderation event arrives with target_peer_id == self_peer_id, so
+    // we must take the self public-key path. Doing the self check before the key
+    // lookup is what lets the "my role changed" notification below actually fire;
+    // previously the early return on the failed peer lookup swallowed it (the cause
+    // of scenario_group_state_changes_test's role-change timeout).
+    Tox_Err_Group_Self_Query err_self;
+    Tox_Group_Peer_Number self_peer_id = tox_group_self_get_peer_id(tox, group_number, &err_self);
+    const bool self_is_target =
+        (err_self == TOX_ERR_GROUP_SELF_QUERY_OK && target_peer_id == self_peer_id);
+
+    // Get target peer public key (self vs. other-peer path).
     uint8_t target_pubkey[TOX_PUBLIC_KEY_SIZE];
-    Tox_Err_Group_Peer_Query err_key;
-    if (!GetToxManager()->getGroupPeerPublicKey(group_number, target_peer_id, target_pubkey, &err_key) ||
-        err_key != TOX_ERR_GROUP_PEER_QUERY_OK) {
+    Tox_Err_Group_Peer_Query err_key = TOX_ERR_GROUP_PEER_QUERY_OK;
+    bool got_target_key = false;
+    if (self_is_target) {
+        Tox_Err_Group_Self_Query err_self_key;
+        got_target_key = tox_group_self_get_public_key(tox, group_number, target_pubkey, &err_self_key)
+                         && err_self_key == TOX_ERR_GROUP_SELF_QUERY_OK;
+    } else {
+        got_target_key = GetToxManager()->getGroupPeerPublicKey(group_number, target_peer_id, target_pubkey, &err_key)
+                         && err_key == TOX_ERR_GROUP_PEER_QUERY_OK;
+    }
+    if (!got_target_key) {
+        V2TIM_LOG(kWarning, "[HandleGroupModeration] could not resolve target pubkey (self_is_target={}, err_key={}) — returning early",
+                  self_is_target ? 1 : 0, static_cast<int>(err_key));
         return;
     }
-    
+
     std::string target_userID = ToxUtil::tox_bytes_to_hex(target_pubkey, TOX_PUBLIC_KEY_SIZE);
-    
-    // Get target peer role after moderation (for future use if needed)
-    Tox_Group_Role new_role = tox_group_peer_get_role(tox, group_number, target_peer_id, &err_key);
-    (void)new_role; // Suppress unused variable warning
-    
+
+    // Get target peer role after moderation (for future use if needed). Only meaningful
+    // for non-self peers; the self role would use tox_group_self_get_role.
+    if (!self_is_target) {
+        Tox_Group_Role new_role = tox_group_peer_get_role(tox, group_number, target_peer_id, &err_key);
+        (void)new_role; // Suppress unused variable warning
+    }
+
     // Notify group listeners based on moderation type
     std::vector<V2TIMGroupListener*> listeners_copy;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         listeners_copy.assign(group_listeners_.begin(), group_listeners_.end());
     }
-    
+
     // When this client is the target of the moderation (e.g. role changed by someone else),
     // notify listeners with OnMemberInfoChanged so the app sees "my role changed".
-    Tox_Err_Group_Self_Query err_self;
-    Tox_Group_Peer_Number self_peer_id = tox_group_self_get_peer_id(tox, group_number, &err_self);
-    if (err_self == TOX_ERR_GROUP_SELF_QUERY_OK && target_peer_id == self_peer_id && !listeners_copy.empty()) {
+    V2TIM_LOG(kInfo, "[HandleGroupModeration] self_is_target={} listeners={} — {} OnMemberInfoChanged",
+              self_is_target ? 1 : 0, listeners_copy.size(),
+              (self_is_target && !listeners_copy.empty()) ? "firing" : "skipping");
+    if (self_is_target && !listeners_copy.empty()) {
         V2TIMGroupMemberChangeInfo changeInfo;
         changeInfo.userID = V2TIMString(target_userID.c_str());
         changeInfo.muteTime = 0;
