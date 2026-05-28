@@ -52,8 +52,15 @@ extern "C" {
         }
 
         InstallCrashHandlersOnce();
-        
-        bool result = Dart_InitializeApiDL(data);
+
+        // Dart_InitializeApiDL returns intptr_t: 0 = success, non-zero = failure
+        // (missing symbols or ABI mismatch). Without a successful init,
+        // Dart_PostCObject_DL must not be called, so propagate the failure
+        // instead of silently flipping g_dart_api_initialized.
+        intptr_t init_rc = Dart_InitializeApiDL(data);
+        if (init_rc != 0) {
+            return 1;
+        }
         g_dart_api_initialized = true;
         return 0;
     }
@@ -126,16 +133,9 @@ void SendCallbackToDart(const char* callback_type, const std::string& json_data,
     }
 
     cobj.value.as_string = message_cstr;
-    bool posted = false;
-    try {
-        posted = Dart_PostCObject_DL(g_dart_port, &cobj);
-    } catch (...) {
-        V2TIM_LOG(kError, "[callback_bridge] SendCallbackToDart: EXCEPTION caught in Dart_PostCObject_DL!");
-        free(message_cstr);
-        return;
-    }
-
-    if (!posted) {
-        free(message_cstr);
-    }
+    // Dart_PostCObject_DL copies the CObject graph (including the kString
+    // payload) into the receiving isolate's heap before returning, so the
+    // caller retains ownership of message_cstr regardless of post success.
+    Dart_PostCObject_DL(g_dart_port, &cobj);
+    free(message_cstr);
 }

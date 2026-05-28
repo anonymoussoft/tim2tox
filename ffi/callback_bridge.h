@@ -33,7 +33,9 @@ struct Dart_CObject {
     } value;
 };
 
-static inline bool Dart_InitializeApiDL(void* /*data*/) { return false; }
+// Real Dart_InitializeApiDL returns intptr_t (0 = success, non-zero = failure).
+// The stub returns -1 to report "not implemented" without the misleading bool.
+static inline intptr_t Dart_InitializeApiDL(void* /*data*/) { return -1; }
 static inline bool Dart_PostCObject_DL(Dart_Port /*port*/, Dart_CObject* /*obj*/) { return false; }
 #endif
 
