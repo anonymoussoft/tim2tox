@@ -5155,7 +5155,10 @@ class FfiChatService {
     pkgffi.malloc.free(pname);
     pkgffi.malloc.free(ptype);
     if (n > 0) {
+      // Extract the id and free the native buffer BEFORE the awaited
+      // prefs/history work below — a throw from those writes must not leak it.
       final gid = buf.cast<pkgffi.Utf8>().toDartString();
+      pkgffi.malloc.free(buf);
       _knownGroups.add(gid);
       // Remove from quit groups if it was previously quit (in case of group ID reuse)
       _quitGroups.remove(gid);
@@ -5164,7 +5167,6 @@ class FfiChatService {
       // This is important when group IDs are reused (e.g., IRC channels)
       await clearGroupHistory(gid);
       await _persistKnownGroups(); // This will call _syncKnownGroupsToNative()
-      pkgffi.malloc.free(buf);
       return gid;
     }
     pkgffi.malloc.free(buf);
