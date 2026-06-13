@@ -594,6 +594,17 @@ class FfiChatService {
   final Map<String, ChatMessage> _lastByPeer = {};
   Map<String, ChatMessage> get lastMessages => _lastByPeer;
   final Map<String, int> _unreadByPeer = {};
+
+  /// True once an external consumer (the installed [Tim2ToxSdkPlatform]'s
+  /// `messages.listen` → `onGroupMessageReceivedForUnread` → [incrementGroupUnread])
+  /// owns GROUP unread accrual. When set, [ingestInboundGroupText] must NOT also
+  /// bump `_unreadByPeer` for the group, or every Dart-path (poll / l3-inject)
+  /// group message would be counted TWICE (ingest bumps directly AND its
+  /// `_messages.add` re-enters the platform listener which bumps again). Left
+  /// false in headless/test contexts that have no platform listener, so ingest
+  /// remains the sole bumper there. Set by the integrator right after wiring
+  /// `onGroupMessageReceivedForUnread`.
+  bool groupUnreadHandledExternally = false;
   String? _activePeerId;
   String? get activePeerId => _activePeerId; // Expose activePeerId for FakeIM
   final Map<String, DateTime> _typingUntil = {}; // peerId -> expiry
@@ -4555,6 +4566,13 @@ class FfiChatService {
       if (!alreadyReflected) {
         _knownGroups.add(gid);
         _lastByPeer[gid] = duplicate;
+        // NB: do NOT apply the groupUnreadHandledExternally guard here. This is
+        // the cross-path duplicate branch (the binary-replacement/native side
+        // persisted the message first). The `_messages.add(duplicate)` below
+        // re-enters the platform listener, but the listener DEDUPS an already-
+        // seen inbound and returns BEFORE its unread callback — so it will NOT
+        // bump. This direct bump is therefore the GUARANTEED single source for
+        // this branch; guarding it would UNDER-count (codex P1).
         if (_activePeerId == gid) {
           _unreadByPeer[gid] = 0;
         } else {
@@ -4583,10 +4601,16 @@ class FfiChatService {
       msgID: msgID,
     );
     _lastByPeer[gid] = msg; // reuse for group last message
-    if (_activePeerId == gid) {
-      _unreadByPeer[gid] = 0;
-    } else {
-      _unreadByPeer.update(gid, (v) => v + 1, ifAbsent: () => 1);
+    // Skip the direct unread write when the platform owns group unread: the
+    // `_messages.add(msg)` below re-enters Tim2ToxSdkPlatform's messages.listen,
+    // which calls onGroupMessageReceivedForUnread -> incrementGroupUnread. Doing
+    // BOTH double-counts every Dart-path (poll / l3-inject) group message.
+    if (!groupUnreadHandledExternally) {
+      if (_activePeerId == gid) {
+        _unreadByPeer[gid] = 0;
+      } else {
+        _unreadByPeer.update(gid, (v) => v + 1, ifAbsent: () => 1);
+      }
     }
     _appendHistory(gid, msg);
     _messages.add(msg);
