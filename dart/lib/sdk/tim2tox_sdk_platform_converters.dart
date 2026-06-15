@@ -420,6 +420,20 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
       msg.elemList.add(msg.textElem!);
     }
 
+    // Preserve any sender-side reply/forward metadata persisted on the
+    // ChatMessage (the V2TIM `{"messageReply":{...}}` cloudCustomData the UIKit
+    // composer built). The text-embedded merger/reply branches above return
+    // early with their OWN rebuilt cloudCustomData; this general path handles a
+    // reply persisted as plain text + `cloudCustomData` (the arm/consume
+    // sender-side persistence in FfiChatService.sendText/sendGroupText), where
+    // parseReplyMessage(text) is false. Without this, the quote renders LIVE
+    // (the composer's in-memory V2TimMessage carries it) but is LOST on cold
+    // reload through getHistoryMessageList* — the quote silently vanishes after
+    // reopening the chat. Round-trips the composer's format verbatim. (codex.)
+    if (chatMsg.cloudCustomData != null && chatMsg.cloudCustomData!.isNotEmpty) {
+      msg.cloudCustomData = chatMsg.cloudCustomData;
+    }
+
     return msg;
   }
 

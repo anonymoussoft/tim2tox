@@ -5237,11 +5237,24 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
                 ? cloudCustomData
                 : messageToSend.cloudCustomData,
           );
-          await provider.sendText(
-            userID: userID,
-            groupID: groupID.isNotEmpty ? groupID : null,
-            text: text,
-          );
+          try {
+            await provider.sendText(
+              userID: userID,
+              groupID: groupID.isNotEmpty ? groupID : null,
+              text: text,
+            );
+          } finally {
+            // Belt-and-suspenders against an armed-value LEAK: the consuming
+            // send clears the armed cloudCustomData at the top of
+            // FfiChatService.sendText/sendGroupText, but if provider.sendText
+            // throws BEFORE reaching it (e.g. messageManager == null throws in
+            // FakeMsgProvider.sendText), the armed reply would survive this
+            // branch and could attach to a later face/location/custom send
+            // (which also route through provider.sendText and consume it) or an
+            // image/file send's successor. Always clear here so a real armed
+            // value can never outlive the text branch. (codex review.)
+            ffiService.armNextSendCloudCustomData(null);
+          }
           if (_debugLog)
             print('[Tim2ToxSdkPlatform] Text message sent successfully');
         } else if (messageToSend.imageElem != null &&

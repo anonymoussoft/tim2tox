@@ -3844,10 +3844,13 @@ class FfiChatService {
   /// lived only on the in-memory message and was lost on cold start).
   ///
   /// SCOPE (deliberate, documented): it is NOT sent over Tox (`_ffi.sendText`
-  /// carries plain text only — the peer never sees the quote) and it is NOT
-  /// carried through the OFFLINE queue (a reply sent while the peer is offline
-  /// persists as plain text). Both are out of scope for this sender-side
-  /// persistence fix and are tracked follow-ups.
+  /// carries plain text only — the peer never sees the quote). The C2C offline
+  /// queue DOES persist it (`_queueOfflineText` threads `cloudCustomData`
+  /// through, so a reply sent while the peer is offline keeps its quote on
+  /// reconnect/reload); only the GROUP offline queue drops it
+  /// (`_queueOfflineGroupText` is text-only) and the over-the-wire delivery
+  /// remain out of scope for this sender-side persistence fix (tracked
+  /// follow-ups).
   Future<void> sendText(String peerId, String text,
       {String? cloudCustomData}) async {
     // Consume any armed reply-quote/forward cloudCustomData (the composer reply
@@ -4715,7 +4718,10 @@ class FfiChatService {
     required String data,
   }) {
     final normalizedFrom = from.length > 64 ? _normalizeFriendId(from) : from;
-    if (from != _selfId && isBlocked(normalizedFrom)) {
+    // Compare the NORMALIZED sender against _selfId for the self-skip guards: a
+    // caller that hands us a 76-char self Tox id must still be recognized as
+    // self (otherwise a self-echo could be counted as unread / blocked). (codex.)
+    if (normalizedFrom != _selfId && isBlocked(normalizedFrom)) {
       _logger?.log(
           '[FfiChatService] ingestInboundC2cCustom: dropping blocked sender');
       return false;
@@ -4742,7 +4748,7 @@ class FfiChatService {
       mediaKind: 'custom',
     );
     _lastByPeer[normalizedFrom] = msg;
-    if (_activePeerId != normalizedFrom && from != _selfId) {
+    if (_activePeerId != normalizedFrom && normalizedFrom != _selfId) {
       _unreadByPeer.update(normalizedFrom, (v) => v + 1, ifAbsent: () => 1);
     }
     _appendHistory(normalizedFrom, msg);
