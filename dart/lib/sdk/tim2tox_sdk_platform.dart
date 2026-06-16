@@ -7886,9 +7886,14 @@ class Tim2ToxSdkPlatform extends TencentCloudChatSdkPlatform {
       getFriendApplicationList() async {
     try {
       final apps = await ffiService.getFriendApplications();
+      final seededNicks = ffiService.seededApplicationNicknames;
       final appList = apps
           .map((app) => fakeFriendApplicationToV2TimFriendApplication(
-                FakeFriendApplication(userID: app.userId, wording: app.wording),
+                FakeFriendApplication(
+                  userID: app.userId,
+                  wording: app.wording,
+                  nickName: seededNicks[app.userId],
+                ),
               ))
           .toList();
 

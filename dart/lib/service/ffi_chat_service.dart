@@ -4254,6 +4254,59 @@ class FfiChatService {
   /// to accept, so old wordings are no longer interesting) and on dispose.
   final Map<String, Set<String>> _observedApplicationWordings = {};
 
+  /// L3 SEED HARNESS ONLY: locally-seeded inbound friend applications that have
+  /// no backing C++ queue entry (the screenshot/demo pipeline materializes a
+  /// pending "new friend" request without a real peer). Merged into
+  /// [getFriendApplications] so the New-Contacts list renders them, and the
+  /// applicant display name is carried in [_seededApplicationNicknames] (the
+  /// raw `(userId, wording)` list the C++ queue uses has no nickname slot).
+  /// Pure Dart state — never persisted, cleared on logout like the observed
+  /// wordings. Populated only via [seedFriendApplication] (debug L3 surface).
+  final List<({String userId, String wording})> _seededApplications = [];
+  final Map<String, String> _seededApplicationNicknames = {};
+
+  /// Read-only view of seeded applicant nicknames (userId → display name), so
+  /// the SDK/platform conversion can fill `V2TimFriendApplication.nickname`
+  /// for a seeded request. Empty in production (nothing seeds it).
+  Map<String, String> get seededApplicationNicknames =>
+      Map.unmodifiable(_seededApplicationNicknames);
+
+  /// L3 SEED HARNESS ONLY: materialize a pending INBOUND friend application
+  /// from [userId] with the given [wording], optionally carrying a display
+  /// [nickName]. Idempotent on (userId, wording). Surfaces on the next
+  /// [getFriendApplications] poll without any C++/native round-trip.
+  void seedFriendApplication({
+    required String userId,
+    required String wording,
+    String? nickName,
+  }) {
+    final norm = _normalizeApplicationUserId(userId);
+    final already = _seededApplications
+        .any((a) => _normalizeApplicationUserId(a.userId) == norm
+            && a.wording == wording);
+    if (!already) {
+      _seededApplications.add((userId: norm, wording: wording));
+    }
+    if (nickName != null && nickName.trim().isNotEmpty) {
+      _seededApplicationNicknames[norm] = nickName.trim();
+    }
+  }
+
+  /// L3 SEED HARNESS ONLY: drop all seeded applications (used by --reset).
+  void clearSeededApplications() {
+    _seededApplications.clear();
+    _seededApplicationNicknames.clear();
+  }
+
+  /// L3 SEED HARNESS ONLY: cache a friend's display name locally so a seeded
+  /// (offline / norequest-added) friend renders with a real name instead of
+  /// the raw public key. Writes the SAME friend-nickname cache
+  /// [getFriendList] falls back to when Tox reports an empty nickname.
+  Future<void> seedLocalFriendNickname(String userId, String nickname) async {
+    final uid = userId.length > 64 ? _normalizeFriendId(userId) : userId;
+    await _prefs?.setFriendNickname(uid, nickname);
+  }
+
   Future<List<({String userId, String wording})>>
       getFriendApplications() async {
     final raw = await _getFriendApplicationsUnfiltered();
@@ -4283,7 +4336,19 @@ class FfiChatService {
         'filtered=${filtered.map((a) => '${_normalizeApplicationUserId(a.userId)}:${a.wording}').toList()}',
       );
     }
-    return filtered;
+    if (_seededApplications.isEmpty) return filtered;
+    // Merge locally-seeded applications (L3 demo seam; no C++ backing), skipping
+    // any whose (userId, wording) fingerprint already came from the live queue.
+    final seen = filtered
+        .map((a) =>
+            _fingerprint(_normalizeApplicationUserId(a.userId), a.wording))
+        .toSet();
+    final merged = [...filtered];
+    for (final s in _seededApplications) {
+      final fp = _fingerprint(_normalizeApplicationUserId(s.userId), s.wording);
+      if (seen.add(fp)) merged.add(s);
+    }
+    return merged;
   }
 
   /// Mark all currently-pending friend applications from [userID] as dismissed
@@ -4304,6 +4369,11 @@ class FfiChatService {
   /// never seen is a no-op.
   Future<void> refuseFriendApplication(String userID) async {
     final normalized = _normalizeApplicationUserId(userID);
+    // Drop any locally-seeded application for this user first — it has no C++
+    // backing entry, so the dismissed-fingerprint path below cannot filter it.
+    _seededApplications
+        .removeWhere((a) => _normalizeApplicationUserId(a.userId) == normalized);
+    _seededApplicationNicknames.remove(normalized);
     final apps = await _getFriendApplicationsUnfiltered();
     final liveWordings = apps
         .where((a) => _normalizeApplicationUserId(a.userId) == normalized)
@@ -4753,6 +4823,50 @@ class FfiChatService {
       _unreadByPeer.update(normalizedFrom, (v) => v + 1, ifAbsent: () => 1);
     }
     _appendHistory(normalizedFrom, msg);
+    _messages.add(msg);
+    return true;
+  }
+
+  /// L3 SEED HARNESS ONLY: materialize one DELIVERED plain-text C2C message in
+  /// a conversation through the same local history / unread / preview / UI
+  /// pipeline as native delivery — WITHOUT a real peer. Unlike
+  /// [ingestInboundC2cCustom] this stores plain text (`mediaKind` null) so the
+  /// chat renders a normal text bubble, and it supports BOTH directions:
+  ///   - `isSelf: false` → an inbound bubble from [peer] (bumps unread when the
+  ///     chat is not active), exactly like a received message;
+  ///   - `isSelf: true`  → a sender-side DELIVERED bubble (no unread, no
+  ///     offline-queue "sending" state — the screenshot pipeline needs clean
+  ///     two-sided history without a live DHT round-trip).
+  /// [peer] is the conversation key (the friend's id, bare or full Tox id);
+  /// pass [epochMs] to control ordering across a scripted back-and-forth.
+  /// Returns false only when the (inbound) sender is blocked.
+  bool ingestC2cText({
+    required String peer,
+    required String text,
+    required bool isSelf,
+    int? epochMs,
+  }) {
+    final convKey = peer.length > 64 ? _normalizeFriendId(peer) : peer;
+    if (!isSelf && convKey != _selfId && isBlocked(convKey)) {
+      _logger?.log('[FfiChatService] ingestC2cText: dropping blocked sender');
+      return false;
+    }
+    final ms = epochMs ?? DateTime.now().millisecondsSinceEpoch;
+    final sequence = _msgIDSequence++;
+    final fromUserId = isSelf ? (_selfId.isNotEmpty ? _selfId : convKey) : convKey;
+    final msgID = '${ms}_${sequence}_$convKey';
+    final msg = ChatMessage(
+      text: text,
+      fromUserId: fromUserId,
+      isSelf: isSelf,
+      timestamp: DateTime.fromMillisecondsSinceEpoch(ms),
+      msgID: msgID,
+    );
+    _lastByPeer[convKey] = msg;
+    if (!isSelf && _activePeerId != convKey && convKey != _selfId) {
+      _unreadByPeer.update(convKey, (v) => v + 1, ifAbsent: () => 1);
+    }
+    _appendHistory(convKey, msg);
     _messages.add(msg);
     return true;
   }
@@ -7783,6 +7897,8 @@ class FfiChatService {
     _typingUntil.clear();
     _processingFileDone.clear();
     _observedApplicationWordings.clear();
+    _seededApplications.clear();
+    _seededApplicationNicknames.clear();
     _activePeerId = null;
 
     // P1-18: previously-leaked maps. Empty them so a re-init of the service

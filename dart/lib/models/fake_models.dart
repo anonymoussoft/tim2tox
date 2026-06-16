@@ -42,9 +42,17 @@ class FakeFriendApplication {
   FakeFriendApplication({
     required this.userID,
     required this.wording,
+    this.nickName,
+    this.faceUrl,
   });
   final String userID;
   final String wording;
+
+  /// Optional display name for the applicant. Tox friend requests carry no
+  /// nickname at the protocol level, so this is normally null; the L3 seed
+  /// harness fills it so a demo "new friend" request shows a real name.
+  final String? nickName;
+  final String? faceUrl;
 }
 
 class FakeFriendDeleted {

@@ -555,6 +555,8 @@ extension Tim2ToxSdkPlatformConverters on Tim2ToxSdkPlatform {
       FakeFriendApplication fakeApp) {
     return V2TimFriendApplication(
       userID: fakeApp.userID,
+      nickname: fakeApp.nickName,
+      faceUrl: fakeApp.faceUrl,
       addWording: fakeApp.wording,
       type: FriendApplicationTypeEnum
           .V2TIM_FRIEND_APPLICATION_COME_IN.index, // Default to incoming
